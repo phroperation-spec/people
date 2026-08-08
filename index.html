@@ -567,6 +567,12 @@ async function loadAll(){
     const c = await storageGet('config', true);
     CONFIG = c ? JSON.parse(c.value) : JSON.parse(JSON.stringify(DEFAULT_CONFIG));
   }catch(e){ CONFIG = JSON.parse(JSON.stringify(DEFAULT_CONFIG)); }
+  // Self-heal a corrupted/partial industries list — every render path (via allCompanies) walks
+  // this array, so one malformed entry here used to crash the entire app before it could even
+  // show the login screen. Any entry missing a proper `companies` array gets one instead of
+  // being left to throw later.
+  if(!Array.isArray(CONFIG.industries)) CONFIG.industries = JSON.parse(JSON.stringify(DEFAULT_CONFIG.industries));
+  CONFIG.industries.forEach(ind=>{ if(!Array.isArray(ind.companies)) ind.companies = []; });
   if(!CONFIG.separationReasons) CONFIG.separationReasons = DEFAULT_CONFIG.separationReasons.slice();
   if(!CONFIG.departments) CONFIG.departments = [];
   if(!CONFIG.costCenterDepartment) CONFIG.costCenterDepartment = {};
@@ -738,7 +744,12 @@ function toast(msg){
 /* ============ DERIVED HELPERS ============ */
 function allCompanies(){
   let out=[];
-  CONFIG.industries.forEach(ind=> ind.companies.forEach(c=> out.push({industry:ind.name, company:c})));
+  // Defensive: an industry entry missing/malformed `companies` (e.g. from a corrupted or
+  // partially-synced Control Panel edit) used to crash the whole app on load — every render
+  // path routes through here, so one bad industry entry took down the entire page before it
+  // could even render the login screen. Treat a missing/non-array companies list as empty
+  // instead of throwing.
+  (CONFIG.industries||[]).forEach(ind=> (Array.isArray(ind.companies)?ind.companies:[]).forEach(c=> out.push({industry:ind.name, company:c})));
   return out;
 }
 function ccdKey(company, costCenter){ return company+'|'+(costCenter||'').trim(); }
