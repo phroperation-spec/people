@@ -585,6 +585,14 @@ async function loadAll(){
   if(!CONFIG.uploadLog) CONFIG.uploadLog = {};
   if(CONFIG.promotionBenchmarkYears==null) CONFIG.promotionBenchmarkYears = DEFAULT_CONFIG.promotionBenchmarkYears;
   if(!CONFIG.authHashes) CONFIG.authHashes = JSON.parse(JSON.stringify(DEFAULT_CONFIG.authHashes));
+  // Same self-heal as industries above — these fields are relied on throughout the Control
+  // Panel and every dropdown that lists Employment Status/Age/Tenure. A config that arrived
+  // missing or with an empty array here (e.g. an older snapshot merged in from the cloud) used
+  // to leave those sections silently blank rather than falling back to sensible defaults.
+  if(!Array.isArray(CONFIG.statuses) || !CONFIG.statuses.length) CONFIG.statuses = DEFAULT_CONFIG.statuses.slice();
+  if(!Array.isArray(CONFIG.ageGroups) || !CONFIG.ageGroups.length) CONFIG.ageGroups = JSON.parse(JSON.stringify(DEFAULT_CONFIG.ageGroups));
+  if(!Array.isArray(CONFIG.tenureGroups) || !CONFIG.tenureGroups.length) CONFIG.tenureGroups = JSON.parse(JSON.stringify(DEFAULT_CONFIG.tenureGroups));
+  if(!Array.isArray(CONFIG.users) || !CONFIG.users.length) CONFIG.users = JSON.parse(JSON.stringify(DEFAULT_CONFIG.users));
   // Restore a previously-signed-in role on this device, if any, so people aren't logged out on
   // every page refresh. This only reads a role name back — the actual password is never stored.
   try{
@@ -1984,33 +1992,62 @@ function renderLogin(){
   </div>`;
 }
 
+// Shown instead of a silent blank page whenever a render step throws — includes the actual
+// error so it can be diagnosed from a screenshot alone, without needing to open DevTools.
+function renderFatalError(err, where){
+  const msg = (err && err.message) ? err.message : String(err);
+  const stack = (err && err.stack) ? err.stack.split('\n').slice(0,4).join('\n') : '';
+  return `
+  <div class="empty" style="text-align:left;max-width:640px;margin:60px auto;padding:24px;background:var(--surface);border:1px solid var(--red);border-radius:10px;">
+    <div style="color:var(--red);font-weight:600;margin-bottom:8px;">Something went wrong${where?` while loading ${where}`:''}.</div>
+    <div style="font-size:12.5px;color:var(--dim);margin-bottom:12px;">This section couldn't render — the rest of the app should still work. Screenshot this box and send it over so it can be fixed; the data itself hasn't been changed or lost.</div>
+    <div style="font-family:var(--mono);font-size:11px;color:var(--text);background:var(--surface2);padding:10px 12px;border-radius:6px;white-space:pre-wrap;word-break:break-word;">${escapeHtml(msg)}${stack?'\n\n'+escapeHtml(stack):''}</div>
+    <button class="btn" style="margin-top:14px;" onclick="location.reload()">Reload Page</button>
+  </div>`;
+}
 function render(){
   const app = document.getElementById('app');
   if(!ready){ app.innerHTML = '<div class="empty" style="padding:60px;">Loading…</div>'; return; }
-  if(!ui.authRole){ app.innerHTML = renderLogin(); document.getElementById('loginPassword')?.focus(); return; }
-  app.innerHTML = `
-    ${sidebar()}
-    <div class="main">
-      ${topbar()}
-      <div id="tabBody"></div>
-    </div>
-  `;
+  if(!ui.authRole){
+    try{ app.innerHTML = renderLogin(); }
+    catch(err){ console.error(err); app.innerHTML = renderFatalError(err, 'the login screen'); }
+    document.getElementById('loginPassword')?.focus();
+    return;
+  }
+  try{
+    app.innerHTML = `
+      ${sidebar()}
+      <div class="main">
+        ${topbar()}
+        <div id="tabBody"></div>
+      </div>
+    `;
+  }catch(err){
+    console.error(err);
+    app.innerHTML = renderFatalError(err, 'the page layout');
+    return;
+  }
   const body = document.getElementById('tabBody');
   const EXEC_ALLOWED_TABS = ['overview','company','forecastreport'];
-  if(ui.tab==='settings' && !isAdmin()){
-    body.innerHTML = '<div class="empty">The Control Panel is restricted to Admin users. Switch your role to Admin (bottom-left) if that\'s you, or ask your Admin for this change.</div>';
+  try{
+    if(ui.tab==='settings' && !isAdmin()){
+      body.innerHTML = '<div class="empty">The Control Panel is restricted to Admin users. Switch your role to Admin (bottom-left) if that\'s you, or ask your Admin for this change.</div>';
+    }
+    else if(ui.role==='Executive' && !EXEC_ALLOWED_TABS.includes(ui.tab)){
+      body.innerHTML = '<div class="empty">Executives can only access Trend &amp; Insight, Company Detail, and Forecast &amp; Executive Report. Switch your role (bottom-left) if that\'s not right, or ask HR/Admin for these other views.</div>';
+    }
+    else if(ui.tab==='overview') body.innerHTML = renderOverview();
+    else if(ui.tab==='company') body.innerHTML = renderCompany();
+    else if(ui.tab==='forecastreport') body.innerHTML = renderForecastReportHub();
+    else if(ui.tab==='recruitment') body.innerHTML = renderRecruitment();
+    else if(ui.tab==='data'){ body.innerHTML = renderData(); refreshUploadMonthMarks(); }
+    else if(ui.tab==='archive') body.innerHTML = renderArchive();
+    else if(ui.tab==='appraisal') body.innerHTML = renderAppraisal();
+    else if(ui.tab==='settings') body.innerHTML = renderSettings();
+  }catch(err){
+    console.error(err);
+    body.innerHTML = renderFatalError(err, NAV_ITEMS.find(n=>n[0]===ui.tab)?.[1] || 'this section');
   }
-  else if(ui.role==='Executive' && !EXEC_ALLOWED_TABS.includes(ui.tab)){
-    body.innerHTML = '<div class="empty">Executives can only access Trend &amp; Insight, Company Detail, and Forecast &amp; Executive Report. Switch your role (bottom-left) if that\'s not right, or ask HR/Admin for these other views.</div>';
-  }
-  else if(ui.tab==='overview') body.innerHTML = renderOverview();
-  else if(ui.tab==='company') body.innerHTML = renderCompany();
-  else if(ui.tab==='forecastreport') body.innerHTML = renderForecastReportHub();
-  else if(ui.tab==='recruitment') body.innerHTML = renderRecruitment();
-  else if(ui.tab==='data'){ body.innerHTML = renderData(); refreshUploadMonthMarks(); }
-  else if(ui.tab==='archive') body.innerHTML = renderArchive();
-  else if(ui.tab==='appraisal') body.innerHTML = renderAppraisal();
-  else if(ui.tab==='settings') body.innerHTML = renderSettings();
   if(ui.modal) renderModal();
 }
 
