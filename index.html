@@ -604,6 +604,18 @@ let _pushRetryCount = 0;
 const PUSH_MAX_RETRIES = 3;
 const PUSH_RETRY_DELAY_MS = 5000;
 
+/* ============================================================
+   REPLACE the entire broken block in your file — from
+   "async function pushToCloud(){" down to the closing "}"
+   right BEFORE the line "// Live cross-device sync..." —
+   with everything below. Do not nest anything; this is the
+   complete, final version of pushToCloud() plus its two helpers.
+   ============================================================ */
+
+let _pushRetryCount = 0;
+const PUSH_MAX_RETRIES = 3;
+const PUSH_RETRY_DELAY_MS = 5000;
+
 async function pushToCloud(){
   if (!firebaseReady()) return;
   updateSyncBadge('syncing');
@@ -634,8 +646,7 @@ async function pushToCloud(){
 
 // Persistent, hard-to-miss banner (separate from the small floating badge) shown at the very
 // top of the page whenever a cloud push has actually failed — with the real error text, so
-// whoever's looking at the screen can screenshot it and it's obvious something's wrong, rather
-// than relying on someone noticing a small badge said "Offline" in the corner.
+// whoever's looking at the screen can screenshot it and it's obvious something's wrong.
 function showPushFailBanner(err){
   let el = document.getElementById('pushFailBanner');
   if(!el){
@@ -651,29 +662,7 @@ function showPushFailBanner(err){
 function hidePushFailBanner(){
   const el = document.getElementById('pushFailBanner');
   if(el) el.style.display = 'none';
-}
-
-  if (!firebaseReady()) return;
-  updateSyncBadge('syncing');
-  try{
-    const payload = {
-      config: CONFIG,
-      employees: EMP,
-      recruitment: RECRUIT,
-      updatedAt: Date.now()
-    };
-    const seqAtPush = _localChangeSeq;
-    _lastKnownUpdatedAt = payload.updatedAt; // set before the write so our own echo is recognized and skipped
-    await _fbRef.set(payload);
-    _syncedChangeSeq = seqAtPush;
-    updateSyncBadge('synced', new Date(payload.updatedAt).toLocaleTimeString());
-  }catch(err){
-    console.warn('Cloud sync (push) failed:', err);
-    updateSyncBadge('offline');
-  }
-}
-
-// Live cross-device sync: any other device's write shows up here within moments.
+}// Live cross-device sync: any other device's write shows up here within moments.
 function startRealtimeSync(){
   if (!firebaseReady()) return;
   _fbRef.on('value', snap => {
