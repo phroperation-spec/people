@@ -590,7 +590,69 @@ async function pullFromCloud(){
   }
 }
 
+async function pushToCloud(){/* ============================================================
+   PATCH: replace the existing pushToCloud() function with this.
+   Same behavior as before, but if a push fails, it now:
+     1) shows a persistent on-screen banner (not just a console log)
+     2) retries automatically after 5 seconds, up to 3 times
+     3) only gives up silently after those retries are exhausted
+   This prevents the "worked on my browser, never actually reached
+   Firebase" problem from going unnoticed again.
+   ============================================================ */
+
+let _pushRetryCount = 0;
+const PUSH_MAX_RETRIES = 3;
+const PUSH_RETRY_DELAY_MS = 5000;
+
 async function pushToCloud(){
+  if (!firebaseReady()) return;
+  updateSyncBadge('syncing');
+  try{
+    const payload = {
+      config: CONFIG,
+      employees: EMP,
+      recruitment: RECRUIT,
+      updatedAt: Date.now()
+    };
+    const seqAtPush = _localChangeSeq;
+    _lastKnownUpdatedAt = payload.updatedAt; // set before the write so our own echo is recognized and skipped
+    await _fbRef.set(payload);
+    _syncedChangeSeq = seqAtPush;
+    _pushRetryCount = 0; // success — reset retry counter
+    updateSyncBadge('synced', new Date(payload.updatedAt).toLocaleTimeString());
+    hidePushFailBanner();
+  }catch(err){
+    console.warn('Cloud sync (push) failed:', err);
+    updateSyncBadge('offline');
+    showPushFailBanner(err);
+    if(_pushRetryCount < PUSH_MAX_RETRIES){
+      _pushRetryCount++;
+      setTimeout(pushToCloud, PUSH_RETRY_DELAY_MS);
+    }
+  }
+}
+
+// Persistent, hard-to-miss banner (separate from the small floating badge) shown at the very
+// top of the page whenever a cloud push has actually failed — with the real error text, so
+// whoever's looking at the screen can screenshot it and it's obvious something's wrong, rather
+// than relying on someone noticing a small badge said "Offline" in the corner.
+function showPushFailBanner(err){
+  let el = document.getElementById('pushFailBanner');
+  if(!el){
+    el = document.createElement('div');
+    el.id = 'pushFailBanner';
+    el.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:10000;background:#7a1e1e;color:#fff;font-family:sans-serif;font-size:13px;text-align:center;padding:10px;box-shadow:0 2px 8px rgba(0,0,0,.4);';
+    document.body.prepend(el);
+  }
+  const msg = (err && err.message) ? err.message : String(err);
+  el.innerHTML = `⚠ Cloud save failed — your latest changes are NOT visible to other users yet. (${escapeHtml(msg)}) — retrying automatically…`;
+  el.style.display = 'block';
+}
+function hidePushFailBanner(){
+  const el = document.getElementById('pushFailBanner');
+  if(el) el.style.display = 'none';
+}
+
   if (!firebaseReady()) return;
   updateSyncBadge('syncing');
   try{
