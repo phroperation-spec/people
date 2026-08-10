@@ -590,32 +590,6 @@ async function pullFromCloud(){
   }
 }
 
-async function pushToCloud(){/* ============================================================
-   PATCH: replace the existing pushToCloud() function with this.
-   Same behavior as before, but if a push fails, it now:
-     1) shows a persistent on-screen banner (not just a console log)
-     2) retries automatically after 5 seconds, up to 3 times
-     3) only gives up silently after those retries are exhausted
-   This prevents the "worked on my browser, never actually reached
-   Firebase" problem from going unnoticed again.
-   ============================================================ */
-
-let _pushRetryCount = 0;
-const PUSH_MAX_RETRIES = 3;
-const PUSH_RETRY_DELAY_MS = 5000;
-
-/* ============================================================
-   REPLACE the entire broken block in your file — from
-   "async function pushToCloud(){" down to the closing "}"
-   right BEFORE the line "// Live cross-device sync..." —
-   with everything below. Do not nest anything; this is the
-   complete, final version of pushToCloud() plus its two helpers.
-   ============================================================ */
-
-let _pushRetryCount = 0;
-const PUSH_MAX_RETRIES = 3;
-const PUSH_RETRY_DELAY_MS = 5000;
-
 async function pushToCloud(){
   if (!firebaseReady()) return;
   updateSyncBadge('syncing');
@@ -630,39 +604,14 @@ async function pushToCloud(){
     _lastKnownUpdatedAt = payload.updatedAt; // set before the write so our own echo is recognized and skipped
     await _fbRef.set(payload);
     _syncedChangeSeq = seqAtPush;
-    _pushRetryCount = 0; // success — reset retry counter
     updateSyncBadge('synced', new Date(payload.updatedAt).toLocaleTimeString());
-    hidePushFailBanner();
   }catch(err){
     console.warn('Cloud sync (push) failed:', err);
     updateSyncBadge('offline');
-    showPushFailBanner(err);
-    if(_pushRetryCount < PUSH_MAX_RETRIES){
-      _pushRetryCount++;
-      setTimeout(pushToCloud, PUSH_RETRY_DELAY_MS);
-    }
   }
 }
 
-// Persistent, hard-to-miss banner (separate from the small floating badge) shown at the very
-// top of the page whenever a cloud push has actually failed — with the real error text, so
-// whoever's looking at the screen can screenshot it and it's obvious something's wrong.
-function showPushFailBanner(err){
-  let el = document.getElementById('pushFailBanner');
-  if(!el){
-    el = document.createElement('div');
-    el.id = 'pushFailBanner';
-    el.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:10000;background:#7a1e1e;color:#fff;font-family:sans-serif;font-size:13px;text-align:center;padding:10px;box-shadow:0 2px 8px rgba(0,0,0,.4);';
-    document.body.prepend(el);
-  }
-  const msg = (err && err.message) ? err.message : String(err);
-  el.innerHTML = `⚠ Cloud save failed — your latest changes are NOT visible to other users yet. (${escapeHtml(msg)}) — retrying automatically…`;
-  el.style.display = 'block';
-}
-function hidePushFailBanner(){
-  const el = document.getElementById('pushFailBanner');
-  if(el) el.style.display = 'none';
-}// Live cross-device sync: any other device's write shows up here within moments.
+// Live cross-device sync: any other device's write shows up here within moments.
 function startRealtimeSync(){
   if (!firebaseReady()) return;
   _fbRef.on('value', snap => {
@@ -734,9 +683,11 @@ function sanitizeConfig(cfg){
 }
 
 async function loadAll(){
+  let hadLocalCache = false;
   try{
     const c = await storageGet('config', true);
     CONFIG = c ? JSON.parse(c.value) : JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+    if (c) hadLocalCache = true;
   }catch(e){ CONFIG = JSON.parse(JSON.stringify(DEFAULT_CONFIG)); }
   CONFIG = sanitizeConfig(CONFIG);
   // Restore a previously-signed-in role on this device, if any, so people aren't logged out on
@@ -760,19 +711,36 @@ async function loadAll(){
   try{
     const e = await storageGet('employees', true);
     EMP = e ? JSON.parse(e.value) : [];
+    if (e) hadLocalCache = true;
   }catch(e){ EMP = []; }
   try{
     const r = await storageGet('recruitment', true);
     RECRUIT = r ? JSON.parse(r.value) : {};
+    if (r) hadLocalCache = true;
   }catch(e){ RECRUIT = {}; }
-  ready = true;
-  render();
+
+  // If this device has never cached anything locally (a new phone/PC, or a
+  // cleared browser) and cloud sync is configured, don't render yet with
+  // empty employees / default config — that's what made opening the site on
+  // another device look like the admin's saved data had "reset". Instead,
+  // keep showing the loading screen (render() already handles !ready) until
+  // the cloud pull resolves one way or another, then render with whatever
+  // that pull actually found.
+  const shouldWaitForCloud = !hadLocalCache && firebaseReady();
+  if (!shouldWaitForCloud){
+    ready = true;
+    render();
+  }
 
   // Cloud sync: pull the latest shared data from Firebase (may override the local/
   // window.storage snapshot above if another device has newer data), then keep
   // listening for live updates from other devices.
   updateSyncBadge(firebaseReady() ? 'syncing' : 'unconfigured');
   await pullFromCloud();
+  if (shouldWaitForCloud){
+    ready = true;
+    render();
+  }
   startRealtimeSync();
 }
 /* ============ AUTH (per-role password, SHA-256 hashed) ============ */
@@ -2209,7 +2177,7 @@ function renderFatalError(err, where){
 }
 function render(){
   const app = document.getElementById('app');
-  if(!ready){ app.innerHTML = '<div class="empty" style="padding:60px;">Loading…</div>'; return; }
+  if(!ready){ app.innerHTML = '<div class="empty" style="padding:60px;">⏳ Loading saved data from the cloud…</div>'; return; }
   if(!ui.authRole){
     try{ app.innerHTML = renderLogin(); }
     catch(err){ console.error(err); app.innerHTML = renderFatalError(err, 'the login screen'); }
