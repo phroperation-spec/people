@@ -208,9 +208,9 @@
   /* Blank reserved space at the top for the physical letterhead this prints onto — left empty on
      purpose, since the letterhead itself is pre-printed on the paper, not part of this markup. */
   .coe-letterhead-space{flex:0 0 auto;height:1.6in;}
-  /* Title, body, and signature are vertically centered as one block within whatever page space
-     is left below the letterhead reservation, rather than sitting pinned to the top. */
-  .coe-content{flex:1 1 auto;display:flex;flex-direction:column;justify-content:center;}
+  /* Title, body, and signature start right below the letterhead reservation rather than being
+     vertically centered in the remaining page space. */
+  .coe-content{flex:1 1 auto;display:flex;flex-direction:column;justify-content:flex-start;}
   .coe-title{text-align:center;font-weight:700;letter-spacing:.12em;font-size:16pt;margin-bottom:56px;}
   .coe-body p{text-align:justify;margin:0 0 20px;text-indent:2.5em;white-space:pre-wrap;}
   .coe-body p:last-child{text-indent:0;}
@@ -3675,6 +3675,7 @@ function renderArchive(){
   const year = Number(ui.month.split('-')[0]) || new Date().getFullYear();
   const companies = allCompanies().map(c=>c.company);
   const matchesFilter = archiveMatchesFilter;
+  const admin = isAdmin();
   const hiredTotal = EMP.filter(e=>{ const d = hireTagDate(e); return d && !e.excludeFromHireCount && d.getFullYear()===year && matchesFilter(e); }).length;
   const separatedTotal = EMP.filter(e=>{ const d = separationTagDate(e); return d && d.getFullYear()===year && matchesFilter(e); }).length;
 
@@ -3689,11 +3690,11 @@ function renderArchive(){
     <h2 class="section">${label} ${year}</h2>
     <div class="archive-grid">
       <div>
-        <div class="mini-label" style="color:var(--green);">New Hires — ${hires.length}</div>
+        <div class="mini-label" style="color:var(--green);display:flex;align-items:center;justify-content:space-between;gap:8px;"><span>New Hires — ${hires.length}</span>${(admin && hires.length) ? `<button class="btn small danger" onclick="openDeleteArchiveListModal(${year},${m},'hires')">Delete List</button>` : ''}</div>
         ${hires.length ? hireTable(hires) : '<div class="empty">No new hires recorded.</div>'}
       </div>
       <div>
-        <div class="mini-label" style="color:var(--red);">Separations — ${seps.length}</div>
+        <div class="mini-label" style="color:var(--red);display:flex;align-items:center;justify-content:space-between;gap:8px;"><span>Separations — ${seps.length}</span>${(admin && seps.length) ? `<button class="btn small danger" onclick="openDeleteArchiveListModal(${year},${m},'seps')">Delete List</button>` : ''}</div>
         ${seps.length ? separationTable(seps) : '<div class="empty">No separations recorded.</div>'}
       </div>
     </div>
@@ -5225,6 +5226,37 @@ async function archiveDeleteRecord(id){
   toast('Record deleted.');
   render();
 }
+/* Bulk delete of an entire month's New Hires or Separations list from the Hire & Separation
+   Archive — Admin-only, same matching logic (company/status filters + tag-month) used to build
+   that list on screen, recomputed at delete time so it can't go stale between render and confirm. */
+function archiveListFor(year, month, kind){
+  const matchesFilter = archiveMatchesFilter;
+  if(kind==='hires'){
+    return EMP.filter(e=>{ const d = hireTagDate(e); return d && !e.excludeFromHireCount && d.getFullYear()===year && d.getMonth()+1===month && matchesFilter(e); });
+  }
+  return EMP.filter(e=>{ const d = separationTagDate(e); return d && d.getFullYear()===year && d.getMonth()+1===month && matchesFilter(e); });
+}
+function openDeleteArchiveListModal(year, month, kind){
+  if(!isAdmin()){ toast('Only Admin can delete employee records.'); return; }
+  ui.modal = {type:'deleteArchiveList', arg:{year, month, kind}};
+  render();
+}
+async function confirmDeleteArchiveList(){
+  if(!isAdmin()){ toast('Only Admin can delete employee records.'); return; }
+  const {year, month, kind} = ui.modal.arg;
+  const typedEl = document.getElementById('delListConfirm');
+  const typed = ((typedEl && typedEl.value) || '').trim().toUpperCase();
+  if(typed!=='DELETE'){ toast('Type DELETE (exactly) to confirm.'); return; }
+  const list = archiveListFor(year, month, kind);
+  const ids = new Set(list.map(e=> String(e.employeeId)));
+  const before = ids.size;
+  EMP = EMP.filter(e=> !ids.has(String(e.employeeId)));
+  await saveEmp();
+  closeModal();
+  const ms = `${year}-${String(month).padStart(2,'0')}`;
+  toast(`${before} record(s) deleted from ${monthLabel(ms)} — ${kind==='hires'?'New Hires':'Separations'}.`);
+  render();
+}
 function openAddArchiveRecordModal(){
   if(!canQuickAdd()){ toast('Only Admin and HR can add records this way.'); return; }
   ui.modal = {type:'addArchiveRecord'};
@@ -6251,6 +6283,20 @@ function renderModal(){
     <p class="hint">Matching active record(s) that would be deleted: <b id="delAllCount">0</b></p>
     <div class="field"><label>TYPE "DELETE" TO CONFIRM</label><input type="text" id="delAllConfirm" placeholder="DELETE"></div>
     <div style="margin-top:16px;"><button class="btn danger" onclick="confirmDeleteAllActive()">Delete Matching Active Records</button> <button class="btn" onclick="closeModal()">Cancel</button></div>`;
+  } else if(ui.modal.type==='deleteArchiveList'){
+    const {year, month, kind} = ui.modal.arg;
+    const ms = `${year}-${String(month).padStart(2,'0')}`;
+    const list = archiveListFor(year, month, kind);
+    const kindLabel = kind==='hires' ? 'New Hires' : 'Separations';
+    body = `<h3>Delete ${kindLabel} List — ${monthLabel(ms)}</h3>
+    <p class="hint" style="color:var(--red);">This permanently deletes all <b>${list.length}</b> employee record(s) shown in the ${monthLabel(ms)} ${kindLabel} list${(ui.archiveCompany||ui.archiveStatus) ? ' (matching the Company/Employment Status filters currently applied)' : ''}. This cannot be undone.</p>
+    <div class="archive-table-wrap" style="max-height:220px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;">
+      <table class="simple">
+        <tbody>${list.map(e=>`<tr><td class="ctr" style="width:20%;">${e.employeeId||''}</td><td>${e.lastName||''}, ${e.firstName||''}</td><td>${e.company||''}</td></tr>`).join('')}</tbody>
+      </table>
+    </div>
+    <div class="field" style="margin-top:12px;"><label>TYPE "DELETE" TO CONFIRM</label><input type="text" id="delListConfirm" placeholder="DELETE"></div>
+    <div style="margin-top:16px;"><button class="btn danger" onclick="confirmDeleteArchiveList()">Delete ${kindLabel} List</button> <button class="btn" onclick="closeModal()">Cancel</button></div>`;
   } else if(ui.modal.type==='editEmployee'){
     const emp = EMP.find(e=> String(e.employeeId)===String(ui.modal.arg));
     if(!emp){
@@ -6348,7 +6394,7 @@ function renderModal(){
     <div id="arAddMsg" class="hint"></div>
     <div style="margin-top:16px;"><button class="btn primary" onclick="confirmAddArchiveRecord()">Add Record</button> <button class="btn" onclick="closeModal()">Cancel</button></div>`;
   }
-  const wide = (ui.modal.type==='editEmployee' || ui.modal.type==='addArchiveRecord' || ui.modal.type==='confirmMasterlistNewHires' || ui.modal.type==='confirmMasterlistPromotions') ? 'width:640px;' : '';
+  const wide = (ui.modal.type==='editEmployee' || ui.modal.type==='addArchiveRecord' || ui.modal.type==='confirmMasterlistNewHires' || ui.modal.type==='confirmMasterlistPromotions' || ui.modal.type==='deleteArchiveList') ? 'width:640px;' : '';
   const wrap = document.createElement('div');
   wrap.innerHTML = `<div class="modal-bg" onclick="if(event.target===this) closeModal()"><div class="modal" style="${wide}">${body}</div></div>`;
   document.getElementById('app').appendChild(wrap.firstElementChild);
