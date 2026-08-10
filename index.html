@@ -111,8 +111,17 @@
   table.archive-table{table-layout:fixed;}
   table.archive-table tbody tr:nth-child(even){background:var(--bg);}
   table.archive-table tbody tr:hover td{background:var(--surface2);}
+  /* Every header stays single-line and ellipsizes instead of overflowing into the next column —
+     with table-layout:fixed, a header label that can't wrap (e.g. "DEPARTMENT") would otherwise
+     spill visually past its own column and overlap the next header. */
+  table.archive-table th{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
   table.archive-table th.ctr, table.archive-table td.ctr{text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
   table.archive-table td.wrap{white-space:normal;}
+  /* Name is the one column people actually need to read in full — never truncate it, and give
+     it room to wrap onto a second line cleanly (rows grow taller, nothing overlaps) rather than
+     clipping a name short. */
+  table.archive-table td.namecell{white-space:normal;word-break:break-word;}
+  .archive-table-wrap{overflow-x:auto;}
   .pill{display:inline-block;padding:2px 8px;border-radius:20px;font-size:11px;font-family:var(--mono);}
   .pill.staff{background:rgba(47,95,174,.14);color:var(--blue);}
   .pill.rankfile{background:rgba(26,138,125,.14);color:var(--teal);}
@@ -157,8 +166,10 @@
   /* At-a-glance charts */
   .glance-grid{display:grid;grid-template-columns:300px 1fr;gap:16px;margin-bottom:8px;}
   @media(max-width:820px){.glance-grid{grid-template-columns:1fr;}}
-  .archive-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;align-items:start;}
-  @media(max-width:900px){.archive-grid{grid-template-columns:1fr;}}
+  /* New Hires and Separations stack one above the other, each getting the page's full width —
+     side-by-side halves left too little room for a 9-10 column table and caused headers/names
+     to overlap. */
+  .archive-grid{display:grid;grid-template-columns:1fr;gap:24px;align-items:start;}
   .donut-wrap{display:flex;align-items:center;gap:24px;flex-wrap:wrap;}
   .donut{position:relative;width:140px;height:140px;border-radius:50%;flex-shrink:0;}
   .donut .hole{position:absolute;inset:17px;border-radius:50%;background:var(--surface);display:flex;flex-direction:column;align-items:center;justify-content:center;}
@@ -189,6 +200,28 @@
     h2.section{page-break-after:avoid;break-after:avoid;}
     a{color:inherit;text-decoration:none;}
     .exec-section-break{page-break-before:always;}
+  }
+  /* ============ CERTIFICATE OF EMPLOYMENT ============ */
+  .coe-page{background:#fff;color:#161a2b;width:8.5in;min-height:11in;margin:0 auto;padding:0.9in 1in;
+    font-family:Georgia,'Times New Roman',Times,serif;font-size:12.5pt;line-height:1.9;font-style:italic;
+    display:flex;flex-direction:column;box-shadow:0 0 0 1px var(--border), 0 4px 18px rgba(0,0,0,.06);}
+  /* Blank reserved space at the top for the physical letterhead this prints onto — left empty on
+     purpose, since the letterhead itself is pre-printed on the paper, not part of this markup. */
+  .coe-letterhead-space{flex:0 0 auto;height:1.6in;}
+  /* Title, body, and signature are vertically centered as one block within whatever page space
+     is left below the letterhead reservation, rather than sitting pinned to the top. */
+  .coe-content{flex:1 1 auto;display:flex;flex-direction:column;justify-content:center;}
+  .coe-title{text-align:center;font-weight:700;letter-spacing:.12em;font-size:16pt;margin-bottom:56px;}
+  .coe-body p{text-align:justify;margin:0 0 20px;text-indent:2.5em;white-space:pre-wrap;}
+  .coe-body p:last-child{text-indent:0;}
+  .coe-sign{margin-top:64px;text-align:right;}
+  .coe-sign .coe-sign-name{font-weight:700;text-transform:uppercase;}
+  .coe-sign .coe-sign-title{font-size:11pt;color:#3a4258;}
+  @media print{
+    .coe-topbar{display:none !important;}
+    .coe-layout{display:block !important;}
+    .coe-page{box-shadow:none;margin:0 auto;padding:0;width:auto;min-height:0;height:9.2in;}
+    @page{size:8.5in 11in;margin:0.9in 1in;}
   }
   #syncBadge{
     position:fixed; right:12px; bottom:12px; z-index:9999;
@@ -236,16 +269,21 @@ const DEFAULT_CONFIG = {
     {label:'5–10 years', min:5, max:9.9},
     {label:'10+ years', min:10, max:999}
   ],
-  departments:[],
+  departments:{}, // key: company -> [department names] (segregated per company, same pattern as cost centers)
   costCenterDepartment:{}, // key: `${company}|${costCenter}` -> department (segregated per company)
   manualCostCenters:{}, // key: company -> [costCenter codes] added manually in the Control Panel
   jobGradeGroups:{}, // key: company -> { employmentStatus -> [{label,min,max}] } — ranges can differ by company & status
   positionJobGrades:{}, // key: company -> { employmentStatus -> { positionName -> jobGradeGroupLabel } } — Job Position categorized by Job Grade Group
-  extraUploadYears:[], // additional years beyond 2030 to extend the Master List "as of month" picker
+  extraUploadYears:[], // additional years added from Control Panel → Additional Years — extend every year picker app-wide (topbar Year, Recruitment Year, Archive, Master List "as of month"), floored at 2026
   lockedUploadMonth:'', // Task A: when set (YYYY-MM), HR can't pick any other month for Master List uploads
   companyBaselineMonth:{}, // key: company -> YYYY-MM of that company's first-ever Master List (baseline) upload
   uploadLog:{}, // key: `${company}|${status}` -> { 'YYYY-MM': {rows, at} } — which months already had a Master List uploaded
   separationReasons:['Resignation','End of Contract','Termination','Retirement','Redundancy/Retrenchment','Other'],
+  // Certificate of Employment — per-company defaults (address, signatory, boilerplate purpose
+  // line) so HR doesn't have to retype them every time; the actual certificate per employee is
+  // never stored here, it's generated fresh each time from the Active Roster / Archive plus
+  // these defaults, and is always further editable before printing.
+  coeSettings: {},
   // A general starting point for "how long is too long without a Job Grade change" — not pulled
   // from any external source, just a common HR rule-of-thumb order of magnitude. Meant to be
   // adjusted by HR to match PGB's actual promotion cadence/policy, not treated as a benchmark.
@@ -288,6 +326,15 @@ let ui = {
   rosterFilterCompany:'',
   rosterFilterStatus:'',
   ccDeptCompany:null,
+  // Certificate of Employment — the working draft for whichever certificate is currently open.
+  // bodyText is the freely-editable certificate paragraph(s); regenerateCOEBody() rebuilds it
+  // from the structured fields below on demand, but never overwrites a manual edit on its own.
+  coe:{
+    company:null, employeeId:'', companyLabel:'', name:'', position:'', department:'',
+    pronoun:'Their', dateHired:'', present:true, dateSeparated:'',
+    issuedDate:'', address:'', purpose:'This certification is being issued for whatever legal purpose this may serve.',
+    signatoryName:'', signatoryTitle:'', bodyText:''
+  },
   jobGradeCompany:null,
   jobGradeStatus:null,
   overviewCompany:'',
@@ -364,6 +411,27 @@ function fmtDateMDY(dateStr){
   const mo = String(d.getMonth()+1).padStart(2,'0');
   const day = String(d.getDate()).padStart(2,'0');
   return `${mo}/${day}/${d.getFullYear()}`;
+}
+// Used by the Certificate of Employment — "July 23, 2011" style, and "4th day of May 2026" for
+// the issued line.
+function fmtDateLong(dateStr){
+  const d = parseDate(dateStr);
+  if(!d) return dateStr || '';
+  return d.toLocaleString('en-US',{month:'long', day:'numeric', year:'numeric'});
+}
+function ordinalSuffix(n){
+  const j = n%10, k = n%100;
+  if(j===1 && k!==11) return 'st';
+  if(j===2 && k!==12) return 'nd';
+  if(j===3 && k!==13) return 'rd';
+  return 'th';
+}
+function fmtOrdinalLongDate(dateStr){
+  const d = parseDate(dateStr);
+  if(!d) return '';
+  const day = d.getDate();
+  const month = d.toLocaleString('en-US',{month:'long'});
+  return `${day}${ordinalSuffix(day)} day of ${month} ${d.getFullYear()}`;
 }
 function peso(n){ return '₱'+Number(n||0).toLocaleString('en-US',{maximumFractionDigits:0}); }
 
@@ -577,12 +645,27 @@ function sanitizeConfig(cfg){
   if(!Array.isArray(cfg.industries)) cfg.industries = JSON.parse(JSON.stringify(DEFAULT_CONFIG.industries));
   cfg.industries.forEach(ind=>{ if(!Array.isArray(ind.companies)) ind.companies = []; });
   if(!cfg.separationReasons) cfg.separationReasons = DEFAULT_CONFIG.separationReasons.slice();
-  if(!cfg.departments) cfg.departments = [];
+  // Departments used to be one flat list shared across every company; now they're segregated
+  // per company, the same way cost centers already were. Migrate an old flat array by seeding
+  // every existing company with the same list of names, so cost centers already mapped to one
+  // of those names (via costCenterDepartment, which was always keyed per company) keep resolving
+  // to a valid option in the per-company dropdown instead of silently going blank.
+  if(!cfg.departments || Array.isArray(cfg.departments)){
+    const legacy = Array.isArray(cfg.departments) ? cfg.departments : [];
+    cfg.departments = {};
+    if(legacy.length){
+      cfg.industries.forEach(ind=> (ind.companies||[]).forEach(c=>{ cfg.departments[c] = legacy.slice(); }));
+    }
+  }
   if(!cfg.costCenterDepartment) cfg.costCenterDepartment = {};
   if(!cfg.manualCostCenters) cfg.manualCostCenters = {};
+  if(!cfg.coeSettings) cfg.coeSettings = {};
   if(!cfg.jobGradeGroups) cfg.jobGradeGroups = {};
   if(!cfg.positionJobGrades) cfg.positionJobGrades = {};
   if(!cfg.extraUploadYears) cfg.extraUploadYears = [];
+  // Floor at 2026 (PGB's records in this tool don't go back further) and keep sorted/deduped so
+  // the Control Panel list and every year picker that reads it stay consistent.
+  cfg.extraUploadYears = Array.from(new Set(cfg.extraUploadYears.map(Number))).filter(y=> y>=MIN_YEAR).sort((a,b)=>a-b);
   if(cfg.lockedUploadMonth===undefined) cfg.lockedUploadMonth = '';
   if(!cfg.companyBaselineMonth) cfg.companyBaselineMonth = {};
   if(!cfg.uploadLog) cfg.uploadLog = {};
@@ -781,6 +864,12 @@ function costCentersForCompany(company){
 function departmentOf(company, costCenter){
   return CONFIG.costCenterDepartment[ccdKey(company, costCenter)] || 'Unassigned';
 }
+// Departments, like cost centers, are segregated per company — a department added for one
+// company never shows up as an option for another.
+function departmentsForCompany(company){
+  CONFIG.departments = CONFIG.departments || {};
+  return ((CONFIG.departments[company] || []).slice()).sort();
+}
 // Resolves an employee's department. Precedence: a per-employee override set directly from the
 // roster (departmentOverride) wins, then the cost-center → department mapping (per company),
 // then whatever department string is on the record, then '' / 'Unassigned'.
@@ -803,6 +892,55 @@ async function addManualCostCenter(company, code){
   CONFIG.manualCostCenters[company] = CONFIG.manualCostCenters[company] || [];
   if(!CONFIG.manualCostCenters[company].includes(code)) CONFIG.manualCostCenters[company].push(code);
   await saveConfig();
+}
+// Task: cost centers can be renamed in place — updates the manual list (if it's a manually-added
+// code), moves its department mapping over to the new key, and re-labels every employee record
+// currently sitting on the old code so nothing silently falls back to "Unassigned".
+async function renameCostCenter(company, oldCC, newCC){
+  newCC = (newCC||'').trim();
+  if(!company || !oldCC || !newCC) { toast('Enter a new cost center code first.'); return; }
+  if(newCC === oldCC) return;
+  if(costCentersForCompany(company).includes(newCC)){
+    toast(`${newCC} already exists for ${company} — to merge employees into it, transfer them individually instead.`);
+    return;
+  }
+  CONFIG.manualCostCenters = CONFIG.manualCostCenters || {};
+  const manualList = CONFIG.manualCostCenters[company];
+  if(manualList){
+    const idx = manualList.indexOf(oldCC);
+    if(idx>-1) manualList[idx] = newCC; else manualList.push(newCC);
+  }
+  const oldKey = ccdKey(company, oldCC), newKey = ccdKey(company, newCC);
+  if(CONFIG.costCenterDepartment[oldKey]!==undefined){
+    CONFIG.costCenterDepartment[newKey] = CONFIG.costCenterDepartment[oldKey];
+    delete CONFIG.costCenterDepartment[oldKey];
+  }
+  let touched = 0;
+  EMP.forEach(e=>{ if(e.company===company && (e.costCenter||'').trim()===oldCC){ e.costCenter = newCC; touched++; } });
+  await saveConfig();
+  if(touched) await saveEmp();
+  closeModal();
+  toast(`${oldCC} renamed to ${newCC}${touched?` — ${touched} employee record(s) updated`:''}.`);
+  render();
+}
+function handleRenameCC(company, oldCC){
+  const val = document.getElementById('m_renameCC').value;
+  renameCostCenter(company, oldCC, val);
+}
+// Task: cost centers can be deleted — blocked while any active employee still sits on it, so
+// deleting never silently strips an employee's cost center out from under them.
+async function deleteCostCenter(company, cc){
+  const inUse = EMP.filter(e=> e.company===company && (e.costCenter||'').trim()===cc && !e.dateSeparated).length;
+  if(inUse){
+    toast(`${inUse} active employee(s) are still on ${cc} — transfer them to a different cost center first.`);
+    return;
+  }
+  CONFIG.manualCostCenters = CONFIG.manualCostCenters || {};
+  if(CONFIG.manualCostCenters[company]) CONFIG.manualCostCenters[company] = CONFIG.manualCostCenters[company].filter(c=> c!==cc);
+  delete CONFIG.costCenterDepartment[ccdKey(company, cc)];
+  await saveConfig();
+  toast(`${cc} deleted.`);
+  render();
 }
 async function setPromotionBenchmark(v){
   const n = Number(v);
@@ -1980,6 +2118,7 @@ const NAV_ITEMS = [
   ['recruitment','Recruitment Cost','Cost per hire and recruitment cost ratio by company'],
   ['archive','Hire &amp; Separation Archive','New hires and separations, side by side, by month and year'],
   ['appraisal','Bound for Performance Appraisal','Staff new hires approaching their 3rd, 6th and 9th month evaluation'],
+  ['coe','Certificate of Employment','Generate and print a Certificate of Employment — editable per company'],
   ['data','Data Management','Upload the master file, add hires, mark separations'],
   ['settings','Control Panel','Industries, companies, groupings and access']
 ];
@@ -2023,7 +2162,7 @@ function render(){
   if(!ui.authRole){
     try{ app.innerHTML = renderLogin(); }
     catch(err){ console.error(err); app.innerHTML = renderFatalError(err, 'the login screen'); }
-    document.getElementById('loginPassword')?.focus();
+    (document.getElementById('loginPassword') || document.getElementById('recCode'))?.focus();
     return;
   }
   try{
@@ -2055,6 +2194,7 @@ function render(){
     else if(ui.tab==='data'){ body.innerHTML = renderData(); refreshUploadMonthMarks(); }
     else if(ui.tab==='archive') body.innerHTML = renderArchive();
     else if(ui.tab==='appraisal') body.innerHTML = renderAppraisal();
+    else if(ui.tab==='coe') body.innerHTML = renderCOE();
     else if(ui.tab==='settings') body.innerHTML = renderSettings();
   }catch(err){
     console.error(err);
@@ -2102,13 +2242,13 @@ function sidebar(){
 function topbar(){
   const current = NAV_ITEMS.find(n=>n[0]===ui.tab);
   const [curYear, curMonthNum] = ui.month.split('-').map(Number);
-  const monthIrrelevant = (ui.tab==='company' && ui.companyPeriod!=='monthly') || ui.tab==='archive' || ui.tab==='appraisal' || (ui.tab==='forecastreport' && ui.forecastReportSub==='execreport' && ui.reportPeriod!=='monthly');
+  const monthIrrelevant = (ui.tab==='company' && ui.companyPeriod!=='monthly') || ui.tab==='archive' || ui.tab==='appraisal' || ui.tab==='coe' || (ui.tab==='forecastreport' && ui.forecastReportSub==='execreport' && ui.reportPeriod!=='monthly');
   const monthOffTitle = ui.tab==='appraisal'
     ? "Month isn't used here — evaluation due dates are tracked against today's date."
-    : (ui.tab==='forecastreport' ? "Month isn't used here — the Executive Report is showing the Annual period (Year picker up top still applies)." : "Month isn't used here — the Archive is browsed by year, showing all 12 months at once.");
+    : (ui.tab==='coe' ? "Month isn't used here — the certificate uses its own Issued Date field." : (ui.tab==='forecastreport' ? "Month isn't used here — the Executive Report is showing the Annual period (Year picker up top still applies)." : "Month isn't used here — the Archive is browsed by year, showing all 12 months at once."));
 
   return `
-  <div class="topbar">
+  <div class="topbar${ui.tab==='coe' ? ' coe-topbar' : ''}">
     <div>
       <h2 class="page-title">${current[1]}</h2>
       <div class="sub">${current[2]}</div>
@@ -2128,15 +2268,28 @@ function topbar(){
   </div>`;
 }
 const MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+// The single floor year for this tool — PGB's records here don't go back further than 2026, so
+// every year picker across the app (topbar Year, Recruitment Year, Archive, Master List "as of
+// month") stays clamped to 2026 and up.
+const MIN_YEAR = 2026;
+// Years added in Control Panel → Additional Years. These feed every year picker in the app, not
+// just the Master List upload picker — once HR adds a year here it's immediately selectable in
+// the topbar Year selector, Recruitment Year, and Archive, each of which then segments its own
+// data (headcount, hires/separations, recruitment cost) by that year like any other.
+function configExtraYears(){
+  return ((CONFIG && CONFIG.extraUploadYears) || []).filter(y=> Number(y)>=MIN_YEAR);
+}
 function yearOptions(){
   const now = new Date().getFullYear();
   let ys = new Set();
-  for(let y=now-3; y<=now+3; y++) ys.add(y);
+  for(let y=Math.max(MIN_YEAR, now-3); y<=now+3; y++) ys.add(y);
   EMP.forEach(e=>{
-    const h = hireTagDate(e); if(h) ys.add(h.getFullYear());
-    const s = separationTagDate(e); if(s) ys.add(s.getFullYear());
+    const h = hireTagDate(e); if(h && h.getFullYear()>=MIN_YEAR) ys.add(h.getFullYear());
+    const s = separationTagDate(e); if(s && s.getFullYear()>=MIN_YEAR) ys.add(s.getFullYear());
   });
-  ys.add(Number(ui.month.split('-')[0]));
+  configExtraYears().forEach(y=> ys.add(y));
+  const uiYear = Number(ui.month.split('-')[0]);
+  if(uiYear>=MIN_YEAR) ys.add(uiYear);
   return Array.from(ys).sort((a,b)=>a-b);
 }
 function setReportingYear(v){
@@ -2158,8 +2311,8 @@ function monthLabel(ms){
 function monthOptions(){
   let set = new Set([monthStr(new Date())]);
   EMP.forEach(e=>{
-    const h = hireTagDate(e); if(h) set.add(monthStr(h));
-    const s = separationTagDate(e); if(s) set.add(monthStr(s));
+    const h = hireTagDate(e); if(h && h.getFullYear()>=MIN_YEAR) set.add(monthStr(h));
+    const s = separationTagDate(e); if(s && s.getFullYear()>=MIN_YEAR) set.add(monthStr(s));
   });
   return Array.from(set).sort().reverse();
 }
@@ -2301,11 +2454,11 @@ function refreshUploadMonthMarks(){
 function uploadMonthOptions(){
   let set = new Set(monthOptions());
   const now = new Date();
-  for(let i=0;i<18;i++){ set.add(monthStr(new Date(now.getFullYear(), now.getMonth()-i, 1))); }
+  for(let i=0;i<18;i++){ const d = new Date(now.getFullYear(), now.getMonth()-i, 1); if(d.getFullYear()>=MIN_YEAR) set.add(monthStr(d)); }
   // Forward-fill every month through December 2030 by default, extended further by any
-  // extra years added in the Control Panel (task F).
-  const maxYear = Math.max(2030, now.getFullYear(), ...((CONFIG && CONFIG.extraUploadYears) || []));
-  for(let y=now.getFullYear(); y<=maxYear; y++){
+  // extra years added in Control Panel → Additional Years (task F).
+  const maxYear = Math.max(2030, now.getFullYear(), ...configExtraYears());
+  for(let y=Math.max(MIN_YEAR, now.getFullYear()); y<=maxYear; y++){
     for(let m=1;m<=12;m++){ set.add(`${y}-${String(m).padStart(2,'0')}`); }
   }
   return Array.from(set).sort().reverse();
@@ -3501,11 +3654,12 @@ function downloadRecruitExport(){
 
 /* ============ HIRE & SEPARATION ARCHIVE ============ */
 function archiveYears(){
-  let ys = new Set([new Date().getFullYear()]);
+  let ys = new Set([Math.max(MIN_YEAR, new Date().getFullYear())]);
   EMP.forEach(e=>{
-    const dh = hireTagDate(e); if(dh) ys.add(dh.getFullYear());
-    const ds = separationTagDate(e); if(ds) ys.add(ds.getFullYear());
+    const dh = hireTagDate(e); if(dh && dh.getFullYear()>=MIN_YEAR) ys.add(dh.getFullYear());
+    const ds = separationTagDate(e); if(ds && ds.getFullYear()>=MIN_YEAR) ys.add(ds.getFullYear());
   });
+  configExtraYears().forEach(y=> ys.add(y));
   return Array.from(ys).sort((a,b)=> b-a);
 }
 // Intern/OJT is tracked separately from directly-employed Hires/Separations everywhere in the
@@ -3614,14 +3768,15 @@ function hireTable(list){
   const admin = isAdmin();
   const canEdit = canQuickAdd();
   // Fixed column widths (colgroup) so ID/Gender/Status/Date/Reporting Month line up as a clean
-  // grid across every row, rather than each column just sizing to its widest cell.
-  const widths = canEdit ? [7,15,7,12,10,12,9,8,8,12] : [8,17,8,14,12,14,10,9,8];
-  return `<table class="simple archive-table">
+  // grid across every row, rather than each column just sizing to its widest cell. Now that New
+  // Hires and Separations stack full-width instead of sitting side by side, Name gets more room.
+  const widths = canEdit ? [6,18,6,12,10,12,9,8,8,11] : [7,20,7,14,12,14,9,9,8];
+  return `<div class="archive-table-wrap"><table class="simple archive-table">
     <colgroup>${widths.map(w=>`<col style="width:${w}%;">`).join('')}</colgroup>
     <thead><tr><th class="ctr">ID</th><th>Name</th><th class="ctr">Gender</th><th>Company</th><th>Department</th><th>Position</th><th class="ctr">Status</th><th class="ctr">Date Hired</th><th class="ctr">Reporting Month</th>${canEdit?'<th class="ctr"></th>':''}</tr></thead>
     <tbody>${list.map(e=>`<tr>
       <td class="ctr">${e.employeeId||''}</td>
-      <td>${e.lastName||''}, ${e.firstName||''}</td>
+      <td class="namecell">${e.lastName||''}, ${e.firstName||''}</td>
       <td class="ctr">${e.gender||''}</td>
       <td>${e.company||''}</td>
       <td>${deptOfEmployee(e, false)}</td>
@@ -3631,18 +3786,18 @@ function hireTable(list){
       <td class="ctr">${hireTagMonthOf(e) ? monthLabel(hireTagMonthOf(e)) : ''}</td>
       ${canEdit?`<td class="ctr row-actions"><button class="btn small" onclick="openEditEmployeeModal('${e.employeeId}')">Edit</button>${admin?` <button class="btn small danger" onclick="archiveDeleteRecord('${e.employeeId}')">Delete</button>`:''}</td>`:''}
     </tr>`).join('')}</tbody>
-  </table>`;
+  </table></div>`;
 }
 function separationTable(list){
   const admin = isAdmin();
   const canEdit = canQuickAdd();
-  const widths = canEdit ? [7,13,6,10,8,8,8,13,15,12] : [7,15,7,12,10,9,9,14,17];
-  return `<table class="simple archive-table">
+  const widths = canEdit ? [6,16,6,10,8,8,8,14,13,11] : [7,18,7,12,10,9,9,14,14];
+  return `<div class="archive-table-wrap"><table class="simple archive-table">
     <colgroup>${widths.map(w=>`<col style="width:${w}%;">`).join('')}</colgroup>
     <thead><tr><th class="ctr">ID</th><th>Name</th><th class="ctr">Gender</th><th>Company</th><th>Department</th><th class="ctr">Date Separated</th><th class="ctr">Reporting Month</th><th>Reason</th><th>Remarks</th>${canEdit?'<th class="ctr"></th>':''}</tr></thead>
     <tbody>${list.map(e=>`<tr>
       <td class="ctr">${e.employeeId||''}</td>
-      <td>${e.lastName||''}, ${e.firstName||''}</td>
+      <td class="namecell">${e.lastName||''}, ${e.firstName||''}</td>
       <td class="ctr">${e.gender||''}</td>
       <td>${e.company||''}</td>
       <td>${deptOfEmployee(e, false)}</td>
@@ -3652,7 +3807,7 @@ function separationTable(list){
       <td class="wrap">${e.separationRemarks||''}</td>
       ${canEdit?`<td class="ctr row-actions"><button class="btn small" onclick="openEditEmployeeModal('${e.employeeId}')">Edit</button>${admin?` <button class="btn small danger" onclick="archiveDeleteRecord('${e.employeeId}')">Delete</button>`:''}</td>`:''}
     </tr>`).join('')}</tbody>
-  </table>`;
+  </table></div>`;
 }
 
 /* ============ BOUND FOR PERFORMANCE APPRAISAL ============
@@ -4343,7 +4498,210 @@ function renderExecReport(){
   `;
 }
 
-/* ============ DATA MANAGEMENT ============ */
+/* ============ CERTIFICATE OF EMPLOYMENT ============ */
+function coeDefaultBody(){
+  const c = ui.coe;
+  const pronoun = c.pronoun || 'Their';
+  const hired = c.dateHired ? fmtDateLong(c.dateHired) : '____________';
+  const endPhrase = c.present ? 'the present' : (c.dateSeparated ? fmtDateLong(c.dateSeparated) : '____________');
+  const deptPhrase = c.department ? ` assigned in **${c.department}**` : '';
+  const name = (c.name||'').toUpperCase() || '____________';
+  const company = c.companyLabel || '____________';
+  const position = c.position || '____________';
+  const issuedLine = c.issuedDate ? `Issued this ${fmtOrdinalLongDate(c.issuedDate)}, at ${c.address||'____________'}.` : `Issued at ${c.address||'____________'}.`;
+  // Key details (name, company, department, position, dates) are wrapped in **double
+  // asterisks** — a lightweight bold marker rendered by coePrintHTML — rather than raw HTML, so
+  // the text stays fully and safely editable in the plain-text bodyText textarea.
+  return `This is to certify that **${name}** has been employed with **${company}**${deptPhrase} as **${position}.** ${pronoun} employment started from **${hired}** until **${endPhrase}**.\n\n${c.purpose||''}\n\n${issuedLine}`;
+}
+// Rebuilds the certificate body from the structured fields — only called explicitly (company/
+// employee change, or the Regenerate button), so it never clobbers a manual edit made directly
+// in the textarea.
+function regenerateCOEBody(){
+  ui.coe.bodyText = coeDefaultBody();
+  render();
+}
+function selectCOECompany(company){
+  ui.coe.company = company;
+  const defaults = (CONFIG.coeSettings && CONFIG.coeSettings[company]) || {};
+  ui.coe.companyLabel = defaults.companyLabel || company || '';
+  ui.coe.address = defaults.address || '';
+  ui.coe.purpose = defaults.purpose || 'This certification is being issued for whatever legal purpose this may serve.';
+  ui.coe.signatoryName = defaults.signatoryName || '';
+  ui.coe.signatoryTitle = defaults.signatoryTitle || '';
+  ui.coe.employeeId = '';
+  ui.coe.name = ''; ui.coe.position = ''; ui.coe.department = '';
+  ui.coe.dateHired = ''; ui.coe.present = true; ui.coe.dateSeparated = '';
+  ui.coe.pronoun = 'Their';
+  if(!ui.coe.issuedDate) ui.coe.issuedDate = fmtDate(new Date());
+  regenerateCOEBody();
+}
+function selectCOEEmployee(id){
+  ui.coe.employeeId = id;
+  if(id){
+    const emp = EMP.find(e=> String(e.employeeId)===String(id));
+    if(emp){
+      ui.coe.name = `${emp.firstName||''} ${emp.middleName?emp.middleName.trim().charAt(0)+'. ':''}${emp.lastName||''}`.replace(/\s+/g,' ').trim();
+      ui.coe.position = emp.position || '';
+      ui.coe.department = deptOfEmployee(emp, true);
+      ui.coe.dateHired = emp.dateHired || '';
+      ui.coe.present = !emp.dateSeparated;
+      ui.coe.dateSeparated = emp.dateSeparated || '';
+      ui.coe.pronoun = emp.gender==='Male' ? 'His' : (emp.gender==='Female' ? 'Her' : 'Their');
+    }
+  }
+  regenerateCOEBody();
+}
+// Every structured field (name override, position, dates, address, signatory, etc.) writes
+// straight into ui.coe and only refreshes the preview pane — never a full render() — so typing
+// in one field never steals focus away from itself.
+function updateCOEField(key, value){
+  ui.coe[key] = value;
+  refreshCOEPreview();
+}
+function updateCOEPresent(checked){
+  ui.coe.present = checked;
+  const dsEl = document.getElementById('coeDateSeparated');
+  if(dsEl) dsEl.disabled = checked;
+  refreshCOEPreview();
+}
+function updateCOEBodyText(value){
+  ui.coe.bodyText = value;
+  refreshCOEPreview();
+}
+function refreshCOEPreview(){
+  const el = document.getElementById('coePrintArea');
+  if(el) el.innerHTML = coePrintHTML();
+}
+// Turns the plain-text **bold** markers in bodyText into <strong> tags. Runs on already
+// HTML-escaped text (escapeHtml never touches asterisks), so this stays injection-safe.
+function coeBoldMarkers(escapedText){
+  return escapedText.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+}
+function coePrintHTML(){
+  const c = ui.coe;
+  const paras = (c.bodyText||'').split(/\n\s*\n/).map(p=> p.trim()).filter(Boolean);
+  return `
+  <div class="coe-page" id="coePage">
+    <div class="coe-letterhead-space"></div>
+    <div class="coe-content">
+      <div class="coe-title">CERTIFICATION</div>
+      <div class="coe-body">${paras.length ? paras.map(p=>`<p>${coeBoldMarkers(escapeHtml(p))}</p>`).join('') : '<p style="color:#999;">Pick or enter an employee\'s details on the left to generate the certification text.</p>'}</div>
+      <div class="coe-sign">
+        <div class="coe-sign-name">${escapeHtml(c.signatoryName||'')}</div>
+        <div class="coe-sign-title">${escapeHtml(c.signatoryTitle||'')}</div>
+      </div>
+    </div>
+  </div>`;
+}
+async function saveCOECompanyDefaults(){
+  if(!ui.coe.company){ toast('Pick a company first.'); return; }
+  CONFIG.coeSettings = CONFIG.coeSettings || {};
+  CONFIG.coeSettings[ui.coe.company] = {
+    companyLabel: ui.coe.companyLabel, address: ui.coe.address, purpose: ui.coe.purpose,
+    signatoryName: ui.coe.signatoryName, signatoryTitle: ui.coe.signatoryTitle
+  };
+  await saveConfig();
+  toast(`Defaults saved for ${ui.coe.company} — company name, address, purpose line, and signatory will auto-fill next time.`);
+}
+function resetCOEForm(){
+  const company = ui.coe.company;
+  ui.coe = {
+    company:null, employeeId:'', companyLabel:'', name:'', position:'', department:'',
+    pronoun:'Their', dateHired:'', present:true, dateSeparated:'',
+    issuedDate: fmtDate(new Date()), address:'', purpose:'This certification is being issued for whatever legal purpose this may serve.',
+    signatoryName:'', signatoryTitle:'', bodyText:''
+  };
+  if(company) selectCOECompany(company); else render();
+}
+function printCOE(){
+  if(!(ui.coe.bodyText||'').trim()){ toast('Nothing to print yet — pick or enter an employee\'s details first.'); return; }
+  window.print();
+}
+function renderCOE(){
+  const settingsCompanies = allCompanies().map(c=>c.company);
+  if(!ui.coe.company || !settingsCompanies.includes(ui.coe.company)){
+    if(settingsCompanies.length) selectCOECompany(settingsCompanies[0]);
+  }
+  if(!ui.coe.issuedDate) ui.coe.issuedDate = fmtDate(new Date());
+  if(!ui.coe.bodyText) ui.coe.bodyText = coeDefaultBody();
+  const c = ui.coe;
+  const companyEmployees = c.company ? EMP.filter(e=> e.company===c.company).slice().sort((a,b)=> (a.lastName||'').localeCompare(b.lastName||'')) : [];
+
+  return `
+  <div class="coe-layout" style="display:grid;grid-template-columns:minmax(320px,420px) 1fr;gap:20px;align-items:start;">
+    <div class="exec-noprint">
+      <div class="panel">
+        <div class="panel-head"><h3>Certificate Details</h3></div>
+        <div class="field" style="margin-bottom:10px;"><label>COMPANY</label>
+          <select onchange="selectCOECompany(this.value)">
+            ${settingsCompanies.map(co=>`<option value="${co}" ${co===c.company?'selected':''}>${co} — ${industryOf(co)}</option>`).join('')}
+          </select>
+        </div>
+        <div class="field" style="margin-bottom:10px;"><label>COMPANY NAME ON CERTIFICATE</label>
+          <input type="text" value="${escapeHtml(c.companyLabel)}" oninput="updateCOEField('companyLabel', this.value)" placeholder="e.g. PRIMARY STRUCTURES CORP.">
+        </div>
+        <div class="field" style="margin-bottom:10px;"><label>EMPLOYEE</label>
+          <select onchange="selectCOEEmployee(this.value)">
+            <option value="">— Manual entry (not in roster) —</option>
+            ${companyEmployees.map(e=>`<option value="${e.employeeId}" ${String(e.employeeId)===String(c.employeeId)?'selected':''}>${e.lastName||''}, ${e.firstName||''} (${e.employeeId})${e.dateSeparated?' — separated':''}</option>`).join('')}
+          </select>
+        </div>
+        <div class="field-row" style="margin-bottom:10px;">
+          <div class="field"><label>NAME</label><input type="text" value="${escapeHtml(c.name)}" oninput="updateCOEField('name', this.value)"></div>
+          <div class="field"><label>PRONOUN</label>
+            <select onchange="updateCOEField('pronoun', this.value)">
+              ${['His','Her','Their'].map(p=>`<option ${p===c.pronoun?'selected':''}>${p}</option>`).join('')}
+            </select>
+          </div>
+        </div>
+        <div class="field-row" style="margin-bottom:10px;">
+          <div class="field"><label>POSITION</label><input type="text" value="${escapeHtml(c.position)}" oninput="updateCOEField('position', this.value)"></div>
+          <div class="field"><label>DEPARTMENT</label><input type="text" value="${escapeHtml(c.department)}" oninput="updateCOEField('department', this.value)"></div>
+        </div>
+        <div class="field-row" style="margin-bottom:10px;align-items:center;">
+          <div class="field"><label>DATE HIRED</label><input type="date" value="${c.dateHired||''}" oninput="updateCOEField('dateHired', this.value)"></div>
+          <div class="field"><label>DATE SEPARATED</label><input type="date" id="coeDateSeparated" value="${c.dateSeparated||''}" ${c.present?'disabled':''} oninput="updateCOEField('dateSeparated', this.value)"></div>
+        </div>
+        <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:10px;">
+          <input type="checkbox" ${c.present?'checked':''} onchange="updateCOEPresent(this.checked)"> Currently employed (Present)
+        </label>
+        <div class="field-row" style="margin-bottom:10px;">
+          <div class="field"><label>ISSUED DATE</label><input type="date" value="${c.issuedDate||''}" oninput="updateCOEField('issuedDate', this.value)"></div>
+          <div class="field"><label>ADDRESS WHERE ISSUED</label><input type="text" value="${escapeHtml(c.address)}" oninput="updateCOEField('address', this.value)" placeholder="e.g. #333 V. Rama St., City, Cebu, Philippines"></div>
+        </div>
+        <div class="field" style="margin-bottom:10px;"><label>PURPOSE LINE</label>
+          <input type="text" value="${escapeHtml(c.purpose)}" oninput="updateCOEField('purpose', this.value)">
+        </div>
+        <div class="field-row" style="margin-bottom:14px;">
+          <div class="field"><label>SIGNATORY NAME</label><input type="text" value="${escapeHtml(c.signatoryName)}" oninput="updateCOEField('signatoryName', this.value)"></div>
+          <div class="field"><label>SIGNATORY TITLE</label><input type="text" value="${escapeHtml(c.signatoryTitle)}" oninput="updateCOEField('signatoryTitle', this.value)"></div>
+        </div>
+        <div class="field-row">
+          <button class="btn" onclick="regenerateCOEBody()">↻ Regenerate Text From Fields</button>
+          <button class="btn" onclick="saveCOECompanyDefaults()">Save as Default for ${c.company||'Company'}</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h3>Certification Text <span style="font-weight:400;color:var(--dim);font-size:12px;">edit freely — this is exactly what prints</span></h3></div>
+        <textarea id="coeBodyTextArea" oninput="updateCOEBodyText(this.value)" style="width:100%;min-height:220px;font-family:var(--mono);font-size:12.5px;line-height:1.6;padding:10px;border:1px solid var(--border);border-radius:6px;background:var(--surface2);color:var(--text);">${escapeHtml(c.bodyText)}</textarea>
+        <p class="hint" style="margin-top:8px;">Blank line = new paragraph. Use <b>Regenerate</b> above if you want to start over from the fields.</p>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h3>Print</h3></div>
+        <p class="hint">Prints on short bond paper (8.5" × 11", portrait). Sized to one page.</p>
+        <button class="btn primary" style="width:100%;" onclick="printCOE()">🖨️ Print Certificate</button>
+        <button class="btn" style="width:100%;margin-top:8px;" onclick="resetCOEForm()">New Certificate</button>
+      </div>
+    </div>
+
+    <div id="coePrintArea">${coePrintHTML()}</div>
+  </div>`;
+}
+
+
 function renderData(){
   const companies = allCompanies().map(c=>c.company);
   const monthOpts = uploadMonthOptions();
@@ -4782,8 +5140,9 @@ async function confirmTransfer(){
   if(newDept==='__new__'){
     newDept = (document.getElementById('m_newDept_new').value||'').trim();
     if(newDept){
-      CONFIG.departments = CONFIG.departments || [];
-      if(!CONFIG.departments.includes(newDept)){ CONFIG.departments.push(newDept); CONFIG.departments.sort(); await saveConfig(); }
+      CONFIG.departments = CONFIG.departments || {};
+      CONFIG.departments[emp.company] = CONFIG.departments[emp.company] || [];
+      if(!CONFIG.departments[emp.company].includes(newDept)){ CONFIG.departments[emp.company].push(newDept); CONFIG.departments[emp.company].sort(); await saveConfig(); }
     }
   }
   const date = document.getElementById('m_transferDate').value || fmtDate(new Date());
@@ -5299,12 +5658,12 @@ function renderSettings(){
 
   const attention = [];
   settingsCompanies.forEach(c=>{
+    if(costCentersForCompany(c).length && !departmentsForCompany(c).length){
+      attention.push(`<li>${c}: no departments added yet, so its cost centers can't be assigned one — <a href="#" onclick="event.preventDefault(); ui.ccDeptCompany='${c}'; render(); setTimeout(()=>{const el=document.getElementById('deptPanel'); if(el) el.scrollIntoView({behavior:'smooth'});},0);">Add one</a></li>`);
+    }
     const n = unmappedCostCentersForCompany(c).length;
     if(n) attention.push(`<li>${c}: <b>${n}</b> cost center(s) need a department — <a href="#" onclick="event.preventDefault(); ui.ccDeptCompany='${c}'; render(); setTimeout(()=>{const el=document.getElementById('ccDeptPanel'); if(el) el.scrollIntoView({behavior:'smooth'});},0);">Fix now</a></li>`);
   });
-  if(!CONFIG.departments.length && settingsCompanies.some(c=> costCentersForCompany(c).length)){
-    attention.push(`<li>No departments have been added yet, so cost centers can't be assigned — <a href="#" onclick="event.preventDefault(); const el=document.getElementById('deptPanel'); if(el) el.scrollIntoView({behavior:'smooth'});">Add one</a></li>`);
-  }
 
   return `
   ${attention.length ? `
@@ -5407,18 +5766,27 @@ function renderSettings(){
   </div>
 
   <div class="panel" id="deptPanel">
-    <div class="panel-head"><h3>Departments</h3></div>
+    <div class="panel-head"><h3>Departments <span style="font-weight:400;color:var(--dim);font-size:12px;">categorized per company, same as cost centers</span></h3></div>
+    <div class="field-row" style="align-items:flex-end;">
+      <div class="field"><label>COMPANY</label>
+        <select onchange="ui.ccDeptCompany=this.value; render();">
+          ${settingsCompanies.map(c=>`<option value="${c}" ${c===ui.ccDeptCompany?'selected':''}>${c} — ${industryOf(c)}</option>`).join('')}
+        </select>
+      </div>
+    </div>
+    ${!settingsCompanies.length ? '<div class="empty">Add a company above first.</div>' : `
     <div class="field-row">
-      ${CONFIG.departments.map((d,i)=>`<span class="pill staff" style="display:flex;align-items:center;gap:8px;">${d} <span style="cursor:pointer;color:var(--red);" onclick="removeDepartment(${i})">✕</span></span>`).join('') || '<span class="hint">No departments yet — add one below.</span>'}
+      ${departmentsForCompany(ui.ccDeptCompany).map((d,i)=>`<span class="pill staff" style="display:flex;align-items:center;gap:8px;">${d} <span style="cursor:pointer;color:var(--red);" onclick="removeDepartment('${ui.ccDeptCompany}', ${i})" title="Remove">✕</span></span>`).join('') || `<span class="hint">No departments yet for ${ui.ccDeptCompany} — add one below.</span>`}
     </div>
     <div class="field-row">
       <input type="text" id="newDept" placeholder="e.g. Site Operations">
       <button class="btn" onclick="addDepartment()">+ Add Department</button>
     </div>
+    `}
   </div>
 
   <div class="panel" id="ccDeptPanel">
-    <div class="panel-head"><h3>Cost Center → Department <span style="font-weight:400;color:var(--dim);font-size:12px;">select a company, then assign its cost centers</span></h3></div>
+    <div class="panel-head"><h3>Cost Center → Department <span style="font-weight:400;color:var(--dim);font-size:12px;">select a company, then assign, rename, or delete its cost centers</span></h3></div>
     <div class="field-row" style="align-items:flex-end;">
       <div class="field"><label>COMPANY</label>
         <select onchange="ui.ccDeptCompany=this.value; render();">
@@ -5435,26 +5803,33 @@ function renderSettings(){
     ${!settingsCompanies.length ? '<div class="empty">Add a company above first.</div>' : `
     ${unmappedCostCentersForCompany(ui.ccDeptCompany).length ? `<p class="hint" style="color:var(--red);">${unmappedCostCentersForCompany(ui.ccDeptCompany).length} cost center(s) for ${ui.ccDeptCompany} still need a department.</p>` : ''}
     ${!costCentersForCompany(ui.ccDeptCompany).length ? '<div class="empty">No cost centers yet for this company — upload a master file, or add one manually above.</div>' : `
-    <table class="simple"><thead><tr><th>Cost Center</th><th>Department</th></tr></thead>
-      <tbody>${costCentersForCompany(ui.ccDeptCompany).map(cc=>`<tr>
+    <table class="simple"><thead><tr><th>Cost Center</th><th>Department</th><th></th></tr></thead>
+      <tbody>${costCentersForCompany(ui.ccDeptCompany).map(cc=>{
+        const depts = departmentsForCompany(ui.ccDeptCompany);
+        return `<tr>
         <td>${cc}</td>
-        <td><select onchange="setCostCenterDept('${ui.ccDeptCompany}','${cc}', this.value)" ${!CONFIG.departments.length?'disabled':''}>
+        <td><select onchange="setCostCenterDept('${ui.ccDeptCompany}','${cc}', this.value)" ${!depts.length?'disabled':''}>
           <option value="">Unassigned</option>
-          ${CONFIG.departments.map(d=>`<option ${CONFIG.costCenterDepartment[ccdKey(ui.ccDeptCompany,cc)]===d?'selected':''}>${d}</option>`).join('')}
+          ${depts.map(d=>`<option ${CONFIG.costCenterDepartment[ccdKey(ui.ccDeptCompany,cc)]===d?'selected':''}>${d}</option>`).join('')}
         </select></td>
-      </tr>`).join('')}</tbody>
+        <td style="white-space:nowrap;">
+          <button class="btn small" onclick="openModal('renameCC', {company:'${ui.ccDeptCompany}', cc:'${escapeHtml(cc)}'})" title="Rename">Rename</button>
+          <button class="btn small danger" onclick="deleteCostCenter('${ui.ccDeptCompany}','${cc}')" title="Delete">Delete</button>
+        </td>
+      </tr>`;}).join('')}</tbody>
     </table>`}
-    ${costCentersForCompany(ui.ccDeptCompany).length && !CONFIG.departments.length ? '<p class="hint">Add at least one department above to start assigning.</p>' : ''}
+    ${costCentersForCompany(ui.ccDeptCompany).length && !departmentsForCompany(ui.ccDeptCompany).length ? '<p class="hint">Add at least one department above to start assigning.</p>' : ''}
     `}
   </div>
 
   <div class="panel">
-    <div class="panel-head"><h3>Master List Upload — Year Range <span style="font-weight:400;color:var(--dim);font-size:12px;">extend how far ahead you can pick an "As of Month"</span></h3></div>
+    <div class="panel-head"><h3>Additional Years <span style="font-weight:400;color:var(--dim);font-size:12px;">extend the Year picker everywhere — topbar, Recruitment, Archive, and Master List "As of Month"</span></h3></div>
+    <p class="hint">Adding a year here makes it selectable app-wide right away; once data is on file for it, it segments into its own headcount, hires/separations, and recruitment-cost figures just like every other year. Years before 2026 aren't supported.</p>
     <div class="field-row">
       ${(CONFIG.extraUploadYears||[]).length ? CONFIG.extraUploadYears.map((y,i)=>`<span class="pill staff" style="display:flex;align-items:center;gap:8px;">${y} <span style="cursor:pointer;color:var(--red);" onclick="removeExtraUploadYear(${i})">✕</span></span>`).join('') : '<span class="hint">No extra years added — 2030 is the current cap.</span>'}
     </div>
     <div class="field-row">
-      <input type="number" id="newExtraYear" placeholder="e.g. 2031">
+      <input type="number" id="newExtraYear" placeholder="e.g. 2031" min="2026">
       <button class="btn" onclick="addExtraUploadYear()">+ Add Year</button>
     </div>
   </div>
@@ -5597,8 +5972,10 @@ function positionJobGradeEditor(company, status){
 async function addExtraUploadYear(){
   const v = Number(document.getElementById('newExtraYear').value);
   if(!v) return;
+  if(v<MIN_YEAR){ toast(`Years before ${MIN_YEAR} aren't supported.`); return; }
   CONFIG.extraUploadYears = CONFIG.extraUploadYears || [];
   if(!CONFIG.extraUploadYears.includes(v)) CONFIG.extraUploadYears.push(v);
+  CONFIG.extraUploadYears.sort((a,b)=>a-b);
   await saveConfig(); render();
 }
 async function removeExtraUploadYear(i){ CONFIG.extraUploadYears.splice(i,1); await saveConfig(); render(); }
@@ -5646,16 +6023,25 @@ async function addSepReason(){
 async function removeSepReason(i){ CONFIG.separationReasons.splice(i,1); await saveConfig(); render(); }
 
 async function addDepartment(){
+  const company = ui.ccDeptCompany;
   const v = document.getElementById('newDept').value.trim();
-  if(!v) return;
-  if(!CONFIG.departments.includes(v)) CONFIG.departments.push(v);
+  if(!v || !company) return;
+  CONFIG.departments = CONFIG.departments || {};
+  CONFIG.departments[company] = CONFIG.departments[company] || [];
+  if(!CONFIG.departments[company].includes(v)){ CONFIG.departments[company].push(v); CONFIG.departments[company].sort(); }
   await saveConfig(); render();
 }
-async function removeDepartment(i){
-  const removed = CONFIG.departments[i];
-  CONFIG.departments.splice(i,1);
-  Object.keys(CONFIG.costCenterDepartment).forEach(key=>{ if(CONFIG.costCenterDepartment[key]===removed) delete CONFIG.costCenterDepartment[key]; });
-  await saveConfig(); render();
+async function removeDepartment(company, i){
+  CONFIG.departments = CONFIG.departments || {};
+  const list = CONFIG.departments[company] || [];
+  const removed = list[i];
+  if(removed===undefined) return;
+  list.splice(i,1);
+  Object.keys(CONFIG.costCenterDepartment).forEach(key=>{
+    if(key.indexOf(company+'|')===0 && CONFIG.costCenterDepartment[key]===removed) delete CONFIG.costCenterDepartment[key];
+  });
+  EMP.forEach(e=>{ if(e.company===company && e.departmentOverride===removed) delete e.departmentOverride; });
+  await saveConfig(); await saveEmp(); render();
 }
 async function setCostCenterDept(company, cc, dept){
   const key = ccdKey(company, cc);
@@ -5804,6 +6190,7 @@ function renderModal(){
   } else if(ui.modal.type==='transfer'){
     const emp = EMP.find(e=> String(e.employeeId)===String(ui.modal.arg));
     const ccs = emp ? costCentersForCompany(emp.company) : [];
+    const depts = emp ? departmentsForCompany(emp.company) : [];
     body = `<h3>Change Cost Center / Department</h3>
     <p class="hint">${emp ? `${emp.firstName} ${emp.lastName} · ID ${emp.employeeId} · ${emp.company}` : ''}</p>
     <p class="hint">Current cost center: <b>${emp && emp.costCenter ? emp.costCenter : 'Unassigned'}</b>${emp ? ` (Department: ${deptOfEmployee(emp, true)})` : ''}</p>
@@ -5818,7 +6205,7 @@ function renderModal(){
     <div class="field" style="margin-top:10px;"><label>DEPARTMENT</label>
       <select id="m_newDept" onchange="toggleTransferNewDept()">
         <option value="">Follow cost center mapping</option>
-        ${(CONFIG.departments||[]).map(d=>`<option ${emp && emp.departmentOverride===d?'selected':''}>${d}</option>`).join('')}
+        ${depts.map(d=>`<option ${emp && emp.departmentOverride===d?'selected':''}>${d}</option>`).join('')}
         <option value="__new__">+ New department…</option>
       </select>
       <input type="text" id="m_newDept_new" placeholder="New department name" style="display:none;margin-top:8px;">
@@ -5826,6 +6213,13 @@ function renderModal(){
     <div class="field" style="margin-top:10px;"><label>EFFECTIVE DATE</label><input type="date" id="m_transferDate" value="${fmtDate(new Date())}"></div>
     <p class="hint">Leave Department on <b>Follow cost center mapping</b> to keep it driven by Control Panel → Cost Center → Department. A department picked here sticks to this employee across monthly master list uploads, and only resets if their cost center changes.</p>
     <div style="margin-top:16px;"><button class="btn primary" onclick="confirmTransfer()">Save Transfer</button> <button class="btn" onclick="closeModal()">Cancel</button></div>`;
+  } else if(ui.modal.type==='renameCC'){
+    const {company, cc} = ui.modal.arg;
+    body = `<h3>Rename Cost Center</h3>
+    <p class="hint">${company} · currently <b>${cc}</b></p>
+    <div class="field"><label>NEW CODE</label><input type="text" id="m_renameCC" value="${cc}"></div>
+    <p class="hint">Every employee currently on ${cc} will be moved to the new code, and its department assignment carries over.</p>
+    <div style="margin-top:16px;"><button class="btn primary" onclick="handleRenameCC('${company}','${cc}')">Save</button> <button class="btn" onclick="closeModal()">Cancel</button></div>`;
   } else if(ui.modal.type==='confirmReupload'){
     const {company, status, asOfMonth, fileName} = ui.modal.arg;
     const prev = ((CONFIG.uploadLog||{})[uploadLogKey(company,status)]||{})[asOfMonth] || {};
