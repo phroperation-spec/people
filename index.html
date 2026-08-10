@@ -544,9 +544,48 @@ function schedulePush(){
   _pushTimer = setTimeout(pushToCloud, 900);
 }
 
+// ---- Firebase key sanitization ------------------------------------------
+// Realtime Database keys can't contain '.', '#', '$', '/', '[', or ']' — but
+// real cost center codes (e.g. "ABC-QA/C") do contain '/', and several CONFIG
+// objects (costCenterDepartment, manualCostCenters, etc.) use free-text values
+// like that AS object keys. Without this, one such code makes the ENTIRE
+// payload's set() call fail — not just that one field — silently losing every
+// other edit in the same save along with it. These walk the whole payload
+// recursively and swap unsafe characters in KEYS ONLY (never touching values)
+// for a reversible placeholder before every push, and reverse it on every pull.
+const FB_KEY_ESCAPES = {'.':'~dot~', '#':'~hash~', '$':'~dollar~', '/':'~slash~', '[':'~lb~', ']':'~rb~'};
+const FB_KEY_UNSAFE_RE = /[.#$/[\]]/g;
+const FB_KEY_UNESCAPES = {dot:'.', hash:'#', dollar:'$', slash:'/', lb:'[', rb:']'};
+const FB_KEY_ESCAPED_RE = /~(dot|hash|dollar|slash|lb|rb)~/g;
+function fbSanitizeKeys(node){
+  if (Array.isArray(node)) return node.map(fbSanitizeKeys);
+  if (node && typeof node === 'object'){
+    const out = {};
+    Object.keys(node).forEach(k=>{
+      const safeKey = k.replace(FB_KEY_UNSAFE_RE, c => FB_KEY_ESCAPES[c]);
+      out[safeKey] = fbSanitizeKeys(node[k]);
+    });
+    return out;
+  }
+  return node;
+}
+function fbRestoreKeys(node){
+  if (Array.isArray(node)) return node.map(fbRestoreKeys);
+  if (node && typeof node === 'object'){
+    const out = {};
+    Object.keys(node).forEach(k=>{
+      const realKey = k.replace(FB_KEY_ESCAPED_RE, (m, tag) => FB_KEY_UNESCAPES[tag]);
+      out[realKey] = fbRestoreKeys(node[k]);
+    });
+    return out;
+  }
+  return node;
+}
+
 // Shared by the one-time pull and the live listener below.
 function applyRemoteData(data){
   if (hasUnsyncedLocalChanges()) return false; // don't clobber an edit that's still on its way up
+  data = fbRestoreKeys(data);
   let changed = false;
   if (data && data.config){
     CONFIG = sanitizeConfig(data.config);
@@ -602,7 +641,7 @@ async function pushToCloud(){
     };
     const seqAtPush = _localChangeSeq;
     _lastKnownUpdatedAt = payload.updatedAt; // set before the write so our own echo is recognized and skipped
-    await _fbRef.set(payload);
+    await _fbRef.set(fbSanitizeKeys(payload));
     _syncedChangeSeq = seqAtPush;
     updateSyncBadge('synced', new Date(payload.updatedAt).toLocaleTimeString());
   }catch(err){
