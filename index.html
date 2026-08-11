@@ -338,6 +338,7 @@ let ui = {
   jobGradeCompany:null,
   jobGradeStatus:null,
   overviewCompany:'',
+  overviewIndustry:'',
   positionView:'breakdown',
   deptSearch:'',
   costcenterSearch:'',
@@ -1628,13 +1629,22 @@ function orgBaselineMonth(){
 // reported data yet (before a scope's first Master List baseline, or later than the reporting
 // month currently selected) are emitted as placeholders: they keep their slot and label on every
 // graph but carry no value, so nothing is invented for a month that hasn't been reported.
-function orgTrend(company){
+function orgTrend(company, companiesList){
   const [y,m] = ui.month.split('-').map(Number);
-  const inScope = e=> !company || e.company===company;
+  // companiesList (optional): scopes to a specific set of companies — e.g. every company in an
+  // Industry — when no single company is picked. Ignored if `company` is set, since a single
+  // company is already the narrowest possible scope.
+  const scopeList = (!company && companiesList && companiesList.length) ? companiesList : null;
+  const inScope = e=> scopeList ? scopeList.includes(e.company) : (!company || e.company===company);
   // A scope only has a baseline recorded if its first Master List went through this app. When
   // it's missing, fall back to the earliest reporting month actually on file for that scope —
   // otherwise every month before real data existed reads as a legitimate headcount of 0.
-  let baseline = company ? companyBaselineMonth(company) : orgBaselineMonth();
+  let baseline;
+  if(company) baseline = companyBaselineMonth(company);
+  else if(scopeList){
+    const vals = scopeList.map(c=> companyBaselineMonth(c)).filter(Boolean);
+    baseline = vals.length ? vals.sort()[0] : null;
+  } else baseline = orgBaselineMonth();
   if(!baseline){
     let earliest = '';
     EMP.forEach(e=>{
@@ -2584,27 +2594,43 @@ function renderOverview(){
   const start = new Date(year,0,1);
   const end = new Date(year,11,31,23,59,59);
   const prevEnd = new Date(year-1,11,31,23,59,59);
-  const companies = allCompanies().map(c=>c.company);
-  const scopeCompany = (ui.overviewCompany && companies.includes(ui.overviewCompany)) ? ui.overviewCompany : '';
-  const scopeLabel = scopeCompany ? scopeCompany : 'All Companies';
+  const allCo = allCompanies();
+  const industries = CONFIG.industries.map(i=>i.name);
+  const scopeIndustry = (ui.overviewIndustry && industries.includes(ui.overviewIndustry)) ? ui.overviewIndustry : '';
+  // The Company Scope dropdown narrows to whichever industry is currently picked, so the two
+  // filters stay consistent with each other rather than letting you pick a company that doesn't
+  // belong to the selected industry.
+  const industryCompanies = allCo.filter(c=> !scopeIndustry || c.industry===scopeIndustry).map(c=>c.company);
+  const scopeCompany = (ui.overviewCompany && industryCompanies.includes(ui.overviewCompany)) ? ui.overviewCompany : '';
+  const scopeLabel = scopeCompany ? scopeCompany : (scopeIndustry ? scopeIndustry : 'All Companies');
   const scopePicker = `
-  <div class="field"><label>COMPANY SCOPE</label>
-    <select onchange="ui.overviewCompany=this.value; render();">
-      <option value="">All Companies</option>
-      ${companies.map(c=>`<option value="${c}" ${c===scopeCompany?'selected':''}>${c}</option>`).join('')}
-    </select>
+  <div class="field-row" style="gap:10px;">
+    <div class="field"><label>INDUSTRY SCOPE</label>
+      <select onchange="ui.overviewIndustry=this.value; ui.overviewCompany=''; render();">
+        <option value="">All Industries</option>
+        ${industries.map(i=>`<option value="${i}" ${i===scopeIndustry?'selected':''}>${i}</option>`).join('')}
+      </select>
+    </div>
+    <div class="field"><label>COMPANY SCOPE</label>
+      <select onchange="ui.overviewCompany=this.value; render();">
+        <option value="">${scopeIndustry ? 'All Companies in '+scopeIndustry : 'All Companies'}</option>
+        ${industryCompanies.map(c=>`<option value="${c}" ${c===scopeCompany?'selected':''}>${c}</option>`).join('')}
+      </select>
+    </div>
   </div>`;
 
   // Same idea as Company Detail's Monthly gate, but for the whole year: never populate the
-  // Trend & Insight snapshot for a year that has no reported data at all. For "All Companies"
-  // scope this only holds the page back if NOT ONE company reported anything all year; for a
-  // specific company, only that company's own data for the year counts.
-  if(!execReportYearHasData(scopeCompany, year)){
+  // Trend & Insight snapshot for a year that has no reported data at all. For "All
+  // Companies"/"All Industries" scope this only holds the page back if NOT ONE in-scope company
+  // reported anything all year; for a specific company, only that company's own data counts.
+  const scopeCompaniesForGate = scopeCompany ? [scopeCompany] : industryCompanies;
+  const hasScopeData = scopeCompaniesForGate.some(c=> companyYearHasData(c, year));
+  if(!hasScopeData){
     return `
     <div class="field-row" style="align-items:center;justify-content:space-between;">
       ${scopePicker}
     </div>
-    <div class="empty">No data has been fed for ${scopeLabel} in ${year} yet — no Master List, Quick Add, or New Hire &amp; Separated Import has touched this year${scopeCompany?'':' for any company'}. Upload or import data for ${year}, or pick a different year.</div>
+    <div class="empty">No data has been fed for ${scopeLabel} in ${year} yet — no Master List, Quick Add, or New Hire &amp; Separated Import has touched this year${scopeCompaniesForGate.length>1?' for any company in scope':''}. Upload or import data for ${year}, or pick a different year.</div>
     `;
   }
 
@@ -2612,10 +2638,12 @@ function renderOverview(){
   // this scope. Used only for the page's own as-of label; the underlying figures below already
   // reflect whatever's on file up to and including that month (a partial year simply reads as
   // year-to-date rather than pretending a full 12 months has been reported).
-  const asOfMonth = latestReportedMonthInYear(scopeCompany, year) || `${year}-12`;
+  let asOfMonth = '';
+  scopeCompaniesForGate.forEach(c=>{ const m = latestReportedMonthInYear(c, year); if(m && m>asOfMonth) asOfMonth = m; });
+  asOfMonth = asOfMonth || `${year}-12`;
   const asOfLabel = monthLabel(asOfMonth);
 
-  const inScope = e=> !scopeCompany || e.company===scopeCompany;
+  const inScope = e=> (!scopeCompany || e.company===scopeCompany) && (!scopeIndustry || industryOf(e.company)===scopeIndustry);
   const RATE_STATUSES = ['staff','rankfile'];
   // Task: the Workforce Snapshot (Total Headcount, Composition, Gender/Age/Tenure) must reflect
   // reported data for THIS year, per employment status — not just "this company had SOMETHING
@@ -2641,11 +2669,15 @@ function renderOverview(){
   const sepAllForRates = EMP.filter(e=> inScope(e) && RATE_STATUSES.includes(STATUS_KEY(e.employmentStatus)) && isSeparatedInReal(e,start,end) && statusReported(e));
   const rateBase = activeStartRateEligible.length || 1;
   const attr = (sepAllForRates.length/rateBase*100);
-  const trend = orgTrend(scopeCompany);
+  const trend = orgTrend(scopeCompany, scopeCompany ? null : industryCompanies);
 
   const genderOrder = ['Male','Female','Other','Unspecified'];
   const ageOrder = CONFIG.ageGroups.map(g=>g.label);
   const tenureOrder = CONFIG.tenureGroups.map(g=>g.label);
+  // Industry breakdown only earns its own panel when the scope isn't already narrowed to a
+  // single industry or company — at that point every active employee shares the same industry,
+  // so a bar chart of one 100% bar wouldn't add anything.
+  const showIndustryPanel = !scopeIndustry && !scopeCompany && industries.length>1;
 
   return `
   <div class="field-row" style="align-items:center;justify-content:space-between;">
@@ -2667,7 +2699,12 @@ function renderOverview(){
     </div>
   </div>
 
-  <div class="grid cards3" style="margin-top:16px;">
+  <div class="grid ${showIndustryPanel?'cards4':'cards3'}" style="margin-top:16px;">
+    ${showIndustryPanel ? `
+    <div class="panel">
+      <div class="panel-head"><h3>Industry</h3></div>
+      ${breakdownBarChart(activeAll, e=> industryOf(e.company), industries)}
+    </div>` : ''}
     <div class="panel">
       <div class="panel-head"><h3>Gender</h3></div>
       ${breakdownBarChart(activeAll, e=> e.gender || 'Unspecified', genderOrder)}
@@ -2715,14 +2752,16 @@ function renderOverview(){
     </div>
   </div>
 
-  <h2 class="section">Headcount Demographic <span class="n">per industry / per company · ${year} accumulated</span></h2>
-  ${overviewTable(year)}
+  <h2 class="section">Headcount Demographic <span class="n">per industry / per company · ${year} accumulated${scopeLabel!=='All Companies'?' · scoped to '+scopeLabel:''}</span></h2>
+  ${overviewTable(year, scopeIndustry, scopeCompany)}
   `;
 }
 
-function overviewTable(year){
+function overviewTable(year, scopeIndustry, scopeCompany){
   year = year || Number(ui.month.split('-')[0]) || new Date().getFullYear();
-  const companies = allCompanies();
+  let companies = allCompanies();
+  if(scopeIndustry) companies = companies.filter(c=> c.industry===scopeIndustry);
+  if(scopeCompany) companies = companies.filter(c=> c.company===scopeCompany);
   if(!companies.length) return '<div class="empty">No companies configured yet.</div>';
   const byInd = {};
   companies.forEach(c=>{ (byInd[c.industry] = byInd[c.industry]||[]).push(c.company); });
