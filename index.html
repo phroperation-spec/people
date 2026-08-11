@@ -1436,6 +1436,28 @@ function companyStatusStats(company, statusName, ms){
     retentionRate: (rateEligible && baseSet.length) ? (100-attrition) : 100
   };
 }
+// Annual counterpart of companyStatusStats — accumulates the whole calendar year (Jan 1 through
+// Dec 31) instead of one month, so Trend & Insight's Headcount Demographic table shows a
+// per-status year-to-date figure rather than a single month's snapshot.
+function companyStatusStatsAnnual(company, statusName, year){
+  const start = new Date(year,0,1), end = new Date(year,11,31,23,59,59);
+  const prevEnd = new Date(year-1,11,31,23,59,59);
+  const inScope = e=> e.company===company && e.employmentStatus===statusName;
+  const active = EMP.filter(e=> inScope(e) && isOnRosterAsOf(e,end));
+  const hired = EMP.filter(e=> inScope(e) && isHiredIn(e,start,end));
+  const separated = EMP.filter(e=> inScope(e) && isSeparatedIn(e,start,end));
+  const separatedForRates = EMP.filter(e=> inScope(e) && isSeparatedInReal(e,start,end));
+  const baseSet = EMP.filter(e=> inScope(e) && isActiveAsOf(e, prevEnd));
+  const rateEligible = STATUS_KEY(statusName) !== 'intern';
+  const base = baseSet.length || 1;
+  const attrition = rateEligible ? (separatedForRates.length/base*100) : 0;
+  return {
+    active: active.length, hired: hired.length, separated: separated.length,
+    baseCount: baseSet.length, rateEligible,
+    attritionRate: (rateEligible && baseSet.length) ? attrition : 0,
+    retentionRate: (rateEligible && baseSet.length) ? (100-attrition) : 100
+  };
+}
 function companyStatsAnnual(company, year){
   const start = new Date(year,0,1);
   const end = new Date(year,11,31,23,59,59);
@@ -2300,10 +2322,12 @@ function sidebar(){
 function topbar(){
   const current = NAV_ITEMS.find(n=>n[0]===ui.tab);
   const [curYear, curMonthNum] = ui.month.split('-').map(Number);
-  const monthIrrelevant = (ui.tab==='company' && ui.companyPeriod!=='monthly') || ui.tab==='archive' || ui.tab==='appraisal' || ui.tab==='coe' || (ui.tab==='forecastreport' && ui.forecastReportSub==='execreport' && ui.reportPeriod!=='monthly');
-  const monthOffTitle = ui.tab==='appraisal'
+  const monthIrrelevant = ui.tab==='overview' || (ui.tab==='company' && ui.companyPeriod!=='monthly') || ui.tab==='archive' || ui.tab==='appraisal' || ui.tab==='coe' || (ui.tab==='forecastreport' && ui.forecastReportSub==='execreport' && ui.reportPeriod!=='monthly');
+  const monthOffTitle = ui.tab==='overview'
+    ? "Month isn't used here — Trend & Insight shows accumulated/annual data for the Year selected above."
+    : (ui.tab==='appraisal'
     ? "Month isn't used here — evaluation due dates are tracked against today's date."
-    : (ui.tab==='coe' ? "Month isn't used here — the certificate uses its own Issued Date field." : (ui.tab==='forecastreport' ? "Month isn't used here — the Executive Report is showing the Annual period (Year picker up top still applies)." : "Month isn't used here — the Archive is browsed by year, showing all 12 months at once."));
+    : (ui.tab==='coe' ? "Month isn't used here — the certificate uses its own Issued Date field." : (ui.tab==='forecastreport' ? "Month isn't used here — the Executive Report is showing the Annual period (Year picker up top still applies)." : "Month isn't used here — the Archive is browsed by year, showing all 12 months at once.")));
 
   return `
   <div class="topbar${ui.tab==='coe' ? ' coe-topbar' : ''}">
@@ -2437,6 +2461,34 @@ function execReportMonthHasData(scope, month){
   const companies = scope ? [scope] : allCompanies().map(c=>c.company);
   return companies.some(c=> companyMonthHasData(c, month));
 }
+// Annual counterparts of isMonthUploaded/companyMonthHasData/execReportMonthHasData — Trend &
+// Insight reports on the whole selected year (accumulated / annual), not a single month, so its
+// gating and per-status "has this been reported yet" checks look across every month of the year
+// instead of one specific month.
+function anyMonthUploadedInYear(company, status, year){
+  for(let m=1;m<=12;m++){
+    if(isMonthUploaded(company, status, `${year}-${String(m).padStart(2,'0')}`)) return true;
+  }
+  return false;
+}
+function companyYearHasData(company, year){
+  return (CONFIG.statuses||[]).some(status=> anyMonthUploadedInYear(company, status, year));
+}
+function execReportYearHasData(scope, year){
+  const companies = scope ? [scope] : allCompanies().map(c=>c.company);
+  return companies.some(c=> companyYearHasData(c, year));
+}
+// Latest reporting month within `year` that has any data on file for a scope, so a still-in-
+// progress year reads as of its most recent real report rather than assuming a full year.
+function latestReportedMonthInYear(company, year){
+  const companies = company ? [company] : allCompanies().map(c=>c.company);
+  let latest = '';
+  for(let m=12;m>=1;m--){
+    const ms = `${year}-${String(m).padStart(2,'0')}`;
+    if(companies.some(c=> companyMonthHasData(c, ms))){ latest = ms; break; }
+  }
+  return latest;
+}
 async function recordUpload(company, status, month, rows){
   if(!CONFIG.uploadLog) CONFIG.uploadLog = {};
   const k = uploadLogKey(company, status);
@@ -2524,8 +2576,14 @@ function uploadMonthOptions(){
 
 /* ============ OVERVIEW ============ */
 function renderOverview(){
-  const {start,end} = monthBounds(ui.month);
-  const prevEnd = new Date(start.getTime()-1);
+  // Trend & Insight is now an ANNUAL / ACCUMULATED view rather than a single-month snapshot —
+  // it reports on the whole selected year (Jan 1 through Dec 31, or through the most recent
+  // month actually reported if the year is still in progress), using the same Year picker at
+  // the top of the page. The Month picker isn't used on this tab at all (see topbar()).
+  const year = Number(ui.month.split('-')[0]) || new Date().getFullYear();
+  const start = new Date(year,0,1);
+  const end = new Date(year,11,31,23,59,59);
+  const prevEnd = new Date(year-1,11,31,23,59,59);
   const companies = allCompanies().map(c=>c.company);
   const scopeCompany = (ui.overviewCompany && companies.includes(ui.overviewCompany)) ? ui.overviewCompany : '';
   const scopeLabel = scopeCompany ? scopeCompany : 'All Companies';
@@ -2537,41 +2595,48 @@ function renderOverview(){
     </select>
   </div>`;
 
-  // Same gate as Company Detail's Monthly view and the Executive Report's Monthly period: never
-  // populate the Trend & Insight snapshot with figures for a month no one actually reported on.
-  // Without real uploads/imports touching this month, rosterSpans simply carry the last real
-  // report forward, which would otherwise silently read as if this month itself had been fed.
-  // For "All Companies" scope this only holds the page back if NOT ONE company has data for the
-  // month picked at the top of the page; for a specific company, only that company's own data
-  // for this month counts.
-  if(!execReportMonthHasData(scopeCompany, ui.month)){
+  // Same idea as Company Detail's Monthly gate, but for the whole year: never populate the
+  // Trend & Insight snapshot for a year that has no reported data at all. For "All Companies"
+  // scope this only holds the page back if NOT ONE company reported anything all year; for a
+  // specific company, only that company's own data for the year counts.
+  if(!execReportYearHasData(scopeCompany, year)){
     return `
     <div class="field-row" style="align-items:center;justify-content:space-between;">
       ${scopePicker}
     </div>
-    <div class="empty">No data has been fed for ${scopeLabel} in ${monthLabel(ui.month)} yet — no Master List, Quick Add, or New Hire &amp; Separated Import has touched this month${scopeCompany?'':' for any company'}. Upload or import data for ${monthLabel(ui.month)}, or pick a different month.</div>
+    <div class="empty">No data has been fed for ${scopeLabel} in ${year} yet — no Master List, Quick Add, or New Hire &amp; Separated Import has touched this year${scopeCompany?'':' for any company'}. Upload or import data for ${year}, or pick a different year.</div>
     `;
   }
+
+  // "Most recent report" — the latest month within the year that actually has data on file for
+  // this scope. Used only for the page's own as-of label; the underlying figures below already
+  // reflect whatever's on file up to and including that month (a partial year simply reads as
+  // year-to-date rather than pretending a full 12 months has been reported).
+  const asOfMonth = latestReportedMonthInYear(scopeCompany, year) || `${year}-12`;
+  const asOfLabel = monthLabel(asOfMonth);
 
   const inScope = e=> !scopeCompany || e.company===scopeCompany;
   const RATE_STATUSES = ['staff','rankfile'];
   // Task: the Workforce Snapshot (Total Headcount, Composition, Gender/Age/Tenure) must reflect
-  // this month's own reported data, per employment status — not just "this company had SOMETHING
-  // fed this month" (that coarser check only gates the whole page above). If Staff was uploaded
-  // for this month but Rank & File wasn't (or vice versa), the status with no report shouldn't
-  // silently keep counting its last-reported headcount here — it should drop out of the snapshot
-  // entirely until its own Master List/Quick Add/Import actually touches this month.
-  const statusReported = e => isMonthUploaded(e.company, e.employmentStatus, ui.month);
+  // reported data for THIS year, per employment status — not just "this company had SOMETHING
+  // fed this year" (that coarser check only gates the whole page above). If Staff was ever
+  // uploaded this year but Rank & File wasn't, the status with no report shouldn't silently
+  // carry forward stale figures — it drops out of the snapshot entirely until its own Master
+  // List/Quick Add/Import actually touches this year.
+  const statusReported = e => anyMonthUploadedInYear(e.company, e.employmentStatus, year);
 
-  // Headcount = reported roster membership for this month (frozen once the month has passed),
-  // restricted to statuses that actually have a report on file for this month.
+  // Headcount = reported roster membership as of the end of the selected year (or its latest
+  // reported month), restricted to statuses that actually have a report on file this year —
+  // i.e. an accumulated, year-end figure rather than a single month's cut.
   const activeAll = EMP.filter(e=> inScope(e) && isOnRosterAsOf(e,end) && statusReported(e));
   // Rate denominator only — stays real-date based so it lines up with isSeparatedInReal.
   const activeStartAll = EMP.filter(e=> inScope(e) && isActiveAsOf(e,prevEnd) && statusReported(e));
+  // Hired/Separated are accumulated across the ENTIRE year (Jan 1 → Dec 31 / latest report),
+  // not one month — this is the year-to-date movement total.
   const hiredAll = EMP.filter(e=> inScope(e) && isHiredIn(e,start,end) && statusReported(e));
   const sepAll = EMP.filter(e=> inScope(e) && isSeparatedIn(e,start,end) && statusReported(e));
-  // Task D fix: attrition needs the same (real-date) basis as its own denominator, and task E
-  // excludes Intern/OJT — same rules as companyStatsCore, applied at whatever scope is selected.
+  // Attrition needs the same (real-date) basis as its own denominator, and excludes Intern/OJT —
+  // same rules as companyStatsCore, applied at whatever scope is selected, accumulated for the year.
   const activeStartRateEligible = activeStartAll.filter(e=> RATE_STATUSES.includes(STATUS_KEY(e.employmentStatus)));
   const sepAllForRates = EMP.filter(e=> inScope(e) && RATE_STATUSES.includes(STATUS_KEY(e.employmentStatus)) && isSeparatedInReal(e,start,end) && statusReported(e));
   const rateBase = activeStartRateEligible.length || 1;
@@ -2585,16 +2650,16 @@ function renderOverview(){
   return `
   <div class="field-row" style="align-items:center;justify-content:space-between;">
     ${scopePicker}
-    <p class="hint" style="margin:0;max-width:420px;text-align:right;">Everything below reflects <b>${scopeLabel}</b> as of ${monthLabel(ui.month)}.</p>
+    <p class="hint" style="margin:0;max-width:460px;text-align:right;">Everything below is accumulated for <b>${year}</b> and reflects <b>${scopeLabel}</b> as of its most recent report (${asOfLabel}).</p>
   </div>
 
-  <h2 class="section">Workforce Snapshot <span class="n">${scopeLabel} · ${monthLabel(ui.month)}</span></h2>
-  <p class="hint" style="margin-top:-4px;">Only employment statuses (Staff, Rank &amp; File, etc.) with a report on file for ${monthLabel(ui.month)} are counted below — a status with nothing uploaded yet for this month doesn't carry forward its last reported headcount.</p>
+  <h2 class="section">Workforce Snapshot <span class="n">${scopeLabel} · ${year} · as of ${asOfLabel}</span></h2>
+  <p class="hint" style="margin-top:-4px;">Only employment statuses (Staff, Rank &amp; File, etc.) with at least one report on file for ${year} are counted below — a status with nothing uploaded yet this year doesn't carry forward stale figures.</p>
   <div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:6px;">
     <div class="card" style="max-width:280px;padding:18px 22px;">
       <div class="label">Total Headcount</div>
       <div class="value" style="font-size:34px;">${activeAll.length}</div>
-      <div class="foot">${scopeLabel} · as of ${monthLabel(ui.month)}</div>
+      <div class="foot">${scopeLabel} · as of ${asOfLabel}</div>
     </div>
     <div class="panel" style="flex:1;min-width:280px;max-width:420px;">
       <div class="panel-head"><h3>Workforce Composition</h3></div>
@@ -2618,7 +2683,7 @@ function renderOverview(){
   </div>
 
   <div class="panel" style="margin-top:16px;">
-    <div class="panel-head"><h3>Headcount Trend <span style="font-weight:400;color:var(--dim);font-size:12px;">${ui.month.slice(0,4)} · Jan–Dec</span></h3></div>
+    <div class="panel-head"><h3>Headcount Trend <span style="font-weight:400;color:var(--dim);font-size:12px;">${year} · Jan–Dec, accumulated</span></h3></div>
     ${trendLineChart(trend)}
     <div style="display:flex;gap:28px;margin-top:16px;flex-wrap:wrap;">
       <div style="flex:1;min-width:220px;">
@@ -2632,52 +2697,54 @@ function renderOverview(){
     </div>
   </div>
 
-  <h2 class="section">Movement &amp; Separation <span class="n">${scopeLabel} · ${monthLabel(ui.month)}</span></h2>
+  <h2 class="section">Movement &amp; Separation <span class="n">${scopeLabel} · ${year} year-to-date</span></h2>
   <div class="grid cards3">
-    <div class="card"><div class="label">New Hires</div><div class="value green">${hiredAll.length}</div><div class="foot">during ${monthLabel(ui.month)}</div></div>
-    <div class="card"><div class="label">Separations</div><div class="value red">${sepAll.length}</div><div class="foot">during ${monthLabel(ui.month)}</div></div>
-    <div class="card"><div class="label">Overall Attrition</div><div class="value ${attr>3?'red':''}">${activeStartRateEligible.length? attr.toFixed(1):'0.0'}%</div><div class="foot">retention ${activeStartRateEligible.length? (100-attr).toFixed(1):'100.0'}% · Staff &amp; Rank &amp; File</div></div>
+    <div class="card"><div class="label">New Hires</div><div class="value green">${hiredAll.length}</div><div class="foot">${year} year-to-date</div></div>
+    <div class="card"><div class="label">Separations</div><div class="value red">${sepAll.length}</div><div class="foot">${year} year-to-date</div></div>
+    <div class="card"><div class="label">Overall Attrition</div><div class="value ${attr>3?'red':''}">${activeStartRateEligible.length? attr.toFixed(1):'0.0'}%</div><div class="foot">retention ${activeStartRateEligible.length? (100-attr).toFixed(1):'100.0'}% · Staff &amp; Rank &amp; File · ${year} full year</div></div>
   </div>
 
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px;">
     <div class="panel">
       <div class="panel-head"><h3>Tenure at Separation</h3></div>
-      ${sepAll.length ? breakdownBarChart(sepAll, e=>{ const t=tenureAtSeparation(e); return t===null?'Unclassified':tenureGroupOf(t); }, tenureOrder) : '<div class="empty">No separations this month.</div>'}
+      ${sepAll.length ? breakdownBarChart(sepAll, e=>{ const t=tenureAtSeparation(e); return t===null?'Unclassified':tenureGroupOf(t); }, tenureOrder) : '<div class="empty">No separations this year.</div>'}
     </div>
     <div class="panel">
       <div class="panel-head"><h3>Separation Reasons</h3></div>
-      ${sepAll.length ? breakdownBarChart(sepAll, e=> e.separationReason || 'Unspecified', CONFIG.separationReasons) : '<div class="empty">No separations this month.</div>'}
+      ${sepAll.length ? breakdownBarChart(sepAll, e=> e.separationReason || 'Unspecified', CONFIG.separationReasons) : '<div class="empty">No separations this year.</div>'}
     </div>
   </div>
 
-  <h2 class="section">Headcount Demographic <span class="n">per industry / per company · ${monthLabel(ui.month)}</span></h2>
-  ${overviewTable()}
+  <h2 class="section">Headcount Demographic <span class="n">per industry / per company · ${year} accumulated</span></h2>
+  ${overviewTable(year)}
   `;
 }
 
-function overviewTable(){
+function overviewTable(year){
+  year = year || Number(ui.month.split('-')[0]) || new Date().getFullYear();
   const companies = allCompanies();
   if(!companies.length) return '<div class="empty">No companies configured yet.</div>';
   const byInd = {};
   companies.forEach(c=>{ (byInd[c.industry] = byInd[c.industry]||[]).push(c.company); });
   const statuses = CONFIG.statuses || [];
 
-  // Per-company, per-EXACT-employment-status stats for the selected month — kept separate per
-  // real status name (Staff, Rank & File, Intern/OJT, or any custom status added in Control
-  // Panel) rather than folding everything that isn't Staff/Intern into one blended "Rank & File"
-  // row, so Staff, Rank & File, and any other configured status each get their own line.
+  // Per-company, per-EXACT-employment-status stats ACCUMULATED for the selected year — kept
+  // separate per real status name (Staff, Rank & File, Intern/OJT, or any custom status added
+  // in Control Panel) rather than folding everything that isn't Staff/Intern into one blended
+  // "Rank & File" row, so Staff, Rank & File, and any other configured status each get their
+  // own line. This is a year-to-date figure, not a single month's snapshot.
   const stats = {};
   companies.forEach(c=>{
     stats[c.company] = {};
-    statuses.forEach(s=> stats[c.company][s] = companyStatusStats(c.company, s, ui.month));
+    statuses.forEach(s=> stats[c.company][s] = companyStatusStatsAnnual(c.company, s, year));
   });
-  // Per-company, per-status gate: a status's cell only populates if THAT status actually had a
-  // Master List, Quick Add, or New Hire & Separated Import touch the selected month at that
-  // company — otherwise it would silently carry forward a prior month's report for that status.
+  // Per-company, per-status gate: a status's cell only populates if THAT status had at least one
+  // Master List, Quick Add, or New Hire & Separated Import touch the selected YEAR at that
+  // company — otherwise it would silently carry forward stale figures for that status.
   const hasData = {};
   companies.forEach(c=>{
     hasData[c.company] = {};
-    statuses.forEach(s=> hasData[c.company][s] = isMonthUploaded(c.company, s, ui.month));
+    statuses.forEach(s=> hasData[c.company][s] = anyMonthUploadedInYear(c.company, s, year));
   });
   const cell = (c, s, val) => hasData[c.company][s] ? val : '<span style="color:var(--dim2);">—</span>';
   const naCell = '<span style="color:var(--dim2);" title="Attrition/Retention isn\'t tracked for this status">n/a</span>';
@@ -2721,7 +2788,7 @@ function overviewTable(){
   // (same Task E exclusion as above — Intern/OJT isn't part of this split). This section
   // aggregates a whole year, so — same as Company Detail's Annual view and the Executive
   // Report's Annual period — it isn't gated the same way as the month-specific rows above.
-  const nhYear = Number(ui.month.split('-')[0]) || new Date().getFullYear();
+  const nhYear = year;
   const cohortBlocks = statuses.filter(s=> STATUS_KEY(s)!=='intern').map(s=>{
     const nh = {}, ex = {};
     companies.forEach(c=>{
@@ -2752,7 +2819,7 @@ function overviewTable(){
       ${cohortBlocks}
     </tbody>
   </table>
-  <p class="hint">Headcount and Movement rows are broken out per employment status — each row shows <b>—</b> if that specific status hasn't had a Master List, Quick Add, or New Hire &amp; Separated Import touch ${monthLabel(ui.month)} yet at that company. Attrition/Retention shows <b>n/a</b> for Intern/OJT, since it isn't a meaningful figure for that status. <b>Annual Cohort Split</b> takes ${nhYear} and divides everyone active that year, per status, into two mutually-exclusive groups — people hired <b>in ${nhYear}</b> (New Hires) versus people already on the roster <b>before ${nhYear}</b> (Existing Employees) — so you can see whether that year's departures skewed toward new joiners or tenured staff. Change the Year picker up top to view a different year.</p>`;
+  <p class="hint">Headcount and Movement rows are accumulated for <b>${year}</b> and broken out per employment status — each row shows <b>—</b> if that specific status hasn't had a Master List, Quick Add, or New Hire &amp; Separated Import touch ${year} yet at that company. Attrition/Retention shows <b>n/a</b> for Intern/OJT, since it isn't a meaningful figure for that status. <b>Annual Cohort Split</b> takes ${nhYear} and divides everyone active that year, per status, into two mutually-exclusive groups — people hired <b>in ${nhYear}</b> (New Hires) versus people already on the roster <b>before ${nhYear}</b> (Existing Employees) — so you can see whether that year's departures skewed toward new joiners or tenured staff. Change the Year picker up top to view a different year.</p>`;
 }
 
 /* ============ COMPANY DETAIL ============ */
