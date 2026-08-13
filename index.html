@@ -340,6 +340,11 @@ let ui = {
   jobGradeStatus:null,
   overviewCompany:'',
   overviewIndustry:'',
+  overviewStatusScope:'', // '' = Overall (Staff + Rank & File blended), 'staff' or 'rankfile' = that status only
+  overviewTableOpen:false, // Headcount Demographic (per industry/company) detail table starts collapsed — keeps Trend & Insight clean for a quick executive read
+  transferFromCompany:'',
+  transferToCompany:'',
+  transferSearch:'',
   positionView:'breakdown',
   deptSearch:'',
   costcenterSearch:'',
@@ -2236,6 +2241,7 @@ const NAV_ITEMS = [
   ['forecastreport','Forecast &amp; Executive Report','Multi-year workforce projections plus a consolidated, printable executive report'],
   ['recruitment','Recruitment Cost','Cost per hire and recruitment cost ratio by company'],
   ['archive','Hire &amp; Separation Archive','New hires and separations, side by side, by month and year'],
+  ['transfers','Transfers','Employees who separated at one company and were hired at another — matched by name'],
   ['appraisal','Bound for Performance Appraisal','Staff new hires approaching their 3rd, 6th and 9th month evaluation'],
   ['coe','Certificate of Employment','Generate and print a Certificate of Employment — editable per company'],
   ['data','Data Management','Upload the master file, add hires, mark separations'],
@@ -2298,13 +2304,13 @@ function render(){
     return;
   }
   const body = document.getElementById('tabBody');
-  const EXEC_ALLOWED_TABS = ['overview','company','forecastreport'];
+  const EXEC_ALLOWED_TABS = ['overview','company','forecastreport','transfers'];
   try{
     if(ui.tab==='settings' && !isAdmin()){
       body.innerHTML = '<div class="empty">The Control Panel is restricted to Admin users. Switch your role to Admin (bottom-left) if that\'s you, or ask your Admin for this change.</div>';
     }
     else if(ui.role==='Executive' && !EXEC_ALLOWED_TABS.includes(ui.tab)){
-      body.innerHTML = '<div class="empty">Executives can only access Trend &amp; Insight, Company Detail, and Forecast &amp; Executive Report. Switch your role (bottom-left) if that\'s not right, or ask HR/Admin for these other views.</div>';
+      body.innerHTML = '<div class="empty">Executives can only access Trend &amp; Insight, Company Detail, Forecast &amp; Executive Report, and Transfers. Switch your role (bottom-left) if that\'s not right, or ask HR/Admin for these other views.</div>';
     }
     else if(ui.tab==='overview') body.innerHTML = renderOverview();
     else if(ui.tab==='company') body.innerHTML = renderCompany();
@@ -2312,6 +2318,7 @@ function render(){
     else if(ui.tab==='recruitment') body.innerHTML = renderRecruitment();
     else if(ui.tab==='data'){ body.innerHTML = renderData(); refreshUploadMonthMarks(); }
     else if(ui.tab==='archive') body.innerHTML = renderArchive();
+    else if(ui.tab==='transfers') body.innerHTML = renderTransfers();
     else if(ui.tab==='appraisal') body.innerHTML = renderAppraisal();
     else if(ui.tab==='coe') body.innerHTML = renderCOE();
     else if(ui.tab==='settings') body.innerHTML = renderSettings();
@@ -2325,7 +2332,7 @@ function render(){
 function sidebar(){
   const unmapped = unmappedCostCenters();
   const dueAppraisals = pendingAppraisals().length;
-  const EXEC_ALLOWED_TABS = ['overview','company','forecastreport'];
+  const EXEC_ALLOWED_TABS = ['overview','company','forecastreport','transfers'];
   const navItems = NAV_ITEMS.filter(([k])=>{
     if(k==='settings') return isAdmin();
     if(ui.role==='Executive') return EXEC_ALLOWED_TABS.includes(k);
@@ -2672,7 +2679,19 @@ function renderOverview(){
   asOfMonth = asOfMonth || `${year}-12`;
   const asOfLabel = monthLabel(asOfMonth);
 
-  const inScope = e=> (!scopeCompany || e.company===scopeCompany) && (!scopeIndustry || industryOf(e.company)===scopeIndustry);
+  // Task A: Staff and Rank & File can each be viewed on their own — Headcount, Gender, Age,
+  // Tenure, Tenure at Separation and Separation Reasons all follow this toggle — while "Overall"
+  // (the default) keeps the original blended view so nothing is lost, just made optional.
+  const statusScope = (ui.overviewStatusScope==='staff' || ui.overviewStatusScope==='rankfile') ? ui.overviewStatusScope : '';
+  const statusScopeLabel = statusScope==='staff' ? 'Staff' : (statusScope==='rankfile' ? 'Rank & File' : 'Overall');
+  const statusToggle = `
+  <div class="field-row" style="gap:6px;align-items:center;">
+    ${[['','Overall'],['staff','Staff'],['rankfile','Rank & File']].map(([v,l])=>
+      `<button class="btn small ${statusScope===v?'primary':''}" onclick="ui.overviewStatusScope='${v}'; render();">${l}</button>`
+    ).join('')}
+  </div>`;
+
+  const inScope = e=> (!scopeCompany || e.company===scopeCompany) && (!scopeIndustry || industryOf(e.company)===scopeIndustry) && (!statusScope || STATUS_KEY(e.employmentStatus)===statusScope);
   const RATE_STATUSES = ['staff','rankfile'];
   // Task: the Workforce Snapshot (Total Headcount, Composition, Gender/Age/Tenure) must reflect
   // reported data for THIS year, per employment status — not just "this company had SOMETHING
@@ -2708,28 +2727,33 @@ function renderOverview(){
   // so a bar chart of one 100% bar wouldn't add anything.
   const showIndustryPanel = !scopeIndustry && !scopeCompany && industries.length>1;
 
+  const transferSummary = transferSummaryForScope(year, scopeCompany, industryCompanies);
+
   return `
   <div class="field-row" style="align-items:center;justify-content:space-between;">
     ${scopePicker}
     <p class="hint" style="margin:0;max-width:460px;text-align:right;">Everything below is accumulated for <b>${year}</b> and reflects <b>${scopeLabel}</b> as of its most recent report (${asOfLabel}).</p>
   </div>
+  <div class="field-row" style="align-items:center;justify-content:space-between;margin-top:8px;">
+    ${statusToggle}
+    <p class="hint" style="margin:0;">Staff and Rank &amp; File demographics can be viewed separately, or Overall (blended) — Intern/OJT isn't broken out here since it isn't part of Retention/Attrition.</p>
+  </div>
 
-  <h2 class="section">Workforce Snapshot <span class="n">${scopeLabel} · ${year} · as of ${asOfLabel}</span></h2>
-  <p class="hint" style="margin-top:-4px;">Only employment statuses (Staff, Rank &amp; File, etc.) with at least one report on file for ${year} are counted below — a status with nothing uploaded yet this year doesn't carry forward stale figures.</p>
+  <h2 class="section">Workforce Snapshot <span class="n">${scopeLabel} · ${statusScopeLabel} · ${year} · as of ${asOfLabel}</span></h2>
   <div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:6px;">
     <div class="card" style="max-width:280px;padding:18px 22px;">
-      <div class="label">Total Headcount</div>
+      <div class="label">${statusScopeLabel} Headcount</div>
       <div class="value" style="font-size:34px;">${activeAll.length}</div>
       <div class="foot">${scopeLabel} · as of ${asOfLabel}</div>
     </div>
-    <div class="panel" style="flex:1;min-width:280px;max-width:420px;">
+    ${statusScope ? '' : `<div class="panel" style="flex:1;min-width:280px;max-width:420px;">
       <div class="panel-head"><h3>Workforce Composition</h3></div>
       ${compositionDonut({staff: activeAll.filter(e=>STATUS_KEY(e.employmentStatus)==='staff').length, rankfile: activeAll.filter(e=>STATUS_KEY(e.employmentStatus)==='rankfile').length, intern: activeAll.filter(e=>STATUS_KEY(e.employmentStatus)==='intern').length}, activeAll.length)}
-    </div>
+    </div>`}
   </div>
 
-  <div class="grid ${showIndustryPanel?'cards4':'cards3'}" style="margin-top:16px;">
-    ${showIndustryPanel ? `
+  <div class="grid ${(showIndustryPanel && !statusScope)?'cards4':'cards3'}" style="margin-top:16px;">
+    ${(showIndustryPanel && !statusScope) ? `
     <div class="panel">
       <div class="panel-head"><h3>Industry</h3></div>
       ${breakdownBarChart(activeAll, e=> industryOf(e.company), industries)}
@@ -2763,12 +2787,13 @@ function renderOverview(){
     </div>
   </div>
 
-  <h2 class="section">Movement &amp; Separation <span class="n">${scopeLabel} · ${year} year-to-date</span></h2>
+  <h2 class="section">Movement &amp; Separation <span class="n">${scopeLabel} · ${statusScopeLabel} · ${year} year-to-date</span></h2>
   <div class="grid cards3">
-    <div class="card"><div class="label">New Hires</div><div class="value green">${hiredAll.length}</div><div class="foot">${year} year-to-date</div></div>
-    <div class="card"><div class="label">Separations</div><div class="value red">${sepAll.length}</div><div class="foot">${year} year-to-date</div></div>
-    <div class="card"><div class="label">Overall Attrition</div><div class="value ${attr>3?'red':''}">${activeStartRateEligible.length? attr.toFixed(1):'0.0'}%</div><div class="foot">retention ${activeStartRateEligible.length? (100-attr).toFixed(1):'100.0'}% · Staff &amp; Rank &amp; File · ${year} full year</div></div>
+    <div class="card"><div class="label">New Hires</div><div class="value green">${hiredAll.length}</div><div class="foot">${transferSummary.in ? `incl. ${transferSummary.in} transfer(s) in — ` : ''}${year} year-to-date</div></div>
+    <div class="card"><div class="label">Separations</div><div class="value red">${sepAll.length}</div><div class="foot">${transferSummary.out ? `incl. ${transferSummary.out} transfer(s) out — ` : ''}${year} year-to-date</div></div>
+    <div class="card"><div class="label">Overall Attrition</div><div class="value ${attr>3?'red':''}">${activeStartRateEligible.length? attr.toFixed(1):'0.0'}%</div><div class="foot">retention ${activeStartRateEligible.length? (100-attr).toFixed(1):'100.0'}% · ${statusScope?statusScopeLabel:'Staff &amp; Rank &amp; File'} · ${year} full year</div></div>
   </div>
+  ${(transferSummary.in || transferSummary.out) ? `<p class="hint" style="margin-top:6px;">${transferSummary.in + transferSummary.out} of the movement above looks like cross-affiliate transfers (matched by name) rather than external hires/separations — see <a href="javascript:void(0)" onclick="ui.tab='transfers'; render();">Transfers</a> for the detail.</p>` : ''}
 
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px;">
     <div class="panel">
@@ -2781,8 +2806,10 @@ function renderOverview(){
     </div>
   </div>
 
-  <h2 class="section">Headcount Demographic <span class="n">per industry / per company · ${year} accumulated${scopeLabel!=='All Companies'?' · scoped to '+scopeLabel:''}</span></h2>
-  ${overviewTable(year, scopeIndustry, scopeCompany)}
+  <details class="panel" style="margin-top:16px;" ${ui.overviewTableOpen?'open':''} ontoggle="ui.overviewTableOpen=this.open;">
+    <summary style="cursor:pointer;padding:14px 16px;font-weight:600;">Headcount Demographic — full per industry / per company breakdown <span style="font-weight:400;color:var(--dim);font-size:12px;">(${year} accumulated${scopeLabel!=='All Companies'?' · scoped to '+scopeLabel:''} — click to expand)</span></summary>
+    <div style="padding:0 16px 16px;">${overviewTable(year, scopeIndustry, scopeCompany)}</div>
+  </details>
   `;
 }
 
@@ -2815,7 +2842,6 @@ function overviewTable(year, scopeIndustry, scopeCompany){
     statuses.forEach(s=> hasData[c.company][s] = anyMonthUploadedInYear(c.company, s, year));
   });
   const cell = (c, s, val) => hasData[c.company][s] ? val : '<span style="color:var(--dim2);">—</span>';
-  const naCell = '<span style="color:var(--dim2);" title="Attrition/Retention isn\'t tracked for this status">n/a</span>';
 
   let head1 = '<tr><th class="rowlabel"></th>' + Object.keys(byInd).map(ind=>`<th colspan="${byInd[ind].length}">${ind}</th>`).join('') + '</tr>';
   let head2 = '<tr><th class="rowlabel">Headcount</th>' + companies.map(c=>`<th>${c.company}</th>`).join('') + '</tr>';
@@ -2835,22 +2861,9 @@ function overviewTable(year, scopeIndustry, scopeCompany){
   const sepRows = statuses.map(s=>
     `<tr><td class="rowlabel">Separated — ${s}</td>${companies.map(c=>`<td>${cell(c, s, stats[c.company][s].separated)}</td>`).join('')}</tr>`
   ).join('');
-  // Task E: Attrition/Retention isn't a meaningful concept for Intern/OJT — shown as n/a rather
-  // than a fabricated 0%/100%, same rule this app already applies everywhere else.
-  const attrRows = statuses.map(s=>{
-    const eligible = STATUS_KEY(s) !== 'intern';
-    return `<tr><td class="rowlabel">Attrition Rate — ${s}</td>${companies.map(c=> eligible
-      ? `<td>${cell(c, s, (stats[c.company][s].baseCount ? stats[c.company][s].attritionRate.toFixed(1) : '0.0')+'%')}</td>`
-      : `<td>${naCell}</td>`
-    ).join('')}</tr>`;
-  }).join('');
-  const retRows = statuses.map(s=>{
-    const eligible = STATUS_KEY(s) !== 'intern';
-    return `<tr><td class="rowlabel">Retention Rate — ${s}</td>${companies.map(c=> eligible
-      ? `<td>${cell(c, s, (stats[c.company][s].baseCount ? stats[c.company][s].retentionRate.toFixed(1) : '100.0')+'%')}</td>`
-      : `<td>${naCell}</td>`
-    ).join('')}</tr>`;
-  }).join('');
+  // Movement — Attrition Rate / Retention Rate rows removed here (task B): the same figures are
+  // already shown at this scope in the Movement & Separation summary cards above and broken out
+  // per-cohort in the Annual Cohort Split below, so a third copy in this table was redundant.
 
   // Annual Cohort Split — New Hire vs. Existing Employee, one sub-block per rate-eligible status
   // (same Task E exclusion as above — Intern/OJT isn't part of this split). This section
@@ -2879,15 +2892,11 @@ function overviewTable(year, scopeIndustry, scopeCompany){
       ${hiredRows}
       <tr class="stathead"><td colspan="${companies.length+1}">Movement — Separated</td></tr>
       ${sepRows}
-      <tr class="stathead"><td colspan="${companies.length+1}">Movement — Attrition Rate</td></tr>
-      ${attrRows}
-      <tr class="stathead"><td colspan="${companies.length+1}">Movement — Retention Rate</td></tr>
-      ${retRows}
       <tr class="stathead"><td colspan="${companies.length+1}">Annual Cohort Split, ${nhYear} <span style="font-weight:400;text-transform:none;letter-spacing:0;">— New Hire vs. Existing Employee, per status</span></td></tr>
       ${cohortBlocks}
     </tbody>
   </table>
-  <p class="hint">Headcount and Movement rows are accumulated for <b>${year}</b> and broken out per employment status — each row shows <b>—</b> if that specific status hasn't had a Master List, Quick Add, or New Hire &amp; Separated Import touch ${year} yet at that company. Attrition/Retention shows <b>n/a</b> for Intern/OJT, since it isn't a meaningful figure for that status. <b>Annual Cohort Split</b> takes ${nhYear} and divides everyone active that year, per status, into two mutually-exclusive groups — people hired <b>in ${nhYear}</b> (New Hires) versus people already on the roster <b>before ${nhYear}</b> (Existing Employees) — so you can see whether that year's departures skewed toward new joiners or tenured staff. Change the Year picker up top to view a different year.</p>`;
+  <p class="hint">Headcount and Movement rows are accumulated for <b>${year}</b> and broken out per employment status — each row shows <b>—</b> if that specific status hasn't had a Master List, Quick Add, or New Hire &amp; Separated Import touch ${year} yet at that company. Overall Attrition/Retention Rate is shown once, at scope level, in the Movement &amp; Separation cards above — see it there or per-cohort just below. <b>Annual Cohort Split</b> takes ${nhYear} and divides everyone active that year, per status, into two mutually-exclusive groups — people hired <b>in ${nhYear}</b> (New Hires) versus people already on the roster <b>before ${nhYear}</b> (Existing Employees) — so you can see whether that year's departures skewed toward new joiners or tenured staff, and shows <b>n/a</b> Attrition/Retention for Intern/OJT since it isn't a meaningful figure for that status. Change the Year picker up top to view a different year.</p>`;
 }
 
 /* ============ COMPANY DETAIL ============ */
@@ -3978,7 +3987,7 @@ function hireTable(list){
       <td class="ctr"><span class="pill ${STATUS_KEY(e.employmentStatus)}">${statusLabel(e.employmentStatus)}</span></td>
       <td class="ctr">${fmtDateMDY(e.dateHired)}</td>
       <td class="ctr">${hireTagMonthOf(e) ? monthLabel(hireTagMonthOf(e)) : ''}</td>
-      ${canEdit?`<td class="ctr row-actions"><button class="btn small" onclick="openEditEmployeeModal('${e.employeeId}')">Edit</button>${admin?` <button class="btn small danger" onclick="archiveDeleteRecord('${e.employeeId}')">Delete</button>`:''}</td>`:''}
+      ${canEdit?`<td class="ctr row-actions" style="overflow:visible;white-space:normal;"><button class="btn small" onclick="viewArchiveRecordInCompanyDetail('${e.employeeId}','hires')" title="View this record in Company Detail">View</button> <button class="btn small" onclick="openEditEmployeeModal('${e.employeeId}')">Edit</button>${admin?` <button class="btn small danger" onclick="archiveDeleteRecord('${e.employeeId}')">Delete</button>`:''}</td>`:''}
     </tr>`).join('')}</tbody>
   </table></div>`;
 }
@@ -3999,9 +4008,129 @@ function separationTable(list){
       <td class="ctr">${separationTagMonthOf(e) ? monthLabel(separationTagMonthOf(e)) : ''}</td>
       <td class="wrap">${e.separationReason||''}</td>
       <td class="wrap">${e.separationRemarks||''}</td>
-      ${canEdit?`<td class="ctr row-actions"><button class="btn small" onclick="openEditEmployeeModal('${e.employeeId}')">Edit</button>${admin?` <button class="btn small danger" onclick="archiveDeleteRecord('${e.employeeId}')">Delete</button>`:''}</td>`:''}
+      ${canEdit?`<td class="ctr row-actions" style="overflow:visible;white-space:normal;"><button class="btn small" onclick="viewArchiveRecordInCompanyDetail('${e.employeeId}','seps')" title="View this record in Company Detail">View</button> <button class="btn small" onclick="openEditEmployeeModal('${e.employeeId}')">Edit</button>${admin?` <button class="btn small danger" onclick="archiveDeleteRecord('${e.employeeId}')">Delete</button>`:''}</td>`:''}
     </tr>`).join('')}</tbody>
   </table></div>`;
+}
+
+/* ============ TRANSFERS (cross-affiliate) ============
+   Task E: a genuine company-to-company move isn't tracked as one continuous record in this
+   system — each affiliate keeps its own Employee ID, so someone who leaves Company A and joins
+   Company B simply shows up as an ordinary Separation on one side and an ordinary New Hire on
+   the other, quite possibly under a different ID. This section detects likely transfers by
+   matching Last/First/Middle Name (normalized, not ID) between a Separation and a New Hire at a
+   DIFFERENT company, both tagged within the same year. It's a name-match heuristic meant for HR
+   to eyeball and counter-check the ID against — not an automatic, certain match. */
+function normalizeNameKey(e){
+  const norm = s => String(s||'').trim().toLowerCase().replace(/\s+/g,' ');
+  return `${norm(e.lastName)}|${norm(e.firstName)}|${norm(e.middleName)}`;
+}
+function detectTransfers(year){
+  const start = new Date(year,0,1), end = new Date(year,11,31,23,59,59);
+  const seps = EMP.filter(e=> isSeparatedIn(e,start,end) && (e.lastName||e.firstName));
+  const hires = EMP.filter(e=> isHiredIn(e,start,end) && (e.lastName||e.firstName));
+  const hiresByName = {};
+  hires.forEach(e=>{ const k=normalizeNameKey(e); (hiresByName[k]=hiresByName[k]||[]).push(e); });
+  const used = new Set();
+  const out = [];
+  seps.forEach(sep=>{
+    const k = normalizeNameKey(sep);
+    const candidates = (hiresByName[k]||[]).filter(h=> h.company!==sep.company && !used.has(h.employeeId+'|'+h.company));
+    if(!candidates.length) return;
+    // Prefer whichever candidate hire date sits closest to this separation date — the most
+    // plausible match when a name collides with more than one hire in the same year.
+    const sepDate = parseDate(sep.dateSeparated) || start;
+    candidates.sort((a,b)=>{
+      const da = Math.abs((parseDate(a.dateHired)||start) - sepDate);
+      const db = Math.abs((parseDate(b.dateHired)||start) - sepDate);
+      return da-db;
+    });
+    const hire = candidates[0];
+    used.add(hire.employeeId+'|'+hire.company);
+    out.push({
+      lastName: sep.lastName||'', firstName: sep.firstName||'', middleName: sep.middleName||'',
+      fromCompany: sep.company, toCompany: hire.company,
+      fromId: sep.employeeId, toId: hire.employeeId,
+      dateSeparated: sep.dateSeparated, dateHired: hire.dateHired,
+      sameId: String(sep.employeeId)===String(hire.employeeId)
+    });
+  });
+  return out.sort((a,b)=> (b.dateHired||'').localeCompare(a.dateHired||''));
+}
+// Used by Trend & Insight (renderOverview) to note how much of that scope's New Hires/
+// Separations total is actually a cross-affiliate transfer rather than genuinely external —
+// this is the link back into the demographics that task E asked for.
+function transferSummaryForScope(year, scopeCompany, industryCompanies){
+  const list = detectTransfers(year);
+  const inScopeCo = c=> scopeCompany ? c===scopeCompany : (industryCompanies ? industryCompanies.includes(c) : true);
+  return { in: list.filter(t=> inScopeCo(t.toCompany)).length, out: list.filter(t=> inScopeCo(t.fromCompany)).length, list };
+}
+function transferMatchesFilter(t){
+  if(ui.transferFromCompany && t.fromCompany!==ui.transferFromCompany) return false;
+  if(ui.transferToCompany && t.toCompany!==ui.transferToCompany) return false;
+  const q = (ui.transferSearch||'').trim().toLowerCase();
+  if(!q) return true;
+  return `${t.lastName} ${t.firstName} ${t.middleName}`.toLowerCase().includes(q);
+}
+function renderTransfers(){
+  const year = Number(ui.month.split('-')[0]) || new Date().getFullYear();
+  const companies = allCompanies().map(c=>c.company);
+  const all = detectTransfers(year);
+  const list = all.filter(transferMatchesFilter);
+  const rows = list.map(t=>`<tr>
+    <td class="namecell">${escapeHtml(t.lastName)}, ${escapeHtml(t.firstName)}${t.middleName?' '+escapeHtml(t.middleName):''}</td>
+    <td>${escapeHtml(t.fromCompany)}</td>
+    <td style="text-align:center;color:var(--dim2);">→</td>
+    <td>${escapeHtml(t.toCompany)}</td>
+    <td class="ctr">${fmtDateMDY(t.dateSeparated)}</td>
+    <td class="ctr">${fmtDateMDY(t.dateHired)}</td>
+    <td class="ctr" style="font-family:var(--mono);font-size:11px;">${t.sameId ? `<span title="Same ID at both companies">${escapeHtml(String(t.fromId))}</span>` : `<span title="IDs differ — counter-check by name">${escapeHtml(String(t.fromId))} → ${escapeHtml(String(t.toId))}</span>`}</td>
+  </tr>`).join('');
+  return `
+  <div class="field-row" style="align-items:center;justify-content:space-between;">
+    <p class="hint" style="margin:0;max-width:560px;">Employees whose <b>Name</b> (Last, First, Middle) matches between a Separation at one company and a New Hire at another, both within <b>${year}</b> — a likely cross-affiliate transfer. Employee ID isn't used to match since it can differ per affiliate; the ID(s) are shown at the end of each row so you can counter-check.</p>
+  </div>
+  <div class="field-row" style="margin-top:10px;">
+    <input type="text" placeholder="Search name…" value="${escapeHtml(ui.transferSearch||'')}" oninput="ui.transferSearch=this.value; renderTransfersTable();" style="width:220px;">
+    <div class="field"><label>FROM COMPANY</label>
+      <select onchange="ui.transferFromCompany=this.value; render();">
+        <option value="">Any</option>
+        ${companies.map(c=>`<option value="${c}" ${ui.transferFromCompany===c?'selected':''}>${c}</option>`).join('')}
+      </select>
+    </div>
+    <div class="field"><label>TO COMPANY</label>
+      <select onchange="ui.transferToCompany=this.value; render();">
+        <option value="">Any</option>
+        ${companies.map(c=>`<option value="${c}" ${ui.transferToCompany===c?'selected':''}>${c}</option>`).join('')}
+      </select>
+    </div>
+  </div>
+  <h2 class="section">Detected Transfers <span class="n">${year} · ${list.length} of ${all.length} shown</span></h2>
+  <div id="transfersTableWrap">${transfersTableHTML(rows)}</div>
+  <p class="hint">This count feeds the "incl. N transfer(s) in/out" note on <a href="javascript:void(0)" onclick="ui.tab='overview'; render();">Trend &amp; Insight</a>'s Movement &amp; Separation cards — a transfer still moves the New Hire/Separation numbers there (the person genuinely left one roster and joined another), this page just clarifies how much of that movement was internal to the group rather than external. Change the Year at the top of the page to view a different year.</p>
+  `;
+}
+function transfersTableHTML(rows){
+  if(!rows) return '<div class="empty">No name-matched transfers found for this year/filter.</div>';
+  return `<div class="archive-table-wrap"><table class="simple archive-table">
+    <thead><tr><th>Name</th><th>From</th><th></th><th>To</th><th class="ctr">Date Separated</th><th class="ctr">Date Hired</th><th class="ctr">Employee ID</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table></div>`;
+}
+function renderTransfersTable(){
+  const year = Number(ui.month.split('-')[0]) || new Date().getFullYear();
+  const list = detectTransfers(year).filter(transferMatchesFilter);
+  const rows = list.map(t=>`<tr>
+    <td class="namecell">${escapeHtml(t.lastName)}, ${escapeHtml(t.firstName)}${t.middleName?' '+escapeHtml(t.middleName):''}</td>
+    <td>${escapeHtml(t.fromCompany)}</td>
+    <td style="text-align:center;color:var(--dim2);">→</td>
+    <td>${escapeHtml(t.toCompany)}</td>
+    <td class="ctr">${fmtDateMDY(t.dateSeparated)}</td>
+    <td class="ctr">${fmtDateMDY(t.dateHired)}</td>
+    <td class="ctr" style="font-family:var(--mono);font-size:11px;">${t.sameId ? escapeHtml(String(t.fromId)) : `${escapeHtml(String(t.fromId))} → ${escapeHtml(String(t.toId))}`}</td>
+  </tr>`).join('');
+  const wrap = document.getElementById('transfersTableWrap');
+  if(wrap) wrap.innerHTML = transfersTableHTML(rows);
 }
 
 /* ============ BOUND FOR PERFORMANCE APPRAISAL ============
@@ -5412,11 +5541,37 @@ async function confirmEditEmployee(){
   closeModal();
   toast('Record updated.');
 }
-async function archiveDeleteRecord(id){
+// Task D: deleting a single record from the Archive now goes through the same confirm step as
+// the bulk "Delete List" — it's the intended one-by-one alternative to wiping a whole month's
+// list at once, so it gets the same guardrail rather than firing on a single click.
+function archiveDeleteRecord(id){
   if(!isAdmin()){ toast('Only Admin can delete employee records.'); return; }
+  const emp = EMP.find(e=> String(e.employeeId)===String(id));
+  if(!emp){ toast('Record not found — it may have already been deleted.'); return; }
+  ui.modal = {type:'archiveDeleteOne', arg:id};
+  render();
+}
+async function confirmArchiveDeleteOne(){
+  if(!isAdmin()){ toast('Only Admin can delete employee records.'); return; }
+  const id = ui.modal.arg;
   EMP = EMP.filter(e=> String(e.employeeId)!==String(id));
   await saveEmp();
+  closeModal();
   toast('Record deleted.');
+  render();
+}
+// Task D: jumps a single Archive row straight to that employee's own company/status/period in
+// Company Detail — the "other functional area" a New Hire or Separation row should link to, so
+// HR can cross-check it against the full picture before deciding whether to delete or edit it.
+function viewArchiveRecordInCompanyDetail(id, kind){
+  const emp = EMP.find(e=> String(e.employeeId)===String(id));
+  if(!emp){ toast('Record not found — it may have already been deleted.'); return; }
+  const tagMonth = kind==='hires' ? hireTagMonthOf(emp) : separationTagMonthOf(emp);
+  ui.tab = 'company';
+  ui.company = emp.company;
+  ui.companySub = kind==='hires' ? 'newhire' : 'separated';
+  ui.companyPeriod = 'monthly';
+  if(tagMonth) ui.month = tagMonth;
   render();
 }
 /* Bulk delete of an entire month's New Hires or Separations list from the Hire & Separation
@@ -6490,6 +6645,15 @@ function renderModal(){
     </div>
     <div class="field" style="margin-top:12px;"><label>TYPE "DELETE" TO CONFIRM</label><input type="text" id="delListConfirm" placeholder="DELETE"></div>
     <div style="margin-top:16px;"><button class="btn danger" onclick="confirmDeleteArchiveList()">Delete ${kindLabel} List</button> <button class="btn" onclick="closeModal()">Cancel</button></div>`;
+  } else if(ui.modal.type==='archiveDeleteOne'){
+    const emp = EMP.find(e=> String(e.employeeId)===String(ui.modal.arg));
+    if(!emp){
+      body = `<h3>Delete Record</h3><p class="hint">Record not found — it may have already been deleted.</p><div style="margin-top:14px;"><button class="btn" onclick="closeModal()">Close</button></div>`;
+    } else {
+      body = `<h3>Delete Record</h3>
+      <p class="hint" style="color:var(--red);">This permanently deletes <b>${emp.lastName||''}, ${emp.firstName||''}</b> (ID ${emp.employeeId||''} · ${emp.company||''}) — one record only, not the rest of that month's list. This cannot be undone.</p>
+      <div style="margin-top:16px;"><button class="btn danger" onclick="confirmArchiveDeleteOne()">Delete This Record</button> <button class="btn" onclick="closeModal()">Cancel</button></div>`;
+    }
   } else if(ui.modal.type==='editEmployee'){
     const emp = EMP.find(e=> String(e.employeeId)===String(ui.modal.arg));
     if(!emp){
