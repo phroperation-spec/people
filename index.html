@@ -1185,10 +1185,23 @@ function industryOf(company){
   return f ? f.name : '';
 }
 function isActiveAsOf(emp, refDate){
-  const hired = parseDate(emp.dateHired);
-  if(!hired || hired > refDate) return false;
   const sep = parseDate(emp.dateSeparated);
   if(sep && sep <= refDate) return false;
+  // excludeFromHireCount marks a record HR/the system has already established as pre-existing —
+  // either the very first Master List baseline for a company+status, or a later upload HR
+  // confirmed was "already employed, just not yet on file" rather than a genuine New Hire (see
+  // isHiredInReal, which permanently excludes these same records from ever counting as a New
+  // Hire). When the source file didn't supply a Date Hired for one of these rows, runCompanyUpload
+  // defaults it to that upload's own as-of month — which can land ON OR AFTER a cohort year's own
+  // start date. Without this shortcut, such a record would fail "active before year Y" for the
+  // very year it was baselined into, and silently drop out of BOTH the New Hire and Already-
+  // Employed cohort buckets (Company Detail's Retention/Attrition Breakdown, Trend & Insight's
+  // cohort chart) while still counting toward the reported headcount — the mismatch this flag
+  // exists to prevent. So for "already employed" purposes, excludeFromHireCount always wins,
+  // regardless of what Date Hired happens to hold.
+  if(emp.excludeFromHireCount) return true;
+  const hired = parseDate(emp.dateHired);
+  if(!hired || hired > refDate) return false;
   return true;
 }
 
@@ -1638,6 +1651,37 @@ function existingEmployeeStatsAnnual(company, year, statusFilter, exact){
 }
 
 
+// Aggregated version of the New Hire / Already-Employed cohort split (same rules as
+// newHireStatsAnnual / existingEmployeeStatsAnnual) but for an arbitrary scope predicate rather
+// than a single company — used by Trend & Insight's org/industry-wide cohort chart. Staff &
+// Rank & File only, same as the per-company version.
+function cohortStatsForScope(inScopeFn, year){
+  const yearStart = new Date(year,0,1);
+  const yearEnd = new Date(year,11,31,23,59,59);
+  const RATE_STATUSES = ['staff','rankfile'];
+  const eligible = e=> inScopeFn(e) && RATE_STATUSES.includes(STATUS_KEY(e.employmentStatus));
+  const now = new Date();
+
+  const nhCohort = EMP.filter(e=> eligible(e) && isHiredInReal(e, yearStart, yearEnd));
+  const nhSep = nhCohort.filter(e=>{ const s = parseDate(e.dateSeparated); return s && s<=now; });
+
+  const exCohort = EMP.filter(e=> eligible(e) && isActiveAsOf(e, new Date(yearStart.getTime()-1)));
+  const exSep = exCohort.filter(e=> isSeparatedInReal(e, yearStart, yearEnd));
+
+  const pack = (cohort, sep)=>{
+    const base = cohort.length || 1;
+    const attritionRate = sep.length/base*100;
+    return {
+      baseCount: cohort.length,
+      separatedCount: sep.length,
+      retainedCount: cohort.length - sep.length,
+      attritionRate: cohort.length ? attritionRate : 0,
+      retentionRate: cohort.length ? (100-attritionRate) : 100
+    };
+  };
+  return { newHires: pack(nhCohort, nhSep), existing: pack(exCohort, exSep) };
+}
+
 /* ============ CHART HELPERS (Trend & Insight) ============ */
 // Task A: the Headcount Trend chart used to always show a fixed last-6-months window, even for
 // a company that only just had its first Master List upload — padding the chart with meaningless
@@ -1733,6 +1777,43 @@ function compositionDonut(byStatus, total){
       <div><span class="sw" style="background:var(--teal);"></span>Rank &amp; File — <b>${byStatus.rankfile}</b> <span style="color:var(--dim);">(${rankPct.toFixed(0)}%)</span></div>
       <div><span class="sw" style="background:var(--violet);"></span>Intern/OJT — <b>${byStatus.intern}</b> <span style="color:var(--dim);">(${internPct.toFixed(0)}%)</span></div>
     </div>
+  </div>`;
+}
+
+// Replaces the old "New Hires vs Already Employed" cohort TABLE with a stacked-bar graph —
+// one bar per cohort, split into Retained (colored) vs Separated (red), so retention reads at a
+// glance instead of requiring a row-by-row scan of a table. Placed beside Workforce Composition
+// on Trend & Insight.
+function cohortRetentionChart(stats, year){
+  const groups = [
+    {label:`New Hires in ${year}`, s: stats.newHires, color:'var(--green)'},
+    {label:`Already Employed before ${year}`, s: stats.existing, color:'var(--blue)'}
+  ];
+  const bars = groups.map(g=>{
+    const total = g.s.baseCount;
+    const sepPct = total ? (g.s.separatedCount/total*100) : 0;
+    const retPct = total ? (100-sepPct) : 0;
+    return `
+    <div style="margin-bottom:16px;">
+      <div style="display:flex;justify-content:space-between;font-size:12.5px;margin-bottom:5px;">
+        <span>${g.label}</span>
+        <span style="font-family:var(--mono);color:var(--dim);">${total} base</span>
+      </div>
+      <div style="height:18px;border-radius:4px;background:var(--surface2);overflow:hidden;display:flex;">
+        ${retPct>0?`<div style="height:100%;width:${retPct}%;background:${g.color};" title="Retained ${g.s.retainedCount}"></div>`:''}
+        ${sepPct>0?`<div style="height:100%;width:${sepPct}%;background:var(--red);" title="Separated ${g.s.separatedCount}"></div>`:''}
+      </div>
+      <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--dim);margin-top:4px;font-family:var(--mono);">
+        <span>Retention ${g.s.retentionRate.toFixed(1)}%</span>
+        <span>Attrition ${g.s.attritionRate.toFixed(1)}% (${g.s.separatedCount} separated)</span>
+      </div>
+    </div>`;
+  }).join('');
+  return bars + `
+  <div style="display:flex;gap:16px;margin-top:2px;flex-wrap:wrap;font-size:11px;color:var(--dim);">
+    <div style="display:flex;align-items:center;gap:6px;"><span style="width:9px;height:9px;border-radius:2px;background:var(--green);display:inline-block;"></span>Retained · New Hires</div>
+    <div style="display:flex;align-items:center;gap:6px;"><span style="width:9px;height:9px;border-radius:2px;background:var(--blue);display:inline-block;"></span>Retained · Already Employed</div>
+    <div style="display:flex;align-items:center;gap:6px;"><span style="width:9px;height:9px;border-radius:2px;background:var(--red);display:inline-block;"></span>Separated</div>
   </div>`;
 }
 
@@ -2345,6 +2426,10 @@ function renderOverview(){
   const showIndustryPanel = !scopeIndustry && !scopeCompany && industries.length>1;
 
   const transferSummary = transferSummaryForScope(year, scopeCompany, industryCompanies);
+  // Same cohort split as Company Detail's "Already Employed before {year}" table, aggregated to
+  // whatever scope (industry/company/all) is selected here — feeds the graph beside Workforce
+  // Composition below.
+  const cohortStats = cohortStatsForScope(inScope, year);
 
   return `
   <div class="field-row" style="align-items:center;justify-content:space-between;">
@@ -2367,6 +2452,10 @@ function renderOverview(){
       <div class="panel-head"><h3>Workforce Composition</h3></div>
       ${compositionDonut({staff: activeAll.filter(e=>STATUS_KEY(e.employmentStatus)==='staff').length, rankfile: activeAll.filter(e=>STATUS_KEY(e.employmentStatus)==='rankfile').length, intern: activeAll.filter(e=>STATUS_KEY(e.employmentStatus)==='intern').length}, activeAll.length)}
     </div>`}
+    <div class="panel" style="flex:1;min-width:280px;max-width:420px;">
+      <div class="panel-head"><h3>New Hires vs. Already Employed <span style="font-weight:400;color:var(--dim);font-size:11px;">${year}</span></h3></div>
+      ${cohortRetentionChart(cohortStats, year)}
+    </div>
   </div>
 
   <div class="grid ${(showIndustryPanel && !statusScope)?'cards4':'cards3'}" style="margin-top:16px;">
@@ -2622,6 +2711,35 @@ function companySubview(sub, st, period){
   return '';
 }
 
+// Sanity check for the exact month a company+status's baseline was first uploaded: in that
+// specific month, nothing could have been hired or separated yet under this app's own tracking,
+// so the reported headcount for that status MUST equal its "Already Employed" cohort base plus
+// any same-month New Hire cohort count. If it doesn't, a data-quality gap — usually a blank Date
+// Hired the app had to guess at, or a Date Separated left inconsistent with the reported roster —
+// is silently pulling someone out of the cohort split while they still show up in headcount (see
+// isActiveAsOf). This turns that into a visible, actionable note instead of a silent mismatch.
+function baselineReconciliationNote(st){
+  const checks = [
+    {label:'Staff', status:'Staff', key:'staff'},
+    {label:'Rank & File', status:'Rank & File', key:'rankfile'}
+  ];
+  const issues = checks.map(c=>{
+    const baselineMonth = uploadedMonthsFor(ui.company, c.status)[0];
+    if(!baselineMonth || baselineMonth !== ui.month) return null;
+    const year = Number(baselineMonth.split('-')[0]);
+    const ex = existingEmployeeStatsAnnual(ui.company, year, c.key);
+    const nh = newHireStatsAnnual(ui.company, year, c.key);
+    const headcount = st.byStatus[c.key];
+    const expected = ex.baseCount + nh.cohortCount;
+    return expected===headcount ? null : {label:c.label, headcount, expected, diff:headcount-expected};
+  }).filter(Boolean);
+  if(!issues.length) return '';
+  return `<div class="hint" style="border:1px solid var(--red);background:rgba(211,71,71,.08);padding:10px 12px;border-radius:8px;margin:10px 0 0;">
+    ⚠ <b>${monthLabel(ui.month)} is ${issues.map(i=>i.label).join(' and ')}'s baseline upload month</b>, so headcount should exactly equal the Already-Employed + New-Hire cohort split below — it doesn't:
+    ${issues.map(i=>`${i.label}: headcount ${i.headcount} vs. cohort split ${i.expected} (${Math.abs(i.diff)} record${Math.abs(i.diff)===1?'':'s'} unaccounted for)`).join('; ')}.
+    This usually means one or more ${ui.company} records uploaded in ${monthLabel(ui.month)} have a blank Date Hired, or a Date Separated that doesn't match their reported roster history — check the Archive for ${issues.map(i=>i.label).join(', ')} records from that upload for either gap.
+  </div>`;
+}
 function subHeadcount(st, period){
   // Annual Cohort Split is shown alongside the month-by-month table as one merged block —
   // both are calendar-year cuts of the same population, just sliced differently. Independent
@@ -2645,6 +2763,7 @@ function subHeadcount(st, period){
     <div class="card"><div class="label">Rank &amp; File</div><div class="value" style="color:var(--teal)">${subStatusHasData('Rank & File') ? st.byStatus.rankfile : noDataCell('Rank & File')}</div></div>
     <div class="card"><div class="label">Intern / OJT</div><div class="value" style="color:var(--violet)">${subStatusHasData('Intern/OJT') ? st.byStatus.intern : noDataCell('Intern/OJT')}</div></div>
   </div>
+  ${baselineReconciliationNote(st)}
   <h2 class="section">Retention &amp; Attrition <span class="n">${period.label} · Staff &amp; Rank &amp; File only</span></h2>
   <div class="grid cards3" style="grid-template-columns:repeat(2,1fr);margin-bottom:14px;">
     <div class="card"><div class="label">Overall Retention Rate</div><div class="value green" style="font-size:20px;">${st.retentionRate.toFixed(1)}%</div></div>
@@ -3121,26 +3240,57 @@ function companyAnnualPromotions(company, year, asOfEnd){
     const current = hist[hist.length-1];
     const startNum = jobGradeNumeric(baseline.jobGrade), curNum = jobGradeNumeric(current.jobGrade);
     if(startNum===null || curNum===null || curNum<=startNum) return;
+    if(isPromotionDismissed(e, baseline.ms, current.ms)) return;
     rows.push({
       emp:e, startGrade:baseline.jobGrade, curGrade:current.jobGrade, startNum, curNum,
       startGroup: jobGradeGroupOf(company, e.employmentStatus, baseline.jobGrade),
-      curGroup: jobGradeGroupOf(company, e.employmentStatus, current.jobGrade)
+      curGroup: jobGradeGroupOf(company, e.employmentStatus, current.jobGrade),
+      fromMs: baseline.ms, toMs: current.ms
     });
   });
   return rows.sort((a,b)=> (b.curNum-b.startNum)-(a.curNum-a.startNum));
+}
+// Admin-only "delete individually" for a promoted list — rather than an all-or-nothing bulk
+// delete, an Admin can dismiss one specific detected promotion (identified by the employee +
+// the exact from/to Job Grade snapshot months that produced it) without touching the employee's
+// record, roster, or any other detected promotion. Dismissed pairs are remembered on the
+// employee record itself so the entry stays gone across re-renders and future uploads.
+function isPromotionDismissed(emp, fromMs, toMs){
+  return Array.isArray(emp.dismissedPromotions) && emp.dismissedPromotions.some(d=> d.fromMs===fromMs && d.toMs===toMs);
+}
+function openDismissPromotionModal(employeeId, fromMs, toMs){
+  if(!isAdmin()){ toast('Only Admin can delete individual promotion entries.'); return; }
+  const emp = EMP.find(e=> String(e.employeeId)===String(employeeId));
+  if(!emp){ toast('Record not found.'); return; }
+  ui.modal = {type:'dismissPromotion', arg:{employeeId, fromMs, toMs}};
+  render();
+}
+async function confirmDismissPromotion(){
+  if(!isAdmin()){ toast('Only Admin can delete individual promotion entries.'); return; }
+  const {employeeId, fromMs, toMs} = ui.modal.arg;
+  const emp = EMP.find(e=> String(e.employeeId)===String(employeeId));
+  if(emp){
+    emp.dismissedPromotions = Array.isArray(emp.dismissedPromotions) ? emp.dismissedPromotions : [];
+    if(!isPromotionDismissed(emp, fromMs, toMs)) emp.dismissedPromotions.push({fromMs, toMs});
+    await saveEmp();
+  }
+  closeModal();
+  toast('Promotion entry removed from the list.');
+  render();
 }
 // Same-shape table renderer for a set of promotion rows, but split into Staff and Rank & File
 // sub-tables (task: keep promotion records separate per employment status rather than one
 // mixed list — Staff and Rank & File typically follow different grade ladders and cadences).
 function promotionsTableByStatus(rows, cols, emptyNoun){
+  const admin = isAdmin();
   const staffRows = rows.filter(r=> STATUS_KEY(r.emp.employmentStatus)==='staff');
   const rfRows = rows.filter(r=> STATUS_KEY(r.emp.employmentStatus)==='rankfile');
   const renderGroup = (label, list)=> `
     <p class="hint" style="margin:12px 0 4px;"><b>${label}</b> — ${list.length} ${emptyNoun}</p>
     ${list.length ? `
     <table class="demo compact">
-      <thead><tr><th class="rowlabel">Employee</th><th>Position</th><th>${cols.startLabel}</th><th>${cols.curLabel}</th></tr></thead>
-      <tbody>${list.map(r=>`<tr><td class="rowlabel">${r.emp.lastName||''}, ${r.emp.firstName||''} <span style="color:var(--dim2);font-size:11px;">(${r.emp.employeeId})</span></td><td>${r.emp.position||'—'}</td><td>${r.startGrade} <span style="color:var(--dim2);font-size:11px;">(${r.startGroup})</span></td><td style="color:var(--green);">${r.curGrade} <span style="font-size:11px;">(${r.curGroup})</span></td></tr>`).join('')}</tbody>
+      <thead><tr><th class="rowlabel">Employee</th><th>Position</th><th>${cols.startLabel}</th><th>${cols.curLabel}</th>${admin?'<th></th>':''}</tr></thead>
+      <tbody>${list.map(r=>`<tr><td class="rowlabel">${r.emp.lastName||''}, ${r.emp.firstName||''} <span style="color:var(--dim2);font-size:11px;">(${r.emp.employeeId})</span></td><td>${r.emp.position||'—'}</td><td>${r.startGrade} <span style="color:var(--dim2);font-size:11px;">(${r.startGroup})</span></td><td style="color:var(--green);">${r.curGrade} <span style="font-size:11px;">(${r.curGroup})</span></td>${admin?`<td><button class="btn small danger" onclick="openDismissPromotionModal('${r.emp.employeeId}','${r.fromMs}','${r.toMs}')">Delete</button></td>`:''}</tr>`).join('')}</tbody>
     </table>` : `<div class="empty">No ${label} ${emptyNoun} in this view.</div>`}
   `;
   return renderGroup('Staff', staffRows) + renderGroup('Rank & File', rfRows);
@@ -3160,10 +3310,12 @@ function companyMonthOverMonthPromotions(company){
     const prevGrade = jobGradeAsOf(e, prevMs), curGrade = jobGradeAsOf(e, curMs);
     const prevNum = jobGradeNumeric(prevGrade), curNum = jobGradeNumeric(curGrade);
     if(prevNum===null || curNum===null || curNum<=prevNum) return;
+    if(isPromotionDismissed(e, prevMs, curMs)) return;
     rows.push({
       emp:e, startGrade:prevGrade, curGrade, startNum:prevNum, curNum,
       startGroup: jobGradeGroupOf(company, e.employmentStatus, prevGrade),
-      curGroup: jobGradeGroupOf(company, e.employmentStatus, curGrade)
+      curGroup: jobGradeGroupOf(company, e.employmentStatus, curGrade),
+      fromMs: prevMs, toMs: curMs
     });
   });
   return { rows: rows.sort((a,b)=> (b.curNum-b.startNum)-(a.curNum-a.startNum)), curLabel: monthLabel(curMs), prevLabel: monthLabel(prevMs) };
@@ -4862,6 +5014,30 @@ function openMasterlistNewHireConfirm(rows, thenPromotionRows, thenCandidateIds)
   ui.modal = {type:'confirmMasterlistNewHires', arg:{rows, thenPromotionRows, thenCandidateIds}};
   render();
 }
+// The annual "New Hires in <year>" cohort (Retention/Attrition Breakdown, Trend & Insight) goes
+// strictly off the real Date Hired, not the reporting month being confirmed here (see
+// isHiredInReal / newHireStatsAnnual) — that's deliberate, so the cohort stays stable no matter
+// when a hire happens to get uploaded. But it means confirming someone "Yes — new hire" here with
+// a Date Hired that lands in a different calendar year than this upload's reporting month quietly
+// produces exactly the confusing result HR ran into: they show up as a New Hire right here and in
+// Company Detail's New Hire list, but never as a New Hire in that annual cohort split — usually
+// because the Date Hired is a typo (e.g. wrong year) or because they were actually already
+// employed before this date and should be marked "No" instead. This flags that mismatch live, at
+// the point of review, instead of leaving it to surface later as a number that doesn't add up.
+function checkNewHireDateWarning(employeeId){
+  const sel = document.querySelector(`.mlNewHireChoice[data-id="${employeeId}"]`);
+  const dateEl = document.querySelector(`.mlNewHireDate[data-id="${employeeId}"]`);
+  const warnEl = document.getElementById(`mlNewHireWarn-${employeeId}`);
+  if(!sel || !dateEl || !warnEl) return;
+  const asOfMonth = MASTERLIST_PENDING ? MASTERLIST_PENDING.asOfMonth : '';
+  const asOfYear = asOfMonth ? Number(asOfMonth.split('-')[0]) : null;
+  const d = parseDate(dateEl.value);
+  const suspicious = sel.value==='yes' && d && asOfYear!=null && d.getFullYear()!==asOfYear;
+  warnEl.style.display = suspicious ? 'block' : 'none';
+  if(suspicious){
+    warnEl.textContent = `⚠ Date Hired is in ${d.getFullYear()}, not ${asOfYear} (this upload's reporting year). Marked "Yes", they'll show up as a New Hire here and in Company Detail, but won't count in the ${asOfYear} New Hires cohort in Retention/Attrition Breakdown or Trend & Insight — that always goes by this date, not the reporting month. Double-check the year, or switch to "No" if they were genuinely already employed before this date.`;
+  }
+}
 async function confirmMasterlistNewHires(){
   const P = MASTERLIST_PENDING;
   if(!P){ closeModal(); return; }
@@ -5187,6 +5363,8 @@ async function confirmEditEmployee(){
   emp.employmentStatus = g('em_status');
   emp.dateHired = g('em_hired');
   emp.hireTagMonth = g('em_hireTagMonth') || '';
+  const countsNewHireEl = document.getElementById('em_countsNewHire');
+  if(countsNewHireEl) emp.excludeFromHireCount = !countsNewHireEl.checked;
   const sepDate = g('em_sepDate');
   emp.dateSeparated = sepDate;
   if(sepDate){
@@ -5416,6 +5594,19 @@ async function runCompanyUpload({file, company, status, asOfMonth}){
   // yet (added, but not counted).
   const isBaselineUpload = !EMP.some(e=> e.company===company && e.employmentStatus===status);
 
+  // Task: only treat this upload as advancing the roster forward — and therefore worth a
+  // Promotion review — when its reporting month is a brand-new month that comes AFTER every
+  // month already on file for this company+status. Re-uploading/overwriting a month that's
+  // already on record, or backfilling an earlier/out-of-sequence ("other") month, should never
+  // trigger the Promotion review: whatever is currently on file for that employee reflects a
+  // *different* (often later) month than the one in this file, so it isn't a meaningful
+  // "before" to compare against — it would just be the file correcting/backfilling data, not a
+  // real promotion happening between two consecutive uploads.
+  const uploadedMonthsSoFar = uploadedMonthsFor(company, status);
+  const alreadyUploadedThisMonth = uploadedMonthsSoFar.includes(asOfMonth);
+  const latestUploadedMonth = uploadedMonthsSoFar.length ? uploadedMonthsSoFar[uploadedMonthsSoFar.length-1] : null;
+  const isForwardMonthUpload = !alreadyUploadedThisMonth && (!latestUploadedMonth || asOfMonth > latestUploadedMonth);
+
   // Snapshot of who this group considered active BEFORE this upload.
   const previousActiveIds = new Set(EMP.filter(e=> e.company===company && e.employmentStatus===status && !e.dateSeparated).map(e=> String(e.employeeId)));
   const fileIds = new Set();
@@ -5477,7 +5668,7 @@ async function runCompanyUpload({file, company, status, asOfMonth}){
       if(wasSeparated) rehired++; else updated++;
       const newPosition = get('position').trim();
       const newJobGrade = get('jobGrade').trim();
-      if(!wasSeparated && prevPosition && prevJobGrade && newPosition && newJobGrade && (newPosition!==prevPosition || newJobGrade!==prevJobGrade)){
+      if(isForwardMonthUpload && !wasSeparated && prevPosition && prevJobGrade && newPosition && newJobGrade && (newPosition!==prevPosition || newJobGrade!==prevJobGrade)){
         pendingPromotionRows.push({employeeId:id, lastName:get('lastName'), firstName:get('firstName'),
           prevPosition, prevJobGrade, newPosition, newJobGrade});
       }
@@ -5523,7 +5714,7 @@ async function runCompanyUpload({file, company, status, asOfMonth}){
   // once every required review step below has been explicitly resolved (finalizeMasterlistUpload).
   MASTERLIST_PENDING = {
     company, status, asOfMonth, isBaselineUpload,
-    alreadyUploaded: isMonthUploaded(company, status, asOfMonth),
+    alreadyUploaded: alreadyUploadedThisMonth,
     rowCount: Math.max(0, rows.length-1),
     working,
     meta: {updated, rehired, baselineAdded, skippedOtherCompany, newHires:0, addedNotCounted:0, promoted:0, changed:0, separated:0}
@@ -6170,12 +6361,13 @@ function renderModal(){
         <div style="padding:8px 0;border-bottom:1px solid var(--border);">
           <div style="font-size:13px;margin-bottom:6px;"><b>${r.lastName||''}, ${r.firstName||''}</b> — ID ${r.employeeId}${r.costCenter?` · ${r.costCenter}`:''}${r.position?` · ${r.position}`:''}</div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;">
-            <select class="mlNewHireChoice" data-id="${r.employeeId}" style="flex:1;min-width:220px;">
+            <select class="mlNewHireChoice" data-id="${r.employeeId}" style="flex:1;min-width:220px;" onchange="checkNewHireDateWarning('${r.employeeId}')">
               <option value="yes" selected>Yes — new hire, count for ${monthLabel(asOfMonth)}</option>
               <option value="no">No — already existed, don't count</option>
             </select>
-            <input type="date" class="mlNewHireDate" data-id="${r.employeeId}" value="${r.dateHired||''}" style="flex:1;min-width:130px;">
+            <input type="date" class="mlNewHireDate" data-id="${r.employeeId}" value="${r.dateHired||''}" style="flex:1;min-width:130px;" oninput="checkNewHireDateWarning('${r.employeeId}')">
           </div>
+          <div id="mlNewHireWarn-${r.employeeId}" style="display:none;font-size:11.5px;color:var(--red);margin-top:6px;line-height:1.4;"></div>
         </div>
       `).join('')}
     </div>
@@ -6318,6 +6510,16 @@ function renderModal(){
       <p class="hint" style="color:var(--red);">This permanently deletes <b>${emp.lastName||''}, ${emp.firstName||''}</b> (ID ${emp.employeeId||''} · ${emp.company||''}) — one record only, not the rest of that month's list. This cannot be undone.</p>
       <div style="margin-top:16px;"><button class="btn danger" onclick="confirmArchiveDeleteOne()">Delete This Record</button> <button class="btn" onclick="closeModal()">Cancel</button></div>`;
     }
+  } else if(ui.modal.type==='dismissPromotion'){
+    const {employeeId, fromMs, toMs} = ui.modal.arg;
+    const emp = EMP.find(e=> String(e.employeeId)===String(employeeId));
+    if(!emp){
+      body = `<h3>Delete Promotion Entry</h3><p class="hint">Record not found — it may have already been deleted.</p><div style="margin-top:14px;"><button class="btn" onclick="closeModal()">Close</button></div>`;
+    } else {
+      body = `<h3>Delete Promotion Entry</h3>
+      <p class="hint" style="color:var(--red);">This removes just this one detected promotion — <b>${emp.lastName||''}, ${emp.firstName||''}</b> (ID ${emp.employeeId||''}), from ${monthLabel(fromMs)} to ${monthLabel(toMs)} — from the Promotions list. It only hides this specific entry; the employee's record, Job Grade, and roster are unaffected, and any other promotion of theirs still shows normally.</p>
+      <div style="margin-top:16px;"><button class="btn danger" onclick="confirmDismissPromotion()">Delete This Entry</button> <button class="btn" onclick="closeModal()">Cancel</button></div>`;
+    }
   } else if(ui.modal.type==='editEmployee'){
     const emp = EMP.find(e=> String(e.employeeId)===String(ui.modal.arg));
     if(!emp){
@@ -6358,7 +6560,13 @@ function renderModal(){
       <div class="field-row">
         <div class="field"><label>DATE HIRED</label><input type="date" id="em_hired" value="${emp.dateHired||''}"></div>
         <div class="field"><label>HIRE REPORTING MONTH</label><input type="month" id="em_hireTagMonth" value="${hireTagMonthOf(emp)||''}"></div>
+        <div class="field" style="flex:1;display:flex;align-items:flex-end;">
+          <label style="display:flex;align-items:center;gap:6px;font-weight:400;text-transform:none;">
+            <input type="checkbox" id="em_countsNewHire" ${emp.excludeFromHireCount?'':'checked'}> Counts as a New Hire
+          </label>
+        </div>
       </div>
+      <p class="hint" style="margin-top:-6px;">Uncheck this for someone who was actually already employed before the Date Hired above — e.g. a baseline/pre-existing employee only just added to the system, or a New Hire review answered "Yes" by mistake. This is what keeps a record out of New Hire counts (Overview, Company Detail, Recruitment Cost, trends) and — together with an accurate Date Hired — out of the wrong year's cohort in Retention/Attrition Breakdown and Trend & Insight.</p>
       <div class="field-row">
         <div class="field"><label>DATE SEPARATED</label><input type="date" id="em_sepDate" value="${emp.dateSeparated||''}"></div>
         <div class="field"><label>SEPARATION REPORTING MONTH</label><input type="month" id="em_tagMonth" value="${separationTagMonthOf(emp)||''}"></div>
@@ -6419,6 +6627,12 @@ function renderModal(){
   const wrap = document.createElement('div');
   wrap.innerHTML = `<div class="modal-bg" onclick="if(event.target===this) closeModal()"><div class="modal" style="${wide}">${body}</div></div>`;
   document.getElementById('app').appendChild(wrap.firstElementChild);
+  // Run the New Hire date/year check immediately on open too — a Date Hired pulled straight from
+  // the uploaded file can already be suspicious before HR touches anything (this is exactly what
+  // happened with the PSC Rank & File hire that never showed up in the New Hires cohort).
+  if(ui.modal.type==='confirmMasterlistNewHires'){
+    (ui.modal.arg.rows||[]).forEach(r=> checkNewHireDateWarning(r.employeeId));
+  }
 }
 async function confirmAddIndustry(){
   const v = document.getElementById('m_name').value.trim();
