@@ -1554,6 +1554,48 @@ function monthlyRetentionAttritionTable(company, year, showHint){
   ${showHint===false ? '' : `<p class="hint">Each month's Retention/Attrition Rate uses that month alone as its own period (baseline = who was already active right before that month began). The <b>Annual</b> row is the blended full-year figure — the two won't simply average together since each month has its own base headcount.</p>`}`;
 }
 
+// Company Detail's Retention/Attrition Breakdown, right side: a month-by-month Total
+// Headcount / New Hire / Separated table for the selected year, replacing the old annual
+// New-Hires-vs-Already-Employed cohort split in this spot (that cohort math still exists —
+// newHireStatsAnnual/existingEmployeeStatsAnnual — and still feeds Trend & Insight and the
+// baseline reconciliation check above; it's just no longer shown here). Total Headcount per
+// month is a real roster snapshot as of that month's end (companyStats -> isOnRosterAsOf), not
+// a manually-accumulated running total, so it already reflects whoever carried over from the
+// prior month plus that month's New Hires minus that month's Separated with no extra math
+// needed — and the same snapshot logic keeps the progression continuous across the December ->
+// January year boundary: pass in year+1 and January's Total Headcount already starts from
+// wherever December of this year left off.
+function monthlyHeadcountBreakdownTable(company, year){
+  const rows = MONTH_NAMES.map((name,i)=>{
+    const ms = `${year}-${String(i+1).padStart(2,'0')}`;
+    return {label: name.slice(0,3), s: companyStats(company, ms)};
+  });
+  const annual = companyStatsAnnual(company, year);
+  // Same Staff / Rank & File / Combined split as the Retention/Attrition table beside this one —
+  // New Hire and Separated aren't tracked per-status on the stats object itself (byStatus only
+  // covers headcount), so each status's hires/separations are filtered out of the same tag-month
+  // hired/separated lists that feed the Combined column.
+  const seg = s=>{
+    const staffHired = s.hired.filter(e=> STATUS_KEY(e.employmentStatus)==='staff').length;
+    const staffSep = s.separated.filter(e=> STATUS_KEY(e.employmentStatus)==='staff').length;
+    const rfHired = s.hired.filter(e=> STATUS_KEY(e.employmentStatus)==='rankfile').length;
+    const rfSep = s.separated.filter(e=> STATUS_KEY(e.employmentStatus)==='rankfile').length;
+    return `<td>${s.byStatus.staff}</td><td>${staffHired}</td><td>${staffSep}</td><td>${s.byStatus.rankfile}</td><td>${rfHired}</td><td>${rfSep}</td><td>${s.total}</td><td>${s.hired.length}</td><td>${s.separated.length}</td>`;
+  };
+  const rowsHtml = rows.map(r=>`<tr><td class="rowlabel">${r.label}</td>${seg(r.s)}</tr>`).join('');
+  return `
+  <table class="demo" style="margin-top:0;">
+    <thead>
+      <tr><th class="rowlabel" rowspan="2">Month</th><th colspan="3">Staff</th><th colspan="3">Rank &amp; File</th><th colspan="3">Combined</th></tr>
+      <tr><th>Headcount</th><th>Hire</th><th>Sep.</th><th>Headcount</th><th>Hire</th><th>Sep.</th><th>Headcount</th><th>Hire</th><th>Sep.</th></tr>
+    </thead>
+    <tbody>
+      ${rowsHtml}
+      <tr class="total"><td class="rowlabel">Annual (${year})</td>${seg(annual)}</tr>
+    </tbody>
+  </table>`;
+}
+
 // Task C: New Hire Retention & Attrition — a separate metric from the overall company-wide
 // Retention/Attrition above. Overall attrition asks "of everyone already on the roster, what
 // share left this period?" New Hire attrition instead asks "of the people hired IN a given year
@@ -1695,17 +1737,23 @@ function orgBaselineMonth(){
   const vals = Object.values(CONFIG.companyBaselineMonth || {});
   return vals.length ? vals.sort()[0] : null;
 }
-// Annual view: the trend runs across the selected year — January through the reporting month
-// currently selected — instead of a rolling six-month window. Months before a scope's first
-// Master List baseline are still trimmed off, so a company that started mid-year begins at its
-// real first month rather than at an empty January.
+// Annual view: the trend runs across the selected year — January through December — instead of
+// a rolling six-month window. Months before a scope's first Master List baseline are still
+// trimmed off, so a company that started mid-year begins at its real first month rather than
+// at an empty January.
 // Always spans the full calendar year — January through December of the selected year — so the
 // line chart and both movement bar graphs share one fixed 12-month frame. Months with no
-// reported data yet (before a scope's first Master List baseline, or later than the reporting
-// month currently selected) are emitted as placeholders: they keep their slot and label on every
-// graph but carry no value, so nothing is invented for a month that hasn't been reported.
+// reported data yet (before a scope's first Master List baseline, or no Master List/Quick Add
+// has actually touched that month at all) are emitted as placeholders: they keep their slot and
+// label on every graph but carry no value, so nothing is invented for a month that hasn't been
+// reported. Whether a month counts as "reported" is based on real data — companyMonthHasData,
+// the same check Company Detail uses — not on comparing against whatever month happens to be
+// picked in the Year/Month selector: that used to cut the whole-year trend off right after the
+// picker's month regardless of the picker's own year, so switching to Annual view for a year
+// that had already been fully reported could still render only a single point (whichever month
+// the picker was left on) instead of the real, fully-populated 12-month line.
 function orgTrend(company, companiesList){
-  const [y,m] = ui.month.split('-').map(Number);
+  const y = Number(ui.month.split('-')[0]) || new Date().getFullYear();
   // companiesList (optional): scopes to a specific set of companies — e.g. every company in an
   // Industry — when no single company is picked. Ignored if `company` is set, since a single
   // company is already the narrowest possible scope.
@@ -1738,12 +1786,14 @@ function orgTrend(company, companiesList){
     if(by > y) hasYear = false;         // scope has no data at all in this year yet
     else if(by === y) startMonth = Math.max(1, bm);
   }
+  const scopeCompanies = company ? [company] : (scopeList || allCompanies().map(c=>c.company));
+  const monthHasData = ms => scopeCompanies.some(c=> companyMonthHasData(c, ms));
   let out=[];
   for(let mm=1; mm<=12; mm++){
     const d = new Date(y, mm-1, 1);
     const ms = monthStr(d);
     const label = d.toLocaleString('en-US',{month:'short'});
-    const reported = hasYear && mm>=startMonth && mm<=m;
+    const reported = hasYear && mm>=startMonth && monthHasData(ms);
     if(!reported){ out.push({ms, label, reported:false, headcount:null, headcountStaff:null, headcountRankfile:null, hired:null, separated:null}); continue; }
     const {start,end} = monthBounds(ms);
     const onRoster = EMP.filter(e=> inScope(e) && isOnRosterAsOf(e,end));
@@ -2741,22 +2791,9 @@ function baselineReconciliationNote(st){
   </div>`;
 }
 function subHeadcount(st, period){
-  // Annual Cohort Split is shown alongside the month-by-month table as one merged block —
-  // both are calendar-year cuts of the same population, just sliced differently. Independent
-  // of the Monthly/Annual period selector, which only drives the Overall block above.
+  // nhYear anchors both month-by-month tables below to a calendar year (independent of the
+  // Monthly/Annual period selector, which only drives the Overall block above).
   const nhYear = Number(ui.month.split('-')[0]) || new Date().getFullYear();
-  const nh = newHireStatsAnnual(ui.company, nhYear);
-  const ex = existingEmployeeStatsAnnual(ui.company, nhYear);
-  const nhS = newHireStatsAnnual(ui.company, nhYear, 'staff');
-  const nhR = newHireStatsAnnual(ui.company, nhYear, 'rankfile');
-  const exS = existingEmployeeStatsAnnual(ui.company, nhYear, 'staff');
-  const exR = existingEmployeeStatsAnnual(ui.company, nhYear, 'rankfile');
-  // Each cohort row is followed by its Staff and Rank & File components; the two sub-rows sum
-  // back to the cohort total on counts, but their rates are each against their own base.
-  const cohortRow = (label, s, sub)=>{
-    const base = s.cohortCount!==undefined ? s.cohortCount : s.baseCount;
-    return `<tr class="${sub?'':'total'}"><td class="rowlabel" style="${sub?'padding-left:26px;font-weight:400;color:var(--dim);':''}">${label}</td><td>${base}</td><td>${s.separatedCount}</td><td>${s.retentionRate.toFixed(1)}%</td><td>${s.attritionRate.toFixed(1)}%</td></tr>`;
-  };
   return `
   <div class="grid cards3">
     <div class="card"><div class="label">Staff</div><div class="value" style="color:var(--blue)">${subStatusHasData('Staff') ? st.byStatus.staff : noDataCell('Staff')}</div></div>
@@ -2772,21 +2809,9 @@ function subHeadcount(st, period){
   <h2 class="section">Retention/Attrition Breakdown <span class="n">${nhYear} · Staff &amp; Rank &amp; File only</span></h2>
   <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(340px,1fr));align-items:start;">
     <div>${monthlyRetentionAttritionTable(ui.company, nhYear, false)}</div>
-    <div>
-      <table class="demo" style="margin-top:0;">
-        <thead><tr><th class="rowlabel">Cohort</th><th>Base Count</th><th>Separated</th><th>Retention Rate</th><th>Attrition Rate</th></tr></thead>
-        <tbody>
-          ${cohortRow(`New Hires in ${nhYear}`, nh)}
-          ${cohortRow('Staff', nhS, true)}
-          ${cohortRow('Rank &amp; File', nhR, true)}
-          ${cohortRow(`Already Employed before ${nhYear}`, ex)}
-          ${cohortRow('Staff', exS, true)}
-          ${cohortRow('Rank &amp; File', exR, true)}
-        </tbody>
-      </table>
-    </div>
+    <div>${monthlyHeadcountBreakdownTable(ui.company, nhYear)}</div>
   </div>
-  <p class="hint">Left: each month uses that month alone as its own period, with the <b>Annual</b> row as the blended full-year figure. Right: everyone active in ${nhYear} split into exactly two groups — hired <b>in ${nhYear}</b> vs. already on the roster <b>before ${nhYear}</b>. Both are always by calendar year; change the Year picker up top to view a different year.</p>
+  <p class="hint">Left: each month uses that month alone as its own period for Retention/Attrition, with the <b>Annual</b> row as the blended full-year figure. Right: Headcount is each month's ending roster snapshot split into Staff / Rank &amp; File / Combined, so it already carries forward everyone kept from the month before, plus that month's Hires, minus that month's Separations — December's ending headcount is exactly where January of the next year starts from. Change the Year picker up top to follow the progression into another year.</p>
 
   <h2 class="section">Roster <span class="n">${st.active.length} active as of ${period.label}</span></h2>
   ${employeeTable(st.active, null, period.trendAnchor)}
@@ -3361,22 +3386,41 @@ function subMovement(list, dateLabel, dateField, period){
   </div>` : (dateField==='dateHired' ? `<p class="hint">Recruitment cost figures are tracked monthly — switch to the Monthly view to see them here, or check the Recruitment Cost tab for the Annual Overview.</p>` : '');
 
   // Task A: for the Separated view, show what tenure people had when they left, and why —
-  // as graphs, using the same Tenure Groups configured in Control Panel.
-  const separationInsights = dateField==='dateSeparated' ? `
-  <h2 class="section">Separation Insights <span class="n">${period.label}</span></h2>
+  // as graphs, using the same Tenure Groups configured in Control Panel. Each graph is split
+  // into Staff and Rank & File side by side (same pattern as the Job Grade Distribution and
+  // Movements panels on the Executive Report) rather than one blended chart, since the two
+  // groups' tenure/reason mix isn't meant to be read together — each side's percentages are
+  // against that group's own separation count, not the combined total.
+  const separationInsights = dateField==='dateSeparated' ? (()=>{
+    const staffList = list.filter(e=> STATUS_KEY(e.employmentStatus)==='staff');
+    const rfList = list.filter(e=> STATUS_KEY(e.employmentStatus)==='rankfile');
+    const tenureOrderLocal = CONFIG.tenureGroups.map(g=>g.label);
+    const byStatus = (label, groupList, keyFn, order) => `<div><p class="hint" style="margin-bottom:6px;"><b>${label}</b></p>${groupList.length ? breakdownBarChart(groupList, keyFn, order) : `<div class="empty">No ${label} separations this period.</div>`}</div>`;
+    return `
+  <h2 class="section">Separation Insights <span class="n">${period.label} · Staff &amp; Rank &amp; File</span></h2>
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:22px;">
     <div class="panel">
       <div class="panel-head"><h3>Tenure at Separation</h3></div>
-      ${breakdownBarChart(list, e=>{ const t=tenureAtSeparation(e); return t===null?'Unclassified':tenureGroupOf(t); }, CONFIG.tenureGroups.map(g=>g.label))}
+      <div class="grid cards3" style="grid-template-columns:1fr 1fr;">
+        ${byStatus('Staff', staffList, e=>{ const t=tenureAtSeparation(e); return t===null?'Unclassified':tenureGroupOf(t); }, tenureOrderLocal)}
+        ${byStatus('Rank &amp; File', rfList, e=>{ const t=tenureAtSeparation(e); return t===null?'Unclassified':tenureGroupOf(t); }, tenureOrderLocal)}
+      </div>
     </div>
     <div class="panel">
       <div class="panel-head"><h3>Separation Reasons</h3></div>
-      ${breakdownBarChart(list, e=> e.separationReason || 'Unspecified', CONFIG.separationReasons)}
+      <div class="grid cards3" style="grid-template-columns:1fr 1fr;">
+        ${byStatus('Staff', staffList, e=> e.separationReason || 'Unspecified', CONFIG.separationReasons)}
+        ${byStatus('Rank &amp; File', rfList, e=> e.separationReason || 'Unspecified', CONFIG.separationReasons)}
+      </div>
     </div>
-  </div>` : '';
+  </div>`;
+  })() : '';
 
+  // Same year the rest of this view is anchored to (period.trendAnchor is Dec of the year for
+  // the Annual tab, or the picked month for Monthly — either way its year is the right one).
+  const trendYear = Number((period.trendAnchor||ui.month).split('-')[0]) || new Date().getFullYear();
   return `
-  <h2 class="section">Monthly Trend <span class="n">last 6 months</span></h2>
+  <h2 class="section">Monthly Trend <span class="n">${trendYear} · Jan–Dec</span></h2>
   <div class="bar-mini">
     ${trend.map(t=>`<div class="b" style="height:60px;"><div class="fill" style="height:${t.pct}%;"></div></div>`).join('')}
   </div>
@@ -3388,16 +3432,20 @@ function subMovement(list, dateLabel, dateField, period){
   `;
 }
 
+// Task: was a rolling "last 6 months" trailing window ending at whatever month was selected —
+// changed to always show the full Jan-Dec of the same calendar year the rest of this view is
+// anchored to (see trendYear above), so the bars read as one continuous year rather than a
+// window that silently shifts (and can span two different years) depending on which month
+// happens to be picked.
 function trendData(dateField, anchorMs){
   const ms = anchorMs || ui.month;
-  const [y,m] = ms.split('-').map(Number);
+  const year = Number(ms.split('-')[0]) || new Date().getFullYear();
   let out=[];
-  for(let i=5;i>=0;i--){
-    const d = new Date(y, m-1-i, 1);
-    const dms = monthStr(d);
+  for(let m=1;m<=12;m++){
+    const dms = `${year}-${String(m).padStart(2,'0')}`;
     const {start,end} = monthBounds(dms);
     const count = EMP.filter(e=> e.company===ui.company && (dateField==='dateHired'? isHiredIn(e,start,end) : isSeparatedIn(e,start,end))).length;
-    out.push({label:d.toLocaleString('en-US',{month:'short'}), count, ms:dms});
+    out.push({label: MONTH_NAMES[m-1].slice(0,3), count, ms:dms});
   }
   const max = Math.max(1, ...out.map(o=>o.count));
   out.forEach(o=> o.pct = o.count/max*100);
