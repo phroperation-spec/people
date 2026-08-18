@@ -279,6 +279,11 @@ const DEFAULT_CONFIG = {
   lockedUploadMonth:'', // Task A: when set (YYYY-MM), HR can't pick any other month for Master List uploads
   companyBaselineMonth:{}, // key: company -> YYYY-MM of that company's first-ever Master List (baseline) upload
   uploadLog:{}, // key: `${company}|${status}` -> { 'YYYY-MM': {rows, at} } — which months already had a Master List uploaded
+  // PRF (Personnel Requisition Form) Monitoring — see prfList below for the record shape.
+  prfList:[],
+  prfAbbrev:{}, // key: company -> short code used in the PRF Reference # (e.g. "PSC") — auto-derived on first use, editable in the PRF form afterward
+  prfCustomPositions:{}, // key: company -> [position titles HR/Admin added manually, not yet on any employee record]
+  prfNextControl:{}, // key: company -> next PRF control number to assign (starts at 1, never reused even if a PRF is deleted)
   separationReasons:['Resignation','End of Contract','Termination','Retirement','Redundancy/Retrenchment','Other'],
   // Certificate of Employment — per-company defaults (address, signatory, boilerplate purpose
   // line) so HR doesn't have to retype them every time; the actual certificate per employee is
@@ -353,7 +358,10 @@ let ui = {
   appraisalSearch:'',
   reportScope:'', // '' = All Companies, else a company name
   reportPeriod:'monthly', // 'monthly' | 'annual'
-  reportCompare:true // show vs-previous-period comparison throughout the report
+  reportCompare:true, // show vs-previous-period comparison throughout the report
+  prfCompanyFilter:'',
+  prfStatusFilter:'',
+  prfSearch:''
 };
 const ROLE_OPTIONS = ['Admin','HR','Executive'];
 function isAdmin(){ return ui.role==='Admin'; }
@@ -739,6 +747,10 @@ function sanitizeConfig(cfg){
   if(cfg.lockedUploadMonth===undefined) cfg.lockedUploadMonth = '';
   if(!cfg.companyBaselineMonth) cfg.companyBaselineMonth = {};
   if(!cfg.uploadLog) cfg.uploadLog = {};
+  if(!Array.isArray(cfg.prfList)) cfg.prfList = [];
+  if(!cfg.prfAbbrev) cfg.prfAbbrev = {};
+  if(!cfg.prfCustomPositions) cfg.prfCustomPositions = {};
+  if(!cfg.prfNextControl) cfg.prfNextControl = {};
   if(cfg.promotionBenchmarkYears==null) cfg.promotionBenchmarkYears = DEFAULT_CONFIG.promotionBenchmarkYears;
   if(!cfg.authHashes) cfg.authHashes = JSON.parse(JSON.stringify(DEFAULT_CONFIG.authHashes));
   // Same self-heal as industries above — these fields are relied on throughout the Control
@@ -1988,6 +2000,7 @@ const NAV_ITEMS = [
   ['company','Company Detail','Drill into one company — headcount, department, cost center, age, tenure, movement'],
   ['forecastreport','Executive Report','Consolidated, printable executive workforce report'],
   ['recruitment','Recruitment Cost','Cost per hire and recruitment cost ratio by company'],
+  ['prf','PRF Monitoring','Personnel Requisition Forms — request to onboarding, by business affiliate'],
   ['archive','Hire &amp; Separation Archive','New hires and separations, side by side, by month and year'],
   ['transfers','Transfers','Employees who separated at one company and were hired at another — matched by name'],
   ['appraisal','Bound for Performance Appraisal','Staff new hires approaching their 3rd, 6th and 9th month evaluation'],
@@ -2069,6 +2082,7 @@ function render(){
     else if(ui.tab==='transfers') body.innerHTML = renderTransfers();
     else if(ui.tab==='appraisal') body.innerHTML = renderAppraisal();
     else if(ui.tab==='coe') body.innerHTML = renderCOE();
+    else if(ui.tab==='prf') body.innerHTML = renderPRF();
     else if(ui.tab==='settings') body.innerHTML = renderSettings();
   }catch(err){
     console.error(err);
@@ -2690,6 +2704,11 @@ function renderCompany(){
   if(!ui.company) return '<div class="empty">No companies configured yet — add one in the Control Panel.</div>';
   const {st, period} = companyDetailContext();
   const subs = [['headcount','Headcount'],['department','Department'],['costcenter','Cost Center'],['position','Position'],['age','Age'],['tenure','Tenure'],['gender','Gender'],['jobgrade','Job Grade'],['promotions','Promotions'],['newhire','New Hire'],['separated','Separated']];
+  // Export is its own last tab, HR/Admin only (Executive stays view-only — see canQuickAdd) —
+  // a single place that lists every export available for this company instead of one scattered
+  // per sub-tab (Master List by month, Position Breakdown, Hire & Separation Archive, Bound for
+  // Performance Appraisal, Recruitment Cost).
+  if(canQuickAdd()) subs.push(['export','Export']);
   const periodTabs = [['monthly','Monthly'],['annual','Annual']];
   const companySelect = `
   <div class="field"><label>COMPANY</label>
@@ -2758,38 +2777,10 @@ function companySubview(sub, st, period){
   if(sub==='promotions') return subPromotions(st, period);
   if(sub==='newhire') return subMovement(st.hired, 'Date Hired', 'dateHired', period);
   if(sub==='separated') return subMovement(st.separated, 'Date Separated', 'dateSeparated', period);
+  if(sub==='export') return canQuickAdd() ? subExportCenter(st, period) : '<div class="empty">Only Admin and HR can export data.</div>';
   return '';
 }
 
-// Sanity check for the exact month a company+status's baseline was first uploaded: in that
-// specific month, nothing could have been hired or separated yet under this app's own tracking,
-// so the reported headcount for that status MUST equal its "Already Employed" cohort base plus
-// any same-month New Hire cohort count. If it doesn't, a data-quality gap — usually a blank Date
-// Hired the app had to guess at, or a Date Separated left inconsistent with the reported roster —
-// is silently pulling someone out of the cohort split while they still show up in headcount (see
-// isActiveAsOf). This turns that into a visible, actionable note instead of a silent mismatch.
-function baselineReconciliationNote(st){
-  const checks = [
-    {label:'Staff', status:'Staff', key:'staff'},
-    {label:'Rank & File', status:'Rank & File', key:'rankfile'}
-  ];
-  const issues = checks.map(c=>{
-    const baselineMonth = uploadedMonthsFor(ui.company, c.status)[0];
-    if(!baselineMonth || baselineMonth !== ui.month) return null;
-    const year = Number(baselineMonth.split('-')[0]);
-    const ex = existingEmployeeStatsAnnual(ui.company, year, c.key);
-    const nh = newHireStatsAnnual(ui.company, year, c.key);
-    const headcount = st.byStatus[c.key];
-    const expected = ex.baseCount + nh.cohortCount;
-    return expected===headcount ? null : {label:c.label, headcount, expected, diff:headcount-expected};
-  }).filter(Boolean);
-  if(!issues.length) return '';
-  return `<div class="hint" style="border:1px solid var(--red);background:rgba(211,71,71,.08);padding:10px 12px;border-radius:8px;margin:10px 0 0;">
-    ⚠ <b>${monthLabel(ui.month)} is ${issues.map(i=>i.label).join(' and ')}'s baseline upload month</b>, so headcount should exactly equal the Already-Employed + New-Hire cohort split below — it doesn't:
-    ${issues.map(i=>`${i.label}: headcount ${i.headcount} vs. cohort split ${i.expected} (${Math.abs(i.diff)} record${Math.abs(i.diff)===1?'':'s'} unaccounted for)`).join('; ')}.
-    This usually means one or more ${ui.company} records uploaded in ${monthLabel(ui.month)} have a blank Date Hired, or a Date Separated that doesn't match their reported roster history — check the Archive for ${issues.map(i=>i.label).join(', ')} records from that upload for either gap.
-  </div>`;
-}
 function subHeadcount(st, period){
   // nhYear anchors both month-by-month tables below to a calendar year (independent of the
   // Monthly/Annual period selector, which only drives the Overall block above).
@@ -2800,7 +2791,6 @@ function subHeadcount(st, period){
     <div class="card"><div class="label">Rank &amp; File</div><div class="value" style="color:var(--teal)">${subStatusHasData('Rank & File') ? st.byStatus.rankfile : noDataCell('Rank & File')}</div></div>
     <div class="card"><div class="label">Intern / OJT</div><div class="value" style="color:var(--violet)">${subStatusHasData('Intern/OJT') ? st.byStatus.intern : noDataCell('Intern/OJT')}</div></div>
   </div>
-  ${baselineReconciliationNote(st)}
   <h2 class="section">Retention &amp; Attrition <span class="n">${period.label} · Staff &amp; Rank &amp; File only</span></h2>
   <div class="grid cards3" style="grid-template-columns:repeat(2,1fr);margin-bottom:14px;">
     <div class="card"><div class="label">Overall Retention Rate</div><div class="value green" style="font-size:20px;">${st.retentionRate.toFixed(1)}%</div></div>
@@ -3033,10 +3023,19 @@ function filterPositionBreakdown(){
   const {st, period} = companyDetailContext();
   document.getElementById('positionBreakdownBody').innerHTML = renderPositionView(st, period, ui.positionSearch);
 }
-// Task C: exports all three Position views (Breakdown, by Department, by Cost Center) as one
-// workbook — one sheet each — reflecting whichever Month/Year and period mode (Monthly/Annual) is currently selected at the top of the page.
+// Task C: exports the four Position views (Breakdown, by Department, by Cost Center, by Job
+// Grade Group) as one workbook — one sheet each — reflecting whichever Month/Year and period mode
+// (Monthly/Annual) is currently selected at the top of the page. Called two ways: from the
+// Position tab's own button with no arguments (always exports all four, same as always), and from
+// the Export tab's checkboxes (exp_pos_breakdown/department/costcenter/jobgrade), which lets HR
+// pick just the report(s) they need instead of the whole workbook.
 function exportPositionExcel(){
   if(typeof XLSX === 'undefined'){ toast('Excel export isn\'t available right now — try refreshing the page.'); return; }
+  const checkboxIds = {breakdown:'exp_pos_breakdown', department:'exp_pos_department', costcenter:'exp_pos_costcenter', jobgrade:'exp_pos_jobgrade'};
+  const checks = Object.fromEntries(Object.entries(checkboxIds).map(([k,id])=> [k, document.getElementById(id)]));
+  const anyCheckboxes = Object.values(checks).some(Boolean);
+  const include = k => !anyCheckboxes || (checks[k] && checks[k].checked);
+  if(anyCheckboxes && !Object.keys(checkboxIds).some(include)){ toast('Select at least one Position report to export.'); return; }
   const {st, period} = companyDetailContext();
   const keyFn = e=> (e.position||'').trim() || 'Unspecified';
   const ccKeyFn = e=> (e.costCenter||'').trim() || 'Unassigned';
@@ -3092,10 +3091,10 @@ function exportPositionExcel(){
   }
 
   const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(breakdownRows), 'Position Breakdown');
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(matrixSheet(deptKeyFn)), 'Position by Department');
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(matrixSheet(ccKeyFn)), 'Position by Cost Center');
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(jobGradeGroupSheet()), 'Position by Job Grade Group');
+  if(include('breakdown')) XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(breakdownRows), 'Position Breakdown');
+  if(include('department')) XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(matrixSheet(deptKeyFn)), 'Position by Department');
+  if(include('costcenter')) XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(matrixSheet(ccKeyFn)), 'Position by Cost Center');
+  if(include('jobgrade')) XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(jobGradeGroupSheet()), 'Position by Job Grade Group');
   const scope = [ui.company||'Company', period.label].join('_').replace(/\s+/g,'-').replace(/[^\w\-]/g,'');
   XLSX.writeFile(wb, `position_breakdown_${scope}.xlsx`);
 }
@@ -4058,6 +4057,428 @@ function appraisalStatePill(row){
   if(row.state==='due') return `<span class="pill" style="background:rgba(154,106,20,.16);color:var(--gold);">Due today</span>`;
   return `<span class="pill" style="background:rgba(154,106,20,.12);color:var(--gold-dim);">In ${row.daysLeft}d</span>`;
 }
+
+/* ============ PRF (PERSONNEL REQUISITION FORM) MONITORING ============
+   Tracks a manpower request per Business Affiliate (= company) from the moment HR receives it
+   through to onboarding. One PRF can request more than one head at once (e.g. "3 Laborers") —
+   each requested head gets its own placeholder "slot" that starts unfilled and is filled either
+   automatically (the PRF-link dropdown on the Master List New Hire review card — see
+   confirmMasterlistNewHires) or by typing a name/date straight into a slot on this tab. Admin/HR
+   only — Executives don't get this tab at all (see NAV_ITEMS / EXEC_ALLOWED_TABS in render()).
+
+   PRF Reference # is never frozen as stored text — it's always computed live from the company's
+   abbreviation + this record's permanent control number + its current Position (prfRefNumber),
+   so fixing a company's abbreviation or a Position typo later immediately corrects every
+   reference number built from it. The control number IS frozen at creation
+   (CONFIG.prfNextControl, never reused even if a PRF is later deleted) so two PRFs for the same
+   company can never collide on the same number. */
+
+// Default abbreviation the first time a company is used on a PRF: initials of each word in the
+// company name (e.g. "Pacific Staffing Corp" -> "PSC"), or its first 3 letters if it's one word.
+// HR/Admin can override this anytime from the PRF form (prf_abbrev) — see prfSetAbbrev.
+function prfDefaultAbbrev(company){
+  const words = String(company||'').trim().split(/\s+/).filter(Boolean);
+  if(words.length>1) return words.map(w=> w[0]).join('').toUpperCase().slice(0,6);
+  return (String(company||'').replace(/[^a-z0-9]/gi,'').slice(0,3).toUpperCase()) || 'CO';
+}
+function prfAbbrevFor(company){
+  CONFIG.prfAbbrev = CONFIG.prfAbbrev || {};
+  if(!CONFIG.prfAbbrev[company]) CONFIG.prfAbbrev[company] = prfDefaultAbbrev(company);
+  return CONFIG.prfAbbrev[company];
+}
+async function prfSetAbbrev(company, value){
+  value = (value||'').trim().toUpperCase();
+  if(!value || !company) return;
+  CONFIG.prfAbbrev = CONFIG.prfAbbrev || {};
+  CONFIG.prfAbbrev[company] = value;
+  await saveConfig();
+}
+// Position options for a company: every distinct Position already on an employee record there
+// (any employment status — a PRF isn't specific to Staff vs. Rank & File), plus anything HR/Admin
+// has added manually via "+ Add new position" on the PRF form that hasn't shown up on a hire yet.
+function prfPositionsFor(company){
+  const set = new Set();
+  EMP.filter(e=> e.company===company && (e.position||'').trim()).forEach(e=> set.add(e.position.trim()));
+  (CONFIG.prfCustomPositions[company]||[]).forEach(p=> set.add(p));
+  return Array.from(set).sort();
+}
+async function prfAddCustomPosition(company, position){
+  position = (position||'').trim();
+  if(!position || !company) return;
+  CONFIG.prfCustomPositions[company] = CONFIG.prfCustomPositions[company] || [];
+  if(!prfPositionsFor(company).includes(position)) CONFIG.prfCustomPositions[company].push(position);
+  await saveConfig();
+}
+function prfNextControlNum(company){
+  CONFIG.prfNextControl[company] = (CONFIG.prfNextControl[company]||0) + 1;
+  return CONFIG.prfNextControl[company];
+}
+function prfRefNumber(prf){
+  return `${prfAbbrevFor(prf.company)}-${String(prf.controlNum).padStart(3,'0')}-${prf.position||'Position'}`;
+}
+// Weekdays (Mon–Fri) strictly after Date Approved, up to and including the onboarding/hired
+// date — i.e. calendar days to fill the role with every Saturday and Sunday in that stretch
+// excluded, per Task j. Returns null when either date is missing or onboarding isn't after
+// (or on) approval.
+function prfWeekdaysBetween(approvedStr, onboardStr){
+  const start = parseDate(approvedStr), end = parseDate(onboardStr);
+  if(!start || !end || end < start) return null;
+  let count = 0;
+  const cur = new Date(start.getFullYear(), start.getMonth(), start.getDate()+1);
+  const endD = new Date(end.getFullYear(), end.getMonth(), end.getDate());
+  while(cur <= endD){
+    const dow = cur.getDay();
+    if(dow!==0 && dow!==6) count++;
+    cur.setDate(cur.getDate()+1);
+  }
+  return count;
+}
+function prfEmptySlot(){ return {employeeId:'', employeeName:'', onboardingDate:''}; }
+// Grows or shrinks a PRF's slot list to match Headcount Requested. Shrinking is blocked if it
+// would discard a slot that's already been filled (linked to a hire, or given a manual name/
+// date) — Headcount Requested should be corrected some other way, or that slot cleared first,
+// rather than silently losing a filled record.
+function prfResizeSlots(prf, newCount){
+  newCount = Math.max(1, Number(newCount)||1);
+  const slots = Array.isArray(prf.slots) ? prf.slots.slice() : [];
+  if(newCount < slots.length){
+    const wouldDrop = slots.slice(newCount).some(s=> s.employeeName || s.onboardingDate);
+    if(wouldDrop){ toast("Can't reduce Headcount Requested below the number of slots already filled — clear a filled slot first."); return false; }
+  }
+  while(slots.length < newCount) slots.push(prfEmptySlot());
+  slots.length = newCount;
+  prf.slots = slots;
+  return true;
+}
+// Closed once every requested slot has an onboarding date on file (Task i). On Hold is a manual
+// override (blocked below Closed so a fully-filled PRF can't be stuck "On Hold"); anything else
+// still open is just Open.
+function prfOverallStatus(prf){
+  const slots = prf.slots||[];
+  if(slots.length && slots.every(s=> s.onboardingDate)) return 'Closed';
+  if(prf.statusOverride==='On Hold') return 'On Hold';
+  return 'Open';
+}
+function prfFilledCount(prf){ return (prf.slots||[]).filter(s=> s.onboardingDate).length; }
+function prfStatusPillStyle(status){
+  if(status==='Closed') return 'background:rgba(58,142,91,.14);color:var(--green);';
+  if(status==='On Hold') return 'background:rgba(178,58,58,.14);color:var(--red);';
+  return 'background:rgba(154,106,20,.14);color:var(--gold);';
+}
+function prfMatchesFilter(prf){
+  if(ui.prfCompanyFilter && prf.company!==ui.prfCompanyFilter) return false;
+  if(ui.prfStatusFilter && prfOverallStatus(prf)!==ui.prfStatusFilter) return false;
+  const q = (ui.prfSearch||'').trim().toLowerCase();
+  if(!q) return true;
+  const hay = [prfRefNumber(prf), prf.company, prf.position, prf.costCenter, prf.qualifications].map(v=> String(v||'').toLowerCase()).join(' ');
+  return hay.includes(q);
+}
+// Open PRFs (at least one unfilled slot) for a company — feeds the PRF-link dropdown on the
+// Master List New Hire review card (Task h), so HR can tag an incoming new hire to the request
+// that brought them on instead of leaving Onboarding Date to be typed in by hand afterward.
+function prfOpenOptionsFor(company){
+  return (CONFIG.prfList||[]).filter(p=> p.company===company && (p.slots||[]).some(s=> !s.onboardingDate));
+}
+function renderPRF(){
+  const companies = allCompanies().map(c=>c.company);
+  const list = (CONFIG.prfList||[]).filter(prfMatchesFilter)
+    .slice().sort((a,b)=> (b._ts||0) - (a._ts||0));
+  const open = (CONFIG.prfList||[]).filter(p=> prfOverallStatus(p)==='Open').length;
+  const onHold = (CONFIG.prfList||[]).filter(p=> prfOverallStatus(p)==='On Hold').length;
+  const closed = (CONFIG.prfList||[]).filter(p=> prfOverallStatus(p)==='Closed').length;
+  return `
+  <div class="field-row" style="align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;">
+    <div class="grid cards3" style="grid-template-columns:repeat(3,120px);gap:12px;">
+      <div class="card" style="padding:10px 14px;"><div class="label">Open</div><div class="value" style="font-size:20px;color:var(--gold);">${open}</div></div>
+      <div class="card" style="padding:10px 14px;"><div class="label">On Hold</div><div class="value red" style="font-size:20px;">${onHold}</div></div>
+      <div class="card" style="padding:10px 14px;"><div class="label">Closed</div><div class="value green" style="font-size:20px;">${closed}</div></div>
+    </div>
+    ${canQuickAdd() ? `<button class="btn primary" onclick="openAddPrfModal()">+ Add PRF</button>` : ''}
+  </div>
+  <div class="field-row" style="margin-top:14px;">
+    <input type="text" id="prfSearchBox" placeholder="Search reference #, position, qualifications…" value="${(ui.prfSearch||'').replace(/"/g,'&quot;')}" oninput="ui.prfSearch=this.value; renderPRFList();" style="width:280px;">
+    <div class="field"><label>BUSINESS AFFILIATE</label>
+      <select onchange="ui.prfCompanyFilter=this.value; render();">
+        <option value="">All Affiliates</option>
+        ${companies.map(c=>`<option value="${c}" ${ui.prfCompanyFilter===c?'selected':''}>${c}</option>`).join('')}
+      </select>
+    </div>
+    <div class="field"><label>STATUS</label>
+      <select onchange="ui.prfStatusFilter=this.value; render();">
+        <option value="">All Statuses</option>
+        <option value="Open" ${ui.prfStatusFilter==='Open'?'selected':''}>Open</option>
+        <option value="On Hold" ${ui.prfStatusFilter==='On Hold'?'selected':''}>On Hold</option>
+        <option value="Closed" ${ui.prfStatusFilter==='Closed'?'selected':''}>Closed</option>
+      </select>
+    </div>
+  </div>
+  <div id="prfListBody" style="margin-top:14px;">${prfListHTML(list)}</div>
+  `;
+}
+function renderPRFList(){
+  const list = (CONFIG.prfList||[]).filter(prfMatchesFilter).slice().sort((a,b)=> (b._ts||0) - (a._ts||0));
+  const el = document.getElementById('prfListBody');
+  if(el) el.innerHTML = prfListHTML(list);
+}
+function prfListHTML(list){
+  if(!list.length) return '<div class="empty">No PRFs on file yet — use + Add PRF to log a new request.</div>';
+  const admin = isAdmin();
+  const canEdit = canQuickAdd();
+  return list.map(prf=>{
+    const status = prfOverallStatus(prf);
+    const filled = prfFilledCount(prf);
+    const total = (prf.slots||[]).length;
+    const slotsHTML = (prf.slots||[]).map((s,i)=>{
+      const days = prfWeekdaysBetween(prf.dateApproved, s.onboardingDate);
+      return `<tr>
+        <td>Slot ${i+1}</td>
+        <td>${canEdit ? `<input type="text" value="${(s.employeeName||'').replace(/"/g,'&quot;')}" placeholder="— Unfilled —" style="width:100%;" onchange="updatePrfSlotName('${prf.id}',${i},this.value)">` : (s.employeeName || '— Unfilled —')}</td>
+        <td>${canEdit ? `<input type="date" value="${s.onboardingDate||''}" onchange="updatePrfSlotDate('${prf.id}',${i},this.value)">` : (s.onboardingDate ? fmtDateMDY(s.onboardingDate) : '—')}</td>
+        <td>${days===null ? '—' : days+'d'}</td>
+        <td class="row-actions">${canEdit && (s.employeeName || s.onboardingDate) ? `<button class="btn small danger" onclick="clearPrfSlot('${prf.id}',${i})">Clear</button>` : ''}</td>
+      </tr>`;
+    }).join('');
+    return `
+    <div class="panel" style="margin-bottom:14px;">
+      <div class="panel-head" style="align-items:flex-start;flex-wrap:wrap;gap:8px;">
+        <h3 style="font-family:var(--mono);">${prfRefNumber(prf)}</h3>
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+          <span class="pill" style="${prfStatusPillStyle(status)}">${status}</span>
+          <span class="hint" style="margin:0;">${filled}/${total} filled</span>
+          ${canEdit ? `<button class="btn small" onclick="openEditPrfModal('${prf.id}')">Edit</button>` : ''}
+          ${admin ? `<button class="btn small danger" onclick="deletePrfConfirm('${prf.id}')">Delete</button>` : ''}
+        </div>
+      </div>
+      <div class="field-row" style="flex-wrap:wrap;gap:20px;margin-bottom:10px;">
+        <div><div class="hint" style="margin:0;">Business Affiliate</div><div>${prf.company}</div></div>
+        <div><div class="hint" style="margin:0;">Position</div><div>${prf.position||'—'}</div></div>
+        <div><div class="hint" style="margin:0;">Cost Center</div><div>${prf.costCenter||'—'}</div></div>
+        <div><div class="hint" style="margin:0;">Headcount Requested</div><div>${total}</div></div>
+        <div><div class="hint" style="margin:0;">Date Received</div><div>${prf.dateReceived ? fmtDateMDY(prf.dateReceived) : '—'}</div></div>
+        <div><div class="hint" style="margin:0;">Date Approved</div><div>${prf.dateApproved ? fmtDateMDY(prf.dateApproved) : '—'}</div></div>
+      </div>
+      ${prf.qualifications ? `<p class="hint"><b>Qualifications:</b> ${escapeHtml(prf.qualifications)}</p>` : ''}
+      ${status==='On Hold' && prf.remarks ? `<p class="hint" style="color:var(--red);"><b>On Hold — Remarks:</b> ${escapeHtml(prf.remarks)}</p>` : ''}
+      <table class="simple">
+        <thead><tr><th>Slot</th><th>Employee</th><th>Onboarding / Hired Date</th><th>Days Filled</th><th></th></tr></thead>
+        <tbody>${slotsHTML}</tbody>
+      </table>
+    </div>`;
+  }).join('');
+}
+async function updatePrfSlotName(id, idx, value){
+  if(!canQuickAdd()) return;
+  const prf = (CONFIG.prfList||[]).find(p=> p.id===id);
+  if(!prf || !prf.slots[idx]) return;
+  prf.slots[idx].employeeName = value;
+  await saveConfig();
+  renderPRFList();
+}
+async function updatePrfSlotDate(id, idx, value){
+  if(!canQuickAdd()) return;
+  const prf = (CONFIG.prfList||[]).find(p=> p.id===id);
+  if(!prf || !prf.slots[idx]) return;
+  prf.slots[idx].onboardingDate = value;
+  await saveConfig();
+  render(); // status/pill and Days Filled both depend on this, not just the row
+}
+async function clearPrfSlot(id, idx){
+  if(!canQuickAdd()) return;
+  const prf = (CONFIG.prfList||[]).find(p=> p.id===id);
+  if(!prf || !prf.slots[idx]) return;
+  prf.slots[idx] = prfEmptySlot();
+  await saveConfig();
+  render();
+}
+function deletePrfConfirm(id){
+  if(!isAdmin()){ toast('Only Admin can delete a PRF.'); return; }
+  ui.modal = {type:'deletePrf', arg:id};
+  render();
+}
+async function confirmDeletePrf(){
+  if(!isAdmin()) return;
+  const id = ui.modal.arg;
+  CONFIG.prfList = (CONFIG.prfList||[]).filter(p=> p.id!==id);
+  await saveConfig();
+  closeModal();
+  toast('PRF deleted.');
+  render();
+}
+
+/* ---- Add / Edit PRF modal ---- */
+function openAddPrfModal(){
+  if(!canQuickAdd()){ toast('Only Admin and HR can add a PRF.'); return; }
+  ui.modal = {type:'prfForm', arg:null};
+  render();
+}
+function openEditPrfModal(id){
+  if(!canQuickAdd()){ toast('Only Admin and HR can edit a PRF.'); return; }
+  ui.modal = {type:'prfForm', arg:id};
+  render();
+}
+// Live preview of the Reference # inside the modal as Business Affiliate/Position change, before
+// the record is even saved — the control number is only actually assigned on save (see
+// confirmSavePrf), so a brand-new PRF previews with the number it WOULD get if saved right now.
+function refreshPrfRefPreview(){
+  const cSel = document.getElementById('prf_company');
+  const pSel = document.getElementById('prf_position');
+  const preview = document.getElementById('prfRefPreview');
+  const abbrevInput = document.getElementById('prf_abbrev');
+  if(!cSel || !preview) return;
+  const company = cSel.value;
+  if(abbrevInput) abbrevInput.value = prfAbbrevFor(company);
+  const editingId = ui.modal && ui.modal.arg;
+  const existing = editingId ? (CONFIG.prfList||[]).find(p=> p.id===editingId) : null;
+  const controlNum = existing ? existing.controlNum : (CONFIG.prfNextControl[company]||0) + 1;
+  const position = (pSel && pSel.value==='__new__') ? ((document.getElementById('prf_position_new')||{}).value||'') : (pSel ? pSel.value : '');
+  preview.textContent = `${prfAbbrevFor(company)}-${String(controlNum).padStart(3,'0')}-${position || 'Position'}`;
+}
+function togglePrfPositionNew(){
+  const sel = document.getElementById('prf_position');
+  const row = document.getElementById('prf_position_new_row');
+  if(row) row.style.display = (sel && sel.value==='__new__') ? 'block' : 'none';
+  refreshPrfRefPreview();
+}
+function togglePrfCostCenterNew(){
+  const sel = document.getElementById('prf_costcenter');
+  const row = document.getElementById('prf_costcenter_new_row');
+  if(row) row.style.display = (sel && sel.value==='__new__') ? 'block' : 'none';
+}
+function togglePrfHoldRemarks(){
+  const sel = document.getElementById('prf_status');
+  const row = document.getElementById('prf_remarks_row');
+  if(row) row.style.display = (sel && sel.value==='On Hold') ? 'block' : 'none';
+}
+async function confirmSavePrf(){
+  if(!canQuickAdd()) return;
+  const g = id => (document.getElementById(id)||{}).value || '';
+  const company = g('prf_company');
+  if(!company){ toast('Choose a Business Affiliate first.'); return; }
+  let position = g('prf_position');
+  if(position==='__new__'){
+    position = g('prf_position_new').trim();
+    if(!position){ toast('Enter the new position title.'); return; }
+    await prfAddCustomPosition(company, position);
+  }
+  let costCenter = g('prf_costcenter');
+  if(costCenter==='__new__'){
+    costCenter = g('prf_costcenter_new').trim();
+    if(!costCenter){ toast('Enter the new cost center.'); return; }
+    await addManualCostCenter(company, costCenter);
+  }
+  const headcount = Math.max(1, Number(g('prf_headcount'))||1);
+  const qualifications = g('prf_qualifications').trim();
+  const dateReceived = g('prf_dateReceived');
+  const dateApproved = g('prf_dateApproved');
+  const statusOverride = g('prf_status');
+  const remarks = g('prf_remarks').trim();
+  if(statusOverride==='On Hold' && !remarks){ toast('Add a remark explaining the On Hold status before saving.'); return; }
+  const abbrev = g('prf_abbrev').trim();
+  if(abbrev) await prfSetAbbrev(company, abbrev); else prfAbbrevFor(company);
+
+  const editingId = ui.modal.arg;
+  let prf = editingId ? (CONFIG.prfList||[]).find(p=> p.id===editingId) : null;
+
+  if(prf){
+    prf.company = company;
+    prf.position = position;
+    prf.costCenter = costCenter;
+    if(!prfResizeSlots(prf, headcount)) return;
+    prf.qualifications = qualifications;
+    prf.dateReceived = dateReceived;
+    prf.dateApproved = dateApproved;
+    prf.statusOverride = statusOverride;
+    prf.remarks = remarks;
+  } else {
+    prf = {
+      id: 'prf_'+Math.random().toString(36).slice(2)+'_'+Date.now().toString(36),
+      _ts: Date.now(),
+      company, position, costCenter,
+      controlNum: prfNextControlNum(company),
+      slots: Array.from({length:headcount}, prfEmptySlot),
+      qualifications, dateReceived, dateApproved,
+      statusOverride, remarks
+    };
+    CONFIG.prfList = CONFIG.prfList || [];
+    CONFIG.prfList.push(prf);
+  }
+  await saveConfig();
+  closeModal();
+  toast(`PRF ${prfRefNumber(prf)} saved.`);
+  render();
+}
+function prfFormModalHTML(editingId){
+  const companies = allCompanies().map(c=>c.company);
+  const prf = editingId ? (CONFIG.prfList||[]).find(p=> p.id===editingId) : null;
+  const company = prf ? prf.company : (companies[0]||'');
+  const positions = prfPositionsFor(company);
+  const headcount = prf ? (prf.slots||[]).length : 1;
+  const controlNum = prf ? prf.controlNum : (CONFIG.prfNextControl[company]||0) + 1;
+  const status = prf ? (prf.statusOverride||'') : '';
+  return `
+  <h3>${prf ? 'Edit PRF' : 'Add PRF'}</h3>
+  <p class="hint" style="margin-top:-4px;">PRF Reference # is generated automatically from the Business Affiliate abbreviation, control # and Position — it updates live as you pick them below.</p>
+  <div class="field-row">
+    <div class="field" style="flex:2;"><label>BUSINESS AFFILIATE</label>
+      <select id="prf_company" onchange="document.getElementById('prf_position').innerHTML = prfPositionOptionsHTML(this.value,''); document.getElementById('prf_costcenter').innerHTML = prfCostCenterOptionsHTML(this.value,''); togglePrfPositionNew(); togglePrfCostCenterNew(); refreshPrfRefPreview();" ${prf?'disabled':''}>
+        ${companies.map(c=>`<option value="${c}" ${c===company?'selected':''}>${c}</option>`).join('')}
+      </select>
+    </div>
+    <div class="field"><label>AFFILIATE ABBREVIATION</label><input type="text" id="prf_abbrev" value="${prfAbbrevFor(company)}" maxlength="6" style="text-transform:uppercase;" oninput="refreshPrfRefPreview()"></div>
+  </div>
+  ${prf ? '<p class="hint" style="margin-top:-6px;">Business Affiliate can\'t be changed once a PRF is created — delete and re-add it under the correct affiliate instead.</p>' : ''}
+  <div class="field-row">
+    <div class="field" style="flex:2;"><label>POSITION</label>
+      <select id="prf_position" onchange="togglePrfPositionNew()">${prfPositionOptionsHTML(company, prf?prf.position:'')}</select>
+    </div>
+    <div class="field"><label>HEADCOUNT REQUESTED</label><input type="number" id="prf_headcount" min="1" value="${headcount}" oninput="refreshPrfRefPreview()"></div>
+  </div>
+  <div id="prf_position_new_row" style="display:none;margin:-6px 0 10px;">
+    <div class="field"><label>NEW POSITION TITLE</label><input type="text" id="prf_position_new" placeholder="Type the position title to add" oninput="refreshPrfRefPreview()"></div>
+  </div>
+  <div class="field-row">
+    <div class="field" style="flex:2;"><label>COST CENTER</label>
+      <select id="prf_costcenter" onchange="togglePrfCostCenterNew()">${prfCostCenterOptionsHTML(company, prf?(prf.costCenter||''):'')}</select>
+    </div>
+  </div>
+  <div id="prf_costcenter_new_row" style="display:none;margin:-6px 0 10px;">
+    <div class="field"><label>NEW COST CENTER</label><input type="text" id="prf_costcenter_new" placeholder="Type the cost center code to add"></div>
+  </div>
+  <div class="field" style="margin-bottom:10px;">
+    <label>PRF REFERENCE # <span style="font-weight:400;text-transform:none;color:var(--dim2);">(auto — control # ${String(controlNum).padStart(3,'0')})</span></label>
+    <div id="prfRefPreview" style="font-family:var(--mono);font-size:15px;padding:8px 10px;background:var(--surface2);border-radius:6px;">${prfAbbrevFor(company)}-${String(controlNum).padStart(3,'0')}-${(prf?prf.position:positions[0])||'Position'}</div>
+  </div>
+  <div class="field" style="margin-bottom:10px;"><label>QUALIFICATIONS</label><textarea id="prf_qualifications" rows="3" style="width:100%;">${prf?(prf.qualifications||''):''}</textarea></div>
+  <div class="field-row">
+    <div class="field"><label>DATE RECEIVED</label><input type="date" id="prf_dateReceived" value="${prf?(prf.dateReceived||''):''}"></div>
+    <div class="field"><label>DATE APPROVED</label><input type="date" id="prf_dateApproved" value="${prf?(prf.dateApproved||''):''}"></div>
+  </div>
+  <div class="field" style="margin-bottom:0;"><label>STATUS</label>
+    <select id="prf_status" onchange="togglePrfHoldRemarks()">
+      <option value="" ${status===''?'selected':''}>Open (default — closes automatically once every slot is filled)</option>
+      <option value="On Hold" ${status==='On Hold'?'selected':''}>On Hold</option>
+    </select>
+  </div>
+  <div id="prf_remarks_row" style="display:${status==='On Hold'?'block':'none'};margin-top:10px;">
+    <div class="field"><label>REMARKS <span style="font-weight:400;text-transform:none;color:var(--dim2);">(required while On Hold)</span></label><input type="text" id="prf_remarks" value="${prf?(prf.remarks||''):''}" style="width:100%;"></div>
+  </div>
+  <div style="margin-top:16px;"><button class="btn primary" onclick="confirmSavePrf()">${prf?'Save Changes':'Add PRF'}</button> <button class="btn" onclick="closeModal()">Cancel</button></div>`;
+}
+function prfPositionOptionsHTML(company, selected){
+  const positions = prfPositionsFor(company);
+  return positions.map(p=>`<option value="${p}" ${p===selected?'selected':''}>${p}</option>`).join('')
+    + `<option value="__new__" ${selected==='__new__'?'selected':''}>+ Add new position…</option>`;
+}
+// Cost Center reuses the same per-company list the rest of the app already keeps (Master List
+// upload, employee edit) — costCentersForCompany/addManualCostCenter — rather than a separate
+// PRF-only store, so a cost center added here shows up everywhere else too, and vice versa.
+function prfCostCenterOptionsHTML(company, selected){
+  const centers = costCentersForCompany(company);
+  return `<option value="" ${selected===''?'selected':''}>— None —</option>`
+    + centers.map(c=>`<option value="${c}" ${c===selected?'selected':''}>${c}</option>`).join('')
+    + `<option value="__new__" ${selected==='__new__'?'selected':''}>+ Add new cost center…</option>`;
+}
+
 function renderAppraisal(){
   const all = pendingAppraisals();
   const rows = all.filter(appraisalMatchesFilter);
@@ -5092,9 +5513,11 @@ async function confirmMasterlistNewHires(){
   const {rows, thenPromotionRows, thenCandidateIds} = ui.modal.arg;
   const {company, status, asOfMonth} = P;
   let newHires=0, addedNotCounted=0;
+  const pendingPrfLinks = [];
   rows.forEach(row=>{
     const sel = document.querySelector(`.mlNewHireChoice[data-id="${row.employeeId}"]`);
     const dateEl = document.querySelector(`.mlNewHireDate[data-id="${row.employeeId}"]`);
+    const prfSel = document.querySelector(`.mlPrfSelect[data-id="${row.employeeId}"]`);
     const isNewHire = !sel || sel.value==='yes';
     const dateHired = (dateEl && dateEl.value) ? dateEl.value : row.dateHired;
     P.working.push({
@@ -5111,9 +5534,17 @@ async function confirmMasterlistNewHires(){
     });
     recordJobGradeSnapshot(P.working[P.working.length-1], asOfMonth, row.jobGrade);
     if(isNewHire) newHires++; else addedNotCounted++;
+    // PRF Monitoring (Task h): if HR tagged this new hire to an open PRF on the review card,
+    // stage the slot fill here — applied atomically with the rest of this upload in
+    // finalizeMasterlistUpload, so a cancelled upload can't leave a PRF slot filled with nobody
+    // actually on the roster. Onboarding Date defaults to this row's Date Hired, per Task h.
+    if(isNewHire && prfSel && prfSel.value){
+      pendingPrfLinks.push({prfId:prfSel.value, employeeId:row.employeeId, employeeName:`${row.lastName||''}, ${row.firstName||''}`, onboardingDate:dateHired});
+    }
   });
   P.meta.newHires = newHires;
   P.meta.addedNotCounted = addedNotCounted;
+  P.pendingPrfLinks = pendingPrfLinks;
   // This step was explicitly resolved (not abandoned), so just clear the modal directly —
   // closeModal() would treat this as a backdrop-dismissal and cancel the whole staged upload.
   ui.modal = null;
@@ -5274,6 +5705,24 @@ async function finalizeMasterlistUpload(){
   EMP = P.working;
   await saveEmp();
   await autoAssignPositionJobGrades(company, status);
+  // PRF Monitoring (Task h): apply any New Hire -> PRF slot links staged during the New Hire
+  // review step, now that the roster write above has actually gone through. Each link fills the
+  // first still-open slot on that PRF with this hire's name/ID and sets Onboarding Date — which
+  // is what flips that PRF to Closed once every slot on it is filled (see prfOverallStatus).
+  if(P.pendingPrfLinks && P.pendingPrfLinks.length){
+    let prfChanged = false;
+    P.pendingPrfLinks.forEach(link=>{
+      const prf = (CONFIG.prfList||[]).find(p=> p.id===link.prfId);
+      if(!prf) return;
+      const slot = (prf.slots||[]).find(s=> !s.onboardingDate);
+      if(!slot) return;
+      slot.employeeId = link.employeeId;
+      slot.employeeName = link.employeeName;
+      slot.onboardingDate = link.onboardingDate;
+      prfChanged = true;
+    });
+    if(prfChanged) await saveConfig();
+  }
   if(isBaselineUpload && meta.baselineAdded){
     const existing = CONFIG.companyBaselineMonth[company];
     if(!existing || asOfMonth < existing){
@@ -5790,6 +6239,118 @@ async function runCompanyUpload({file, company, status, asOfMonth}){
   } else {
     await finalizeMasterlistUpload();
   }
+}
+
+/* ============ EXPORT (Company Detail's own tab, last in the subnav) ============
+   HR/Admin-only, single place that lists every export available for the currently-selected
+   company, each with its own label describing exactly what's in the file, instead of an export
+   button scattered inside a different sub-tab for each one. */
+function subExportCenter(st, period){
+  return `
+  <p class="hint" style="margin-bottom:14px;">Every export below downloads to your browser's Downloads folder. Company comes from the picker above (<b>${ui.company}</b>); each panel below has its own filters where it needs one.</p>
+  ${exportMasterListControls()}
+  <div class="panel" style="margin-top:14px;">
+    <div class="panel-head"><h3>Position Breakdown <span class="pill staff" style="margin-left:8px;">${period.label}</span></h3></div>
+    <p class="hint">Position headcount for <b>${ui.company}</b>, for the period currently selected above (Monthly/Annual). Pick which report(s) to include — each becomes its own sheet in the file, matching the views in the Position tab's own subnav.</p>
+    <div class="field-row" style="flex-wrap:wrap;gap:14px 22px;margin-bottom:10px;">
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;"><input type="checkbox" id="exp_pos_breakdown" checked> Position Breakdown</label>
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;"><input type="checkbox" id="exp_pos_department" checked> Position by Department</label>
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;"><input type="checkbox" id="exp_pos_costcenter" checked> Position by Cost Center</label>
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;"><input type="checkbox" id="exp_pos_jobgrade" checked> Position by Job Grade Group</label>
+    </div>
+    <button class="btn primary" onclick="exportPositionExcel()">Export Selected</button>
+  </div>
+  <div class="panel" style="margin-top:14px;">
+    <div class="panel-head"><h3>Hire &amp; Separation Archive <span class="pill rankfile" style="margin-left:8px;">Establishment Report format</span></h3></div>
+    <p class="hint">New Hires and Separations for ${Number(ui.month.split('-')[0]) || new Date().getFullYear()}, using whatever Company / Employment Status filters are currently set on the Hire &amp; Separation Archive tab (all companies/statuses if nothing's filtered there).</p>
+    <button class="btn primary" onclick="exportArchiveExcel()">Export to Excel</button>
+  </div>
+  <div class="panel" style="margin-top:14px;">
+    <div class="panel-head"><h3>Bound for Performance Appraisal <span class="pill intern" style="margin-left:8px;">Staff · 3rd/6th/9th month</span></h3></div>
+    <p class="hint">Pending, due and overdue new-hire evaluations, using whatever Company / Search filters are currently set on the Performance Appraisal tab.</p>
+    <button class="btn primary" onclick="exportAppraisalExcel()">Export to Excel</button>
+  </div>
+  <div class="panel" style="margin-top:14px;">
+    <div class="panel-head"><h3>Recruitment Cost Data <span class="pill" style="margin-left:8px;background:rgba(180,150,60,.14);color:var(--gold);">All companies &amp; months</span></h3></div>
+    <p class="hint">Every Recruitment Cost record on file — Recruitment Ave Salary, Hiring Manager/Interviewer Time, Load Allocation, Recruitment Ad Posting, Travel Expense, Recruitment Collaterals — across every company and month.</p>
+    <button class="btn primary" onclick="downloadRecruitExport()">Export CSV</button>
+  </div>
+  `;
+}
+/* ============ EXPORT MASTER LIST (per month, already uploaded) ============
+   HR and Admin can pull back the roster on file for the currently-selected Company Detail
+   company + an employment status, as of any month that already had a Master List merged into it
+   (or otherwise has a reporting-month fingerprint on record — see uploadedMonthsFor). Lives in
+   Company Detail's Export tab (subExportCenter above) since that's where a company is already
+   being browsed — Company comes from the page's own selection (ui.company), Employment Status
+   and Month get their own pickers here.
+   This reconstructs the roster from what the app itself carries forward, not the original file
+   byte-for-byte: Position, Cost Center and Department only ever track their CURRENT value (no
+   history), so those columns reflect the latest values on file rather than what that specific
+   month's file said. Job Grade is the one field with real history
+   (recordJobGradeSnapshot/jobGradeAsOf), so it's reconstructed as of the selected month wherever
+   that history exists. Age is computed as of the end of that month. */
+function exportMasterListControls(){
+  const status = CONFIG.statuses[0] || '';
+  return `
+  <div class="panel" style="margin-top:14px;">
+    <div class="panel-head"><h3>Export Master List <span class="pill staff" style="margin-left:8px;">By Month</span></h3></div>
+    <p class="hint">Export the roster on file for <b>${ui.company}</b>, for an employment status and month that already had a Master List uploaded (or otherwise has data on record for that month). <b>Position, Cost Center and Department</b> reflect the latest values on file; <b>Job Grade</b> is reconstructed as of that month using recorded history where available. The exported file saves to your browser's Downloads folder, the same as any other file download from this app.</p>
+    <div class="field-row">
+      <div class="field"><label>EMPLOYMENT STATUS</label><select id="dl_status" onchange="refreshDownloadMonthOptions()">${CONFIG.statuses.map(s=>`<option>${s}</option>`).join('')}</select></div>
+      <div class="field"><label>MONTH</label><select id="dl_month">${downloadMonthOptionsHTML(ui.company, status)}</select></div>
+    </div>
+    <div class="field-row">
+      <button class="btn primary" onclick="downloadMasterListSnapshot()">Export</button>
+    </div>
+    <div id="dlMsg" class="hint"></div>
+  </div>`;
+}
+// Months to offer for export: anything already recognized as "on record" for that company +
+// status (logged Master List uploads, plus months recovered from roster-span/tag fingerprints —
+// same source uploadMonthState draws on), newest first.
+function downloadMonthOptionsHTML(company, status){
+  const months = uploadedMonthsFor(company, status).slice().sort().reverse();
+  if(!months.length) return `<option value="">No Master List on record yet</option>`;
+  return months.map(m=>`<option value="${m}">${monthLabel(m)}</option>`).join('');
+}
+function refreshDownloadMonthOptions(){
+  const sSel = document.getElementById('dl_status');
+  const mSel = document.getElementById('dl_month');
+  if(!sSel || !mSel) return;
+  mSel.innerHTML = downloadMonthOptionsHTML(ui.company, sSel.value);
+}
+function downloadMasterListSnapshot(){
+  const msgEl = document.getElementById('dlMsg');
+  const setMsg = t => { if(msgEl) msgEl.textContent = t; };
+  const company = ui.company;
+  const status = document.getElementById('dl_status').value;
+  const month = document.getElementById('dl_month').value;
+  if(!month){ setMsg('No Master List has been uploaded yet for that company and employment status.'); return; }
+  const refDate = monthBounds(month).end;
+  const list = EMP.filter(e=> e.company===company && e.employmentStatus===status && isOnRosterInMonth(e, month))
+    .sort((a,b)=> (a.lastName||'').localeCompare(b.lastName||'') || (a.firstName||'').localeCompare(b.firstName||''));
+  if(!list.length){ setMsg(`No one was on the reported roster for ${company} (${status}) in ${monthLabel(month)}.`); return; }
+  const headers = ['ID #','Last Name','First Name','Middle Name','Gender','Cost Center','Department','Position','Job Grade','Birthdate','Age','Date Hired','Employment Status','Company'];
+  const rows = list.map(e=>{
+    const age = e.birthdate ? ageYears(e, refDate) : null;
+    return [
+      e.employeeId||'', e.lastName||'', e.firstName||'', e.middleName||'', e.gender||'',
+      e.costCenter||'', deptOfEmployee(e, true), e.position||'', jobGradeAsOf(e, month)||'',
+      e.birthdate ? fmtDateMDY(e.birthdate) : '', age===null ? '' : age,
+      e.dateHired ? fmtDateMDY(e.dateHired) : '', e.employmentStatus||'', e.company||''
+    ];
+  });
+  const filenameBase = `master_list_${company}_${status}_${month}`.replace(/[^a-z0-9_-]+/gi,'_');
+  if(typeof XLSX !== 'undefined'){
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.aoa_to_sheet([headers, ...rows]);
+    XLSX.utils.book_append_sheet(wb, ws, 'Master List');
+    XLSX.writeFile(wb, `${filenameBase}.xlsx`);
+  } else {
+    downloadCSV([headers, ...rows], `${filenameBase}.csv`);
+  }
+  setMsg(`Exported ${list.length} record(s) for ${company} (${status}) — ${monthLabel(month)}. Saved to your browser's Downloads folder as ${filenameBase}.${typeof XLSX !== 'undefined' ? 'xlsx' : 'csv'}.`);
 }
 
 function downloadCompanyTemplate(){
@@ -6402,6 +6963,7 @@ function renderModal(){
     const {rows} = ui.modal.arg;
     const P = MASTERLIST_PENDING;
     const asOfMonth = P ? P.asOfMonth : '';
+    const openPrfs = P ? prfOpenOptionsFor(P.company) : [];
     body = `<h3>Review New IDs — New Hire or Already Existed?</h3>
     <p class="hint">Nothing from this Master List upload is saved yet — it's staged until every review step here is completed.</p>
     <div style="max-height:380px;overflow:auto;margin:10px 0;border:1px solid var(--border);border-radius:6px;padding:8px 10px;">
@@ -6415,6 +6977,13 @@ function renderModal(){
             </select>
             <input type="date" class="mlNewHireDate" data-id="${r.employeeId}" value="${r.dateHired||''}" style="flex:1;min-width:130px;" oninput="checkNewHireDateWarning('${r.employeeId}')">
           </div>
+          ${openPrfs.length ? `
+          <div style="margin-top:6px;">
+            <select class="mlPrfSelect" data-id="${r.employeeId}" style="width:100%;">
+              <option value="">— No PRF (skip PRF Monitoring for this hire) —</option>
+              ${openPrfs.map(p=>`<option value="${p.id}">Fills PRF ${prfRefNumber(p)} — ${prfFilledCount(p)}/${(p.slots||[]).length} filled</option>`).join('')}
+            </select>
+          </div>` : ''}
           <div id="mlNewHireWarn-${r.employeeId}" style="display:none;font-size:11.5px;color:var(--red);margin-top:6px;line-height:1.4;"></div>
         </div>
       `).join('')}
@@ -6670,8 +7239,15 @@ function renderModal(){
     </div>
     <div id="arAddMsg" class="hint"></div>
     <div style="margin-top:16px;"><button class="btn primary" onclick="confirmAddArchiveRecord()">Add Record</button> <button class="btn" onclick="closeModal()">Cancel</button></div>`;
+  } else if(ui.modal.type==='prfForm'){
+    body = prfFormModalHTML(ui.modal.arg);
+  } else if(ui.modal.type==='deletePrf'){
+    const prf = (CONFIG.prfList||[]).find(p=> p.id===ui.modal.arg);
+    body = `<h3>Delete PRF?</h3>
+    <p class="hint">This permanently deletes <b>${prf?prfRefNumber(prf):''}</b> and every slot on it${prf && prfFilledCount(prf) ? `, including ${prfFilledCount(prf)} filled slot(s)` : ''}. This can't be undone.</p>
+    <div style="margin-top:16px;"><button class="btn danger" onclick="confirmDeletePrf()">Delete</button> <button class="btn" onclick="closeModal()">Cancel</button></div>`;
   }
-  const wide = (ui.modal.type==='editEmployee' || ui.modal.type==='addArchiveRecord' || ui.modal.type==='confirmMasterlistNewHires' || ui.modal.type==='confirmMasterlistPromotions' || ui.modal.type==='deleteArchiveList') ? 'width:640px;' : '';
+  const wide = (ui.modal.type==='editEmployee' || ui.modal.type==='addArchiveRecord' || ui.modal.type==='confirmMasterlistNewHires' || ui.modal.type==='confirmMasterlistPromotions' || ui.modal.type==='deleteArchiveList' || ui.modal.type==='prfForm') ? 'width:640px;' : '';
   const wrap = document.createElement('div');
   wrap.innerHTML = `<div class="modal-bg" onclick="if(event.target===this) closeModal()"><div class="modal" style="${wide}">${body}</div></div>`;
   document.getElementById('app').appendChild(wrap.firstElementChild);
@@ -6680,6 +7256,13 @@ function renderModal(){
   // happened with the PSC Rank & File hire that never showed up in the New Hires cohort).
   if(ui.modal.type==='confirmMasterlistNewHires'){
     (ui.modal.arg.rows||[]).forEach(r=> checkNewHireDateWarning(r.employeeId));
+  }
+  // Sync the "new position"/"new cost center" text boxes to whatever their selects actually
+  // loaded with — needed because a company with none on file yet only has "+ Add new…" to offer,
+  // so that ends up selected by default with no onchange ever having fired to reveal the box.
+  if(ui.modal.type==='prfForm'){
+    togglePrfPositionNew();
+    togglePrfCostCenterNew();
   }
 }
 async function confirmAddIndustry(){
