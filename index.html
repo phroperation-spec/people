@@ -361,7 +361,10 @@ let ui = {
   reportCompare:true, // show vs-previous-period comparison throughout the report
   prfCompanyFilter:'',
   prfStatusFilter:'',
-  prfSearch:''
+  prfSearch:'',
+  prfArchiveCompanyFilter:'',
+  prfArchiveSearch:'',
+  prfView:'active' // 'active' (Open + On Hold) | 'archive' (Closed/served) — selector on the PRF Monitoring tab itself, see renderPRF
 };
 const ROLE_OPTIONS = ['Admin','HR','Executive'];
 function isAdmin(){ return ui.role==='Admin'; }
@@ -4303,29 +4306,96 @@ function prfMatchesFilter(prf){
   const hay = [prfRefNumber(prf), prf.company, prf.position, prf.costCenter, prf.qualifications].map(v=> String(v||'').toLowerCase()).join(' ');
   return hay.includes(q);
 }
+// PRF Archive (see below): same idea as prfMatchesFilter but with its own company/search UI
+// state, since the Archive tab is filtered independently of PRF Monitoring's own filters — a
+// status filter isn't needed here, every record in this list is already Closed by definition.
+function prfArchiveMatchesFilter(prf){
+  if(ui.prfArchiveCompanyFilter && prf.company!==ui.prfArchiveCompanyFilter) return false;
+  const q = (ui.prfArchiveSearch||'').trim().toLowerCase();
+  if(!q) return true;
+  const hay = [prfRefNumber(prf), prf.company, prf.position, prf.costCenter, prf.qualifications].map(v=> String(v||'').toLowerCase()).join(' ');
+  return hay.includes(q);
+}
 // Open PRFs (at least one unfilled slot) for a company — feeds the PRF-link dropdown on the
 // Master List New Hire review card (Task h), so HR can tag an incoming new hire to the request
 // that brought them on instead of leaving Onboarding Date to be typed in by hand afterward.
 function prfOpenOptionsFor(company){
   return (CONFIG.prfList||[]).filter(p=> p.company===company && (p.slots||[]).some(s=> !s.onboardingDate));
 }
+// A PRF is "served" once every requested head has an onboarding date on file (prfOverallStatus
+// returns 'Closed'). Nothing marks that on the record itself — it's computed live from the
+// slots, same as everything else about a PRF — so a served PRF simply stops matching this test
+// and, per the newest request, moves off PRF Monitoring onto the PRF Archive tab automatically;
+// if it's later reopened (e.g. Headcount Requested is edited back up) it flows back on its own.
+function prfIsServed(prf){ return prfOverallStatus(prf)==='Closed'; }
+// PRF Monitoring has one selector (Active / Archive) instead of a separate nav tab — ui.prfView
+// picks which of the two lists below renderPrfListSection() builds. Both share the summary cards
+// at top; only the filter row and the list itself change with the selector.
 function renderPRF(){
-  const companies = allCompanies().map(c=>c.company);
-  const list = (CONFIG.prfList||[]).filter(prfMatchesFilter)
-    .slice().sort((a,b)=> (b._ts||0) - (a._ts||0));
-  const open = (CONFIG.prfList||[]).filter(p=> prfOverallStatus(p)==='Open').length;
-  const onHold = (CONFIG.prfList||[]).filter(p=> prfOverallStatus(p)==='On Hold').length;
-  const closed = (CONFIG.prfList||[]).filter(p=> prfOverallStatus(p)==='Closed').length;
+  const all = CONFIG.prfList||[];
+  const open = all.filter(p=> prfOverallStatus(p)==='Open').length;
+  const onHold = all.filter(p=> prfOverallStatus(p)==='On Hold').length;
+  const closed = all.filter(p=> prfOverallStatus(p)==='Closed').length;
+  // Headcount indicator (Task b): counts individual requested heads (slots), not PRF forms — a
+  // single PRF for "3 Laborers" counts as 1 toward PRF No. above but 3 toward Headcount No. here.
+  // A head is "closed" using the same test prfFilledCount/prfOverallStatus use for a Closed PRF:
+  // it has an onboarding date on file. Totals always count across every PRF regardless of the
+  // Active/Archive selector below, so HR gets the full picture from either view.
+  const totalHeads = all.reduce((sum,p)=> sum + (p.slots||[]).length, 0);
+  const closedHeads = all.reduce((sum,p)=> sum + prfFilledCount(p), 0);
+  const openHeads = totalHeads - closedHeads;
+  const view = ui.prfView==='archive' ? 'archive' : 'active';
   return `
-  <div class="field-row" style="align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;">
-    <div class="grid cards3" style="grid-template-columns:repeat(3,120px);gap:12px;">
-      <div class="card" style="padding:10px 14px;"><div class="label">Open</div><div class="value" style="font-size:20px;color:var(--gold);">${open}</div></div>
-      <div class="card" style="padding:10px 14px;"><div class="label">On Hold</div><div class="value red" style="font-size:20px;">${onHold}</div></div>
-      <div class="card" style="padding:10px 14px;"><div class="label">Closed</div><div class="value green" style="font-size:20px;">${closed}</div></div>
+  <div class="field-row" style="align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:12px;">
+    <div>
+      <div class="hint" style="margin:0 0 6px;text-transform:uppercase;letter-spacing:.04em;">PRF No. — by form</div>
+      <div class="grid cards3" style="grid-template-columns:repeat(3,120px);gap:12px;">
+        <div class="card" style="padding:10px 14px;"><div class="label">Open</div><div class="value" style="font-size:20px;color:var(--gold);">${open}</div></div>
+        <div class="card" style="padding:10px 14px;"><div class="label">On Hold</div><div class="value red" style="font-size:20px;">${onHold}</div></div>
+        <div class="card" style="padding:10px 14px;"><div class="label">Closed</div><div class="value green" style="font-size:20px;">${closed}</div></div>
+      </div>
+      <div class="hint" style="margin:14px 0 6px;text-transform:uppercase;letter-spacing:.04em;">Headcount No. — by requested head</div>
+      <div class="grid cards3" style="grid-template-columns:repeat(3,120px);gap:12px;">
+        <div class="card" style="padding:10px 14px;"><div class="label">Requested</div><div class="value" style="font-size:20px;">${totalHeads}</div></div>
+        <div class="card" style="padding:10px 14px;"><div class="label">Open</div><div class="value" style="font-size:20px;color:var(--gold);">${openHeads}</div></div>
+        <div class="card" style="padding:10px 14px;"><div class="label">Closed</div><div class="value green" style="font-size:20px;">${closedHeads}</div></div>
+      </div>
     </div>
     ${canQuickAdd() ? `<button class="btn primary" onclick="openAddPrfModal()">+ Add PRF</button>` : ''}
   </div>
-  <div class="field-row" style="margin-top:14px;">
+  <div class="field-row" style="margin-top:16px;align-items:center;gap:0;border-bottom:1px solid var(--border,rgba(255,255,255,.1));">
+    <div onclick="ui.prfView='active'; render();" style="cursor:pointer;padding:8px 16px;font-family:var(--mono);font-size:11.5px;letter-spacing:.05em;text-transform:uppercase;${view==='active'?'color:var(--gold);border-bottom:2px solid var(--gold);':'color:var(--dim2);border-bottom:2px solid transparent;'}">Active (${open+onHold})</div>
+    <div onclick="ui.prfView='archive'; render();" style="cursor:pointer;padding:8px 16px;font-family:var(--mono);font-size:11.5px;letter-spacing:.05em;text-transform:uppercase;${view==='archive'?'color:var(--gold);border-bottom:2px solid var(--gold);':'color:var(--dim2);border-bottom:2px solid transparent;'}">Archive — Served (${closed})</div>
+  </div>
+  <div id="prfListSection" style="margin-top:14px;">${renderPrfListSection()}</div>
+  `;
+}
+// The filter row + list for whichever half of the selector is active. Split out from renderPRF()
+// so the search box's oninput (renderPRFList below) can refresh just this part of the page.
+function renderPrfListSection(){
+  const companies = allCompanies().map(c=>c.company);
+  if(ui.prfView==='archive'){
+    const list = (CONFIG.prfList||[]).filter(prfIsServed).filter(prfArchiveMatchesFilter)
+      .slice().sort((a,b)=> (b._ts||0) - (a._ts||0));
+    return `
+    <div class="field-row">
+      <input type="text" id="prfArchiveSearchBox" placeholder="Search reference #, position, qualifications…" value="${(ui.prfArchiveSearch||'').replace(/"/g,'&quot;')}" oninput="ui.prfArchiveSearch=this.value; renderPRFList();" style="width:280px;">
+      <div class="field"><label>BUSINESS AFFILIATE</label>
+        <select onchange="ui.prfArchiveCompanyFilter=this.value; render();">
+          <option value="">All Affiliates</option>
+          ${companies.map(c=>`<option value="${c}" ${ui.prfArchiveCompanyFilter===c?'selected':''}>${c}</option>`).join('')}
+        </select>
+      </div>
+    </div>
+    <div style="margin-top:14px;">${list.length ? prfListHTML(list) : '<div class="empty">No PRFs have been fully served yet — closed PRFs will appear here automatically once every requested head is filled.</div>'}</div>`;
+  }
+  // Active = Open + On Hold, i.e. anything still needing HR's attention. A fully served PRF
+  // (every requested head filled) drops out of this view on its own once it's Closed — no
+  // manual archiving step — and reappears here automatically if it's ever reopened.
+  const list = (CONFIG.prfList||[]).filter(p=> !prfIsServed(p)).filter(prfMatchesFilter)
+    .slice().sort((a,b)=> (b._ts||0) - (a._ts||0));
+  return `
+  <div class="field-row">
     <input type="text" id="prfSearchBox" placeholder="Search reference #, position, qualifications…" value="${(ui.prfSearch||'').replace(/"/g,'&quot;')}" oninput="ui.prfSearch=this.value; renderPRFList();" style="width:280px;">
     <div class="field"><label>BUSINESS AFFILIATE</label>
       <select onchange="ui.prfCompanyFilter=this.value; render();">
@@ -4335,20 +4405,20 @@ function renderPRF(){
     </div>
     <div class="field"><label>STATUS</label>
       <select onchange="ui.prfStatusFilter=this.value; render();">
-        <option value="">All Statuses</option>
+        <option value="">All (Open + On Hold)</option>
         <option value="Open" ${ui.prfStatusFilter==='Open'?'selected':''}>Open</option>
         <option value="On Hold" ${ui.prfStatusFilter==='On Hold'?'selected':''}>On Hold</option>
-        <option value="Closed" ${ui.prfStatusFilter==='Closed'?'selected':''}>Closed</option>
       </select>
     </div>
   </div>
-  <div id="prfListBody" style="margin-top:14px;">${prfListHTML(list)}</div>
-  `;
+  <div style="margin-top:14px;">${prfListHTML(list)}</div>`;
 }
+// Called by the search box's oninput on whichever half of the selector is showing, and by in-row
+// slot edits (updatePrfSlotName) — a lighter partial refresh of just the list/filter row instead
+// of a full render(), so the search box itself doesn't lose focus while typing.
 function renderPRFList(){
-  const list = (CONFIG.prfList||[]).filter(prfMatchesFilter).slice().sort((a,b)=> (b._ts||0) - (a._ts||0));
-  const el = document.getElementById('prfListBody');
-  if(el) el.innerHTML = prfListHTML(list);
+  const el = document.getElementById('prfListSection');
+  if(el) el.innerHTML = renderPrfListSection();
 }
 function prfListHTML(list){
   if(!list.length) return '<div class="empty">No PRFs on file yet — use + Add PRF to log a new request.</div>';
@@ -4360,12 +4430,19 @@ function prfListHTML(list){
     const total = (prf.slots||[]).length;
     const slotsHTML = (prf.slots||[]).map((s,i)=>{
       const days = prfWeekdaysBetween(prf.dateApproved, s.onboardingDate);
+      // Task a: once a slot has an onboarding date on file it's a completed new-hire record —
+      // the same "filled" test prfFilledCount/prfOverallStatus use for a Closed PRF/slot. From
+      // that point on only Admin can edit or clear it; HR can still type a name/date into a slot
+      // that hasn't reached that point yet (that's the normal way HR logs a new hire here).
+      const locked = !!s.onboardingDate;
+      const slotEditable = canEdit && (admin || !locked);
+      const canClearSlot = (s.employeeName || s.onboardingDate) && (admin || !locked);
       return `<tr>
         <td>Slot ${i+1}</td>
-        <td>${canEdit ? `<input type="text" value="${(s.employeeName||'').replace(/"/g,'&quot;')}" placeholder="— Unfilled —" style="width:100%;" onchange="updatePrfSlotName('${prf.id}',${i},this.value)">` : (s.employeeName || '— Unfilled —')}</td>
-        <td>${canEdit ? `<input type="date" value="${s.onboardingDate||''}" onchange="updatePrfSlotDate('${prf.id}',${i},this.value)">` : (s.onboardingDate ? fmtDateMDY(s.onboardingDate) : '—')}</td>
+        <td>${slotEditable ? `<input type="text" value="${(s.employeeName||'').replace(/"/g,'&quot;')}" placeholder="— Unfilled —" style="width:100%;" onchange="updatePrfSlotName('${prf.id}',${i},this.value)">` : (s.employeeName || '— Unfilled —')}</td>
+        <td>${slotEditable ? `<input type="date" value="${s.onboardingDate||''}" onchange="updatePrfSlotDate('${prf.id}',${i},this.value)">` : (s.onboardingDate ? fmtDateMDY(s.onboardingDate) : '—')}</td>
         <td>${days===null ? '—' : days+'d'}</td>
-        <td class="row-actions">${canEdit && (s.employeeName || s.onboardingDate) ? `<button class="btn small danger" onclick="clearPrfSlot('${prf.id}',${i})">Clear</button>` : ''}</td>
+        <td class="row-actions">${canClearSlot ? `<button class="btn small danger" onclick="clearPrfSlot('${prf.id}',${i})">Clear</button>` : (canEdit && locked && !admin ? '<span class="hint" style="margin:0;">Admin only</span>' : '')}</td>
       </tr>`;
     }).join('');
     return `
@@ -4396,10 +4473,14 @@ function prfListHTML(list){
     </div>`;
   }).join('');
 }
+// Task a: HR can fill in a slot that hasn't reached "onboarding date on file" yet, but once it
+// has, editing or clearing it is Admin-only — checked here too (not just hidden in the UI above)
+// so a locked slot can't be edited or cleared out from under HR's own past-rendered form.
 async function updatePrfSlotName(id, idx, value){
   if(!canQuickAdd()) return;
   const prf = (CONFIG.prfList||[]).find(p=> p.id===id);
   if(!prf || !prf.slots[idx]) return;
+  if(prf.slots[idx].onboardingDate && !isAdmin()){ toast('Only Admin can edit a PRF slot that already has an onboarding date on file.'); renderPRFList(); return; }
   prf.slots[idx].employeeName = value;
   await saveConfig();
   renderPRFList();
@@ -4408,6 +4489,7 @@ async function updatePrfSlotDate(id, idx, value){
   if(!canQuickAdd()) return;
   const prf = (CONFIG.prfList||[]).find(p=> p.id===id);
   if(!prf || !prf.slots[idx]) return;
+  if(prf.slots[idx].onboardingDate && !isAdmin()){ toast('Only Admin can edit a PRF slot that already has an onboarding date on file.'); render(); return; }
   prf.slots[idx].onboardingDate = value;
   await saveConfig();
   render(); // status/pill and Days Filled both depend on this, not just the row
@@ -4416,6 +4498,7 @@ async function clearPrfSlot(id, idx){
   if(!canQuickAdd()) return;
   const prf = (CONFIG.prfList||[]).find(p=> p.id===id);
   if(!prf || !prf.slots[idx]) return;
+  if(prf.slots[idx].onboardingDate && !isAdmin()){ toast('Only Admin can clear a PRF slot that already has an onboarding date on file.'); render(); return; }
   prf.slots[idx] = prfEmptySlot();
   await saveConfig();
   render();
