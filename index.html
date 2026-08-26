@@ -371,6 +371,10 @@ function isAdmin(){ return ui.role==='Admin'; }
 // Task B: Hire & Separation Quick Add is open to both Admin and HR (Executive still can't reach
 // the Data Management tab at all — see EXEC_ALLOWED_TABS).
 function canQuickAdd(){ return ui.role==='Admin' || ui.role==='HR'; }
+// Task: Executives lost the Transfers tab but were explicitly given view + export access to
+// Company Detail's own Export sub-tab (every download available for the selected company, all
+// read-only — see subExportCenter) — Admin/HR keep that access too, same as before.
+function canViewCompanyExport(){ return canQuickAdd() || ui.role==='Executive'; }
 function setRole(v){ ui.role = v; render(); }
 
 function monthStr(d){ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0'); }
@@ -2132,13 +2136,16 @@ function render(){
     return;
   }
   const body = document.getElementById('tabBody');
-  const EXEC_ALLOWED_TABS = ['overview','company','forecastreport','transfers'];
+  // Task: Executives lost Transfers (removed from this list below) — Company Detail stays
+  // allowed since that's where their Export access lives now (see companySubview's 'export'
+  // branch and renderCompany's Export sub-tab, both gated on canViewCompanyExport()).
+  const EXEC_ALLOWED_TABS = ['overview','company','forecastreport'];
   try{
     if(ui.tab==='settings' && !isAdmin()){
       body.innerHTML = '<div class="empty">The Control Panel is restricted to Admin users. Switch your role to Admin (bottom-left) if that\'s you, or ask your Admin for this change.</div>';
     }
     else if(ui.role==='Executive' && !EXEC_ALLOWED_TABS.includes(ui.tab)){
-      body.innerHTML = '<div class="empty">Executives can only access Trend &amp; Insight, Company Detail, Executive Report, and Transfers. Switch your role (bottom-left) if that\'s not right, or ask HR/Admin for these other views.</div>';
+      body.innerHTML = '<div class="empty">Executives can only access Trend &amp; Insight, Company Detail, and Executive Report. Switch your role (bottom-left) if that\'s not right, or ask HR/Admin for these other views.</div>';
     }
     else if(ui.tab==='overview') body.innerHTML = renderOverview();
     else if(ui.tab==='company') body.innerHTML = renderCompany();
@@ -2161,7 +2168,7 @@ function render(){
 function sidebar(){
   const unmapped = unmappedCostCenters();
   const dueAppraisals = pendingAppraisals().length;
-  const EXEC_ALLOWED_TABS = ['overview','company','forecastreport','transfers'];
+  const EXEC_ALLOWED_TABS = ['overview','company','forecastreport'];
   const navItems = NAV_ITEMS.filter(([k])=>{
     if(k==='settings') return isAdmin();
     if(ui.role==='Executive') return EXEC_ALLOWED_TABS.includes(k);
@@ -2771,11 +2778,12 @@ function renderCompany(){
   if(!ui.company) return '<div class="empty">No companies configured yet — add one in the Control Panel.</div>';
   const {st, period} = companyDetailContext();
   const subs = [['headcount','Headcount'],['department','Department'],['costcenter','Cost Center'],['position','Position'],['age','Age'],['tenure','Tenure'],['gender','Gender'],['jobgrade','Job Grade'],['promotions','Promotions'],['newhire','New Hire'],['separated','Separated']];
-  // Export is its own last tab, HR/Admin only (Executive stays view-only — see canQuickAdd) —
-  // a single place that lists every export available for this company instead of one scattered
-  // per sub-tab (Master List by month, Position Breakdown, Hire & Separation Archive, Bound for
-  // Performance Appraisal, Recruitment Cost).
-  if(canQuickAdd()) subs.push(['export','Export']);
+  // Export is its own last tab — a single place that lists every export available for this
+  // company instead of one scattered per sub-tab (Master List by month, Position Breakdown,
+  // Hire & Separation Archive, Bound for Performance Appraisal, Recruitment Cost). Admin, HR and
+  // Executive can all view and use it (see canViewCompanyExport) — everything in it is a
+  // read-only download, nothing here changes any data on file.
+  if(canViewCompanyExport()) subs.push(['export','Export']);
   const periodTabs = [['monthly','Monthly'],['annual','Annual']];
   const companySelect = `
   <div class="field"><label>COMPANY</label>
@@ -2844,7 +2852,7 @@ function companySubview(sub, st, period){
   if(sub==='promotions') return subPromotions(st, period);
   if(sub==='newhire') return subMovement(st.hired, 'Date Hired', 'dateHired', period);
   if(sub==='separated') return subMovement(st.separated, 'Date Separated', 'dateSeparated', period);
-  if(sub==='export') return canQuickAdd() ? subExportCenter(st, period) : '<div class="empty">Only Admin and HR can export data.</div>';
+  if(sub==='export') return canViewCompanyExport() ? subExportCenter(st, period) : '<div class="empty">Only Admin, HR and Executive can export data.</div>';
   return '';
 }
 
