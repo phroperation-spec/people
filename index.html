@@ -1108,6 +1108,70 @@ function jobGradeAsOf(emp, ms){
   }
   return emp.jobGrade;
 }
+// Parallel history log to recordJobGradeSnapshot/jobGradeAsOf, but for Employment Status. Job
+// Grade ranges/ladders are configured separately per employment status (see jobGradeGroupsFor),
+// so a Rank & File employee's grade number and a Staff employee's grade number aren't on the same
+// scale — a real Rank & File -> Staff promotion can easily show a same-or-lower grade *number*
+// even though it's unambiguously a promotion. This history lets promotion detection (see
+// companyAnnualPromotions / companyMonthOverMonthPromotions / execJobGradeMovement) recognize that
+// status move directly instead of relying on Job Grade number progression. Keyed by as-of month,
+// same re-upload/correction handling as recordJobGradeSnapshot.
+function recordStatusSnapshot(emp, ms, status){
+  if(!ms || !status) return;
+  emp.statusHistory = Array.isArray(emp.statusHistory) ? emp.statusHistory : [];
+  const idx = emp.statusHistory.findIndex(h=> h.ms===ms);
+  if(idx>=0) emp.statusHistory[idx].status = status;
+  else {
+    emp.statusHistory.push({ms, status});
+    emp.statusHistory.sort((a,b)=> a.ms<b.ms?-1:(a.ms>b.ms?1:0));
+  }
+}
+// Employment Status on file as of a given month — same "latest snapshot at or before" approach as
+// jobGradeAsOf. Records that predate this feature (no history yet) fall back to whatever
+// Employment Status is currently on file, same as every other "older record" fallback in this app
+// — it just means a Rank & File -> Staff move that happened before this history started being
+// recorded can't be reconstructed after the fact.
+function statusAsOf(emp, ms){
+  const hist = emp.statusHistory;
+  if(Array.isArray(hist) && hist.length){
+    const eligible = hist.filter(h=> h.ms<=ms);
+    return eligible.length ? eligible[eligible.length-1].status : null;
+  }
+  return emp.employmentStatus;
+}
+// True when, between two as-of months on the same employee, their Employment Status moved from
+// Rank & File to Staff — i.e. a promotion that should be tagged regardless of what the Job Grade
+// numbers say (see recordStatusSnapshot above for why the numbers alone can't be trusted here).
+function isRankFileToStaffMove(emp, fromMs, toMs){
+  return statusAsOf(emp, fromMs)==='Rank & File' && statusAsOf(emp, toMs)==='Staff';
+}
+// Parallel history log to recordJobGradeSnapshot/jobGradeAsOf, but for Position — kept so a
+// promotion's From/To Position can be reconstructed later (companyAnnualPromotions), the same way
+// From/To Job Grade already can. Position itself still only ever tracks its CURRENT value on the
+// employee record proper (see exportMasterListControls above) — this history is purely additive,
+// recorded at the same moments recordJobGradeSnapshot is (Master List upload, Quick Add, New Hire
+// & Separated Import, manual edit), so the two stay in lockstep.
+function recordPositionSnapshot(emp, ms, position){
+  if(!ms || !position) return;
+  emp.positionHistory = Array.isArray(emp.positionHistory) ? emp.positionHistory : [];
+  const idx = emp.positionHistory.findIndex(h=> h.ms===ms);
+  if(idx>=0) emp.positionHistory[idx].position = position;
+  else {
+    emp.positionHistory.push({ms, position});
+    emp.positionHistory.sort((a,b)=> a.ms<b.ms?-1:(a.ms>b.ms?1:0));
+  }
+}
+// Position on file as of a given month — same "latest snapshot at or before" approach as
+// jobGradeAsOf/statusAsOf. Records with no history yet (predating this feature, or an employee
+// whose Position never changed since) fall back to whatever Position is currently on file.
+function positionAsOf(emp, ms){
+  const hist = emp.positionHistory;
+  if(Array.isArray(hist) && hist.length){
+    const eligible = hist.filter(h=> h.ms<=ms);
+    return eligible.length ? eligible[eligible.length-1].position : null;
+  }
+  return emp.position;
+}
 // The most senior Job Grade Group configured for a company & status, by highest Min — used to
 // tell whether a long-tenured employee has actually reached the top of their ladder or is still
 // short of it (see execTenureGradeGaps in the Executive Report).
@@ -3243,6 +3307,49 @@ function subJobGradeByStatus(st, period){
   return out;
 }
 
+// Best-known From/To Position for a promotion window. Prefers an explicit promotionHistory entry
+// — the record HR already creates during the Master List "Promotion review" step (see
+// confirmMasterlistPromotions/skipMasterlistPromotions), which captures the real Position on both
+// sides of that specific reviewed change — over the newer positionHistory snapshot log. This
+// matters because positionHistory only started being recorded going forward from when that
+// tracking was added: for a promotion from before then, positionHistory has nothing to fall back
+// on except the CURRENT Position on both ends (which is why From/To Position can otherwise show
+// the same value for older promotions), whereas a promotionHistory entry — if this employee's
+// promotion went through a Master List upload's review step — already has the true historical
+// values regardless of when it happened.
+function promotionHistoryPositionChange(emp, fromMs, toMs){
+  const hist = Array.isArray(emp.promotionHistory) ? emp.promotionHistory : [];
+  const inWindow = hist.filter(h=> h.ms>fromMs && h.ms<=toMs).sort((a,b)=> a.ms<b.ms?-1:(a.ms>b.ms?1:0));
+  if(!inWindow.length) return null;
+  const fromPosition = inWindow[0].fromPosition, toPosition = inWindow[inWindow.length-1].toPosition;
+  if(!fromPosition && !toPosition) return null;
+  return {fromPosition: fromPosition||null, toPosition: toPosition||null};
+}
+// The actual month a promotion took effect, not just the last month that happened to be on file
+// by year-end. Job Grade is re-recorded on EVERY Master List upload for EVERY active employee —
+// changed or not (see recordJobGradeSnapshot's call sites) — so an employee re-uploaded every
+// month has one jobGradeHistory entry per month, and "current" (the latest one at or before the
+// as-of date) can land many months after the grade actually rose. This walks forward from the
+// baseline snapshot to find the FIRST point where the grade number actually increased, or — for a
+// Rank & File -> Staff move — the first statusHistory entry recording 'Staff' after baseline.
+// Falls back to the comparison window's own end (current.ms) if neither can be pinned down (e.g.
+// sparse/older history with no month-by-month detail to walk).
+function promotionEffectiveMonth(emp, baseline, current, startNum, statusPromoted){
+  if(statusPromoted && Array.isArray(emp.statusHistory)){
+    const staffEntry = emp.statusHistory
+      .filter(h=> h.ms>baseline.ms && h.ms<=current.ms && h.status==='Staff')
+      .sort((a,b)=> a.ms<b.ms?-1:(a.ms>b.ms?1:0))[0];
+    if(staffEntry) return staffEntry.ms;
+  }
+  if(Array.isArray(emp.jobGradeHistory) && startNum!==null){
+    const risen = emp.jobGradeHistory
+      .filter(h=> h.ms>baseline.ms && h.ms<=current.ms)
+      .sort((a,b)=> a.ms<b.ms?-1:(a.ms>b.ms?1:0))
+      .find(h=> { const n = jobGradeNumeric(h.jobGrade); return n!==null && n>startNum; });
+    if(risen) return risen.ms;
+  }
+  return current.ms;
+}
 // Employees at this company whose Job Grade rose at some point within the selected calendar
 // year, using the snapshot history recorded on every Master List upload/manual edit (see
 // recordJobGradeSnapshot/jobGradeAsOf) — this app only keeps a live "current" Job Grade
@@ -3263,13 +3370,30 @@ function companyAnnualPromotions(company, year, asOfEnd){
     const baseline = priorEligible.length ? priorEligible[priorEligible.length-1] : hist[0];
     const current = hist[hist.length-1];
     const startNum = jobGradeNumeric(baseline.jobGrade), curNum = jobGradeNumeric(current.jobGrade);
-    if(startNum===null || curNum===null || curNum<=startNum) return;
+    // A Rank & File -> Staff status move (see recordStatusSnapshot/statusAsOf) counts as a
+    // promotion on its own, even if the Job Grade numbers don't rise — Staff and Rank & File use
+    // separate, non-comparable grade ladders, so the number comparison alone can't be trusted for
+    // a cross-status move the way it can within a single ladder.
+    const gradeRose = startNum!==null && curNum!==null && curNum>startNum;
+    const statusPromoted = isRankFileToStaffMove(e, baseline.ms, current.ms);
+    if(!gradeRose && !statusPromoted) return;
     if(isPromotionDismissed(e, baseline.ms, current.ms)) return;
+    // Position at each end of the same window. See promotionHistoryPositionChange above for why
+    // that source is tried first; positionAsOf (positionHistory-based) fills in whatever it
+    // doesn't have, and if neither has anything, both ends fall back to the CURRENT Position on
+    // file — which will legitimately show the same value on both sides when a promotion was a
+    // pure Job Grade/step increase with no title change, as well as for older promotions this app
+    // has no historical Position for.
+    const promoPos = promotionHistoryPositionChange(e, baseline.ms, current.ms);
+    const promotedMs = promotionEffectiveMonth(e, baseline, current, startNum, statusPromoted);
     rows.push({
-      emp:e, startGrade:baseline.jobGrade, curGrade:current.jobGrade, startNum, curNum,
+      emp:e, startGrade:baseline.jobGrade, curGrade:current.jobGrade,
+      startPosition: (promoPos && promoPos.fromPosition) || positionAsOf(e, baseline.ms),
+      curPosition: (promoPos && promoPos.toPosition) || positionAsOf(e, current.ms),
+      startNum: startNum!==null?startNum:0, curNum: curNum!==null?curNum:0, statusPromoted,
       startGroup: jobGradeGroupOf(company, e.employmentStatus, baseline.jobGrade),
       curGroup: jobGradeGroupOf(company, e.employmentStatus, current.jobGrade),
-      fromMs: baseline.ms, toMs: current.ms
+      fromMs: baseline.ms, toMs: current.ms, promotedMs
     });
   });
   return rows.sort((a,b)=> (b.curNum-b.startNum)-(a.curNum-a.startNum));
@@ -3314,7 +3438,7 @@ function promotionsTableByStatus(rows, cols, emptyNoun){
     ${list.length ? `
     <table class="demo compact">
       <thead><tr><th class="rowlabel">Employee</th><th>Position</th><th>${cols.startLabel}</th><th>${cols.curLabel}</th>${admin?'<th></th>':''}</tr></thead>
-      <tbody>${list.map(r=>`<tr><td class="rowlabel">${r.emp.lastName||''}, ${r.emp.firstName||''} <span style="color:var(--dim2);font-size:11px;">(${r.emp.employeeId})</span></td><td>${r.emp.position||'—'}</td><td>${r.startGrade} <span style="color:var(--dim2);font-size:11px;">(${r.startGroup})</span></td><td style="color:var(--green);">${r.curGrade} <span style="font-size:11px;">(${r.curGroup})</span></td>${admin?`<td><button class="btn small danger" onclick="openDismissPromotionModal('${r.emp.employeeId}','${r.fromMs}','${r.toMs}')">Delete</button></td>`:''}</tr>`).join('')}</tbody>
+      <tbody>${list.map(r=>`<tr><td class="rowlabel">${r.emp.lastName||''}, ${r.emp.firstName||''} <span style="color:var(--dim2);font-size:11px;">(${r.emp.employeeId})</span>${r.statusPromoted?` <span class="pill staff" style="font-size:10px;" title="Tagged as a promotion because they moved from Rank & File to Staff, regardless of Job Grade numbers.">Rank &amp; File → Staff</span>`:''}</td><td>${r.emp.position||'—'}</td><td>${r.startGrade} <span style="color:var(--dim2);font-size:11px;">(${r.startGroup})</span></td><td style="color:var(--green);">${r.curGrade} <span style="font-size:11px;">(${r.curGroup})</span></td>${admin?`<td><button class="btn small danger" onclick="openDismissPromotionModal('${r.emp.employeeId}','${r.fromMs}','${r.toMs}')">Delete</button></td>`:''}</tr>`).join('')}</tbody>
     </table>` : `<div class="empty">No ${label} ${emptyNoun} in this view.</div>`}
   `;
   return renderGroup('Staff', staffRows) + renderGroup('Rank & File', rfRows);
@@ -3333,10 +3457,16 @@ function companyMonthOverMonthPromotions(company){
     if(!Array.isArray(e.jobGradeHistory) || e.jobGradeHistory.length<2) return; // need at least two dated snapshots to compare
     const prevGrade = jobGradeAsOf(e, prevMs), curGrade = jobGradeAsOf(e, curMs);
     const prevNum = jobGradeNumeric(prevGrade), curNum = jobGradeNumeric(curGrade);
-    if(prevNum===null || curNum===null || curNum<=prevNum) return;
+    // Same rule as companyAnnualPromotions: a Rank & File -> Staff status move is a promotion on
+    // its own, independent of whether the Job Grade number happens to rise — the two employment
+    // statuses use separate, non-comparable grade ladders (see recordStatusSnapshot/statusAsOf).
+    const gradeRose = prevNum!==null && curNum!==null && curNum>prevNum;
+    const statusPromoted = isRankFileToStaffMove(e, prevMs, curMs);
+    if(!gradeRose && !statusPromoted) return;
     if(isPromotionDismissed(e, prevMs, curMs)) return;
     rows.push({
-      emp:e, startGrade:prevGrade, curGrade, startNum:prevNum, curNum,
+      emp:e, startGrade:prevGrade, curGrade,
+      startNum: prevNum!==null?prevNum:0, curNum: curNum!==null?curNum:0, statusPromoted,
       startGroup: jobGradeGroupOf(company, e.employmentStatus, prevGrade),
       curGroup: jobGradeGroupOf(company, e.employmentStatus, curGrade),
       fromMs: prevMs, toMs: curMs
@@ -4716,13 +4846,18 @@ function execJobGradeMovement(period){
     if(!Array.isArray(e.jobGradeHistory) || e.jobGradeHistory.length<2) return; // need at least two dated snapshots to compare
     const prevGrade = jobGradeAsOf(e, prevMs), curGrade = jobGradeAsOf(e, curMs);
     const prevNum = jobGradeNumeric(prevGrade), curNum = jobGradeNumeric(curGrade);
-    if(prevNum===null || curNum===null || prevNum===curNum) return;
+    // A Rank & File -> Staff status move is a promotion in its own right — route it straight to
+    // "promoted" without needing the Job Grade numbers to agree, since Staff and Rank & File use
+    // separate, non-comparable grade ladders (see recordStatusSnapshot/statusAsOf). Otherwise,
+    // fall back to the existing numeric-only comparison.
+    const statusPromoted = isRankFileToStaffMove(e, prevMs, curMs);
+    if(!statusPromoted && (prevNum===null || curNum===null || prevNum===curNum)) return;
     const row = {
-      emp:e, prevGrade, curGrade, prevNum, curNum,
+      emp:e, prevGrade, curGrade, prevNum: prevNum!==null?prevNum:0, curNum: curNum!==null?curNum:0, statusPromoted,
       prevGroup: jobGradeGroupOf(e.company, e.employmentStatus, prevGrade),
       curGroup: jobGradeGroupOf(e.company, e.employmentStatus, curGrade)
     };
-    (curNum>prevNum ? promoted : decreased).push(row);
+    (statusPromoted || curNum>prevNum ? promoted : decreased).push(row);
   });
   promoted.sort((a,b)=> (b.curNum-b.prevNum)-(a.curNum-a.prevNum));
   decreased.sort((a,b)=> (a.curNum-a.prevNum)-(b.curNum-b.prevNum));
@@ -4821,7 +4956,7 @@ function execExecutiveSummary(st, prevSt, period){
   } else {
     bullets.push(`<b>${agedPctNow.toFixed(0)}%</b> of the workforce is age 45 or older.`);
   }
-  if(movement.promoted.length) bullets.push(`<b>${movement.promoted.length}</b> employee(s) moved to a higher Job Grade this period vs. ${period.prevLabel} — see Promotions &amp; Job Grade Movement below.`);
+  if(movement.promoted.length) bullets.push(`<b>${movement.promoted.length}</b> employee(s) were promoted this period vs. ${period.prevLabel} — either a higher Job Grade or a Rank &amp; File -> Staff move — see Promotions &amp; Job Grade Movement below.`);
   if(movement.decreased.length) bullets.push(`<b>${movement.decreased.length}</b> employee(s) show a lower Job Grade this period vs. ${period.prevLabel} — worth confirming whether this reflects an actual role change or a data entry correction.`);
   if(tenureGradeGaps.length) bullets.push(`<b>${tenureGradeGaps.length}</b> Staff employee(s) have stayed at their current Job Grade Group longer than that grade's configured Max Tenure Stay without moving up even one Job Grade — a possible promotion-readiness gap (see Correlation Analysis → Tenure vs. Job Grade Level).`);
   if(ccRisk && ccRisk.rate>0) bullets.push(`Cost Center <b>${ccRisk.cc}</b> shows the highest attrition this period at <b>${ccRisk.rate.toFixed(1)}%</b> (${ccRisk.sep} of ${ccRisk.base}) — the top risk area for turnover concentration.`);
@@ -4991,12 +5126,12 @@ function renderExecReport(){
   <div class="exec-block">
     <h2 class="section">Promotions &amp; Job Grade Movement <span class="n">${ui.reportCompare?`vs. ${period.prevLabel}`:''}</span></h2>
     ${!ui.reportCompare ? `<p class="hint">Turn on "Compare vs. prior period" above to see who moved Job Grade between ${period.label} and the prior period.</p>` : `
-    <p class="hint" style="margin-top:-4px;">Detected by comparing each employee's Job Grade as of ${period.prevLabel} against ${period.label}, using the grade on file at each Master List upload (or manual edit) — not a live promotion log, so it only catches movement between two dated snapshots on file.</p>
-    <div class="exec-flag opp" style="margin-top:8px;">⬆ <b>${movement.promoted.length}</b> employee(s) moved to a higher Job Grade this period — likely promotions/re-gradings, worth confirming against HR records.</div>
+    <p class="hint" style="margin-top:-4px;">Detected by comparing each employee's Job Grade (and Employment Status) as of ${period.prevLabel} against ${period.label}, using what was on file at each Master List upload (or manual edit) — not a live promotion log, so it only catches movement between two dated snapshots on file. A Rank &amp; File -> Staff move is always counted as a promotion here even when the Job Grade number doesn't rise, since Staff and Rank &amp; File use separate, non-comparable grade ladders.</p>
+    <div class="exec-flag opp" style="margin-top:8px;">⬆ <b>${movement.promoted.length}</b> employee(s) were promoted this period — a higher Job Grade and/or a Rank &amp; File -> Staff move — worth confirming against HR records.</div>
     ${movement.promoted.length ? `
     <table class="demo compact" style="margin-top:8px;">
       <thead><tr><th class="rowlabel">Employee</th><th>Position</th>${!ui.reportScope?'<th>Company</th>':''}<th>Previous Grade</th><th>Current Grade</th></tr></thead>
-      <tbody>${movement.promoted.map(r=>`<tr><td class="rowlabel">${r.emp.lastName||''}, ${r.emp.firstName||''} <span style="color:var(--dim2);font-size:11px;">(${r.emp.employeeId})</span></td><td>${r.emp.position||'—'}</td>${!ui.reportScope?`<td>${r.emp.company||'—'}</td>`:''}<td>${r.prevGrade} <span style="color:var(--dim2);font-size:11px;">(${r.prevGroup})</span></td><td style="color:var(--green);">${r.curGrade} <span style="font-size:11px;">(${r.curGroup})</span></td></tr>`).join('')}</tbody>
+      <tbody>${movement.promoted.map(r=>`<tr><td class="rowlabel">${r.emp.lastName||''}, ${r.emp.firstName||''} <span style="color:var(--dim2);font-size:11px;">(${r.emp.employeeId})</span>${r.statusPromoted?` <span class="pill staff" style="font-size:10px;" title="Tagged as a promotion because they moved from Rank & File to Staff, regardless of Job Grade numbers.">Rank &amp; File → Staff</span>`:''}</td><td>${r.emp.position||'—'}</td>${!ui.reportScope?`<td>${r.emp.company||'—'}</td>`:''}<td>${r.prevGrade} <span style="color:var(--dim2);font-size:11px;">(${r.prevGroup})</span></td><td style="color:var(--green);">${r.curGrade} <span style="font-size:11px;">(${r.curGroup})</span></td></tr>`).join('')}</tbody>
     </table>` : ''}
     ${movement.decreased.length ? `
     <div class="exec-flag watch" style="margin-top:14px;">⬇ <b>${movement.decreased.length}</b> employee(s) show a lower Job Grade this period than last — this is more often a data-entry correction than an actual demotion, but worth double-checking.</div>
@@ -5512,13 +5647,21 @@ async function confirmMasterlistNewHires(){
   if(!P){ closeModal(); return; }
   const {rows, thenPromotionRows, thenCandidateIds} = ui.modal.arg;
   const {company, status, asOfMonth} = P;
-  let newHires=0, addedNotCounted=0;
+  let newHires=0, addedNotCounted=0, promotedFromRf=0;
   const pendingPrfLinks = [];
   rows.forEach(row=>{
     const sel = document.querySelector(`.mlNewHireChoice[data-id="${row.employeeId}"]`);
     const dateEl = document.querySelector(`.mlNewHireDate[data-id="${row.employeeId}"]`);
     const prfSel = document.querySelector(`.mlPrfSelect[data-id="${row.employeeId}"]`);
-    const isNewHire = !sel || sel.value==='yes';
+    const choice = sel ? sel.value : 'yes';
+    // Task: "Promoted from Rank & File" is its own outcome, distinct from Yes/No — it's neither a
+    // genuine New Hire nor a plain "already existed, don't count". It's tagged as a promotion
+    // unconditionally (never gated on Job Grade numbers lining up — Staff and Rank & File use
+    // separate, non-comparable grade ladders) and linked back to the matched Rank & File record
+    // by name (see findRankFileNameMatch) since regularization often issues a brand-new Employee
+    // ID, so the two records can't be matched by ID alone.
+    const isPromoted = choice==='promoted' && row.rfMatchEmployeeId;
+    const isNewHire = !isPromoted && choice==='yes';
     const dateHired = (dateEl && dateEl.value) ? dateEl.value : row.dateHired;
     P.working.push({
       employeeId:row.employeeId, lastName:row.lastName, firstName:row.firstName, middleName:row.middleName,
@@ -5530,10 +5673,29 @@ async function confirmMasterlistNewHires(){
       // reported roster in this upload's month, so this shows up as an increase here and
       // leaves every earlier month's headcount untouched.
       rosterSpans:[{start:asOfMonth, end:''}],
-      dateSeparated:'', separationReason:'', separationRemarks:''
+      dateSeparated:'', separationReason:'', separationRemarks:'',
+      promotedFromEmployeeId: isPromoted ? row.rfMatchEmployeeId : undefined
     });
-    recordJobGradeSnapshot(P.working[P.working.length-1], asOfMonth, row.jobGrade);
-    if(isNewHire) newHires++; else addedNotCounted++;
+    const newEmp = P.working[P.working.length-1];
+    recordJobGradeSnapshot(newEmp, asOfMonth, row.jobGrade);
+    recordPositionSnapshot(newEmp, asOfMonth, row.position);
+    recordStatusSnapshot(newEmp, asOfMonth, status);
+    if(isPromoted){
+      promotedFromRf++;
+      newEmp.promotionHistory = Array.isArray(newEmp.promotionHistory) ? newEmp.promotionHistory : [];
+      newEmp.promotionHistory.push({
+        ms: asOfMonth, type:'promotion', statusChange:true,
+        fromPosition: row.rfMatchPosition||'', fromJobGrade: row.rfMatchJobGrade||'',
+        toPosition: row.position||'', toJobGrade: row.jobGrade||'',
+        fromEmploymentStatus:'Rank & File', toEmploymentStatus:'Staff'
+      });
+      // Link the two records for traceability. The matched Rank & File record itself is left
+      // otherwise untouched here (still active) — it naturally comes up for review as "missing
+      // from file" the next time that company's own Rank & File Master List is uploaded, where
+      // HR can close it out with whatever Separation Reason fits (see confirmMasterlistSeparations).
+      const rfEmp = P.working.find(e=> String(e.employeeId)===String(row.rfMatchEmployeeId));
+      if(rfEmp) rfEmp.promotedToEmployeeId = row.employeeId;
+    } else if(isNewHire) newHires++; else addedNotCounted++;
     // PRF Monitoring (Task h): if HR tagged this new hire to an open PRF on the review card,
     // stage the slot fill here — applied atomically with the rest of this upload in
     // finalizeMasterlistUpload, so a cancelled upload can't leave a PRF slot filled with nobody
@@ -5544,6 +5706,7 @@ async function confirmMasterlistNewHires(){
   });
   P.meta.newHires = newHires;
   P.meta.addedNotCounted = addedNotCounted;
+  P.meta.promoted = (P.meta.promoted||0) + promotedFromRf;
   P.pendingPrfLinks = pendingPrfLinks;
   // This step was explicitly resolved (not abandoned), so just clear the modal directly —
   // closeModal() would treat this as a backdrop-dismissal and cancel the whole staged upload.
@@ -5587,17 +5750,23 @@ async function confirmMasterlistPromotions(){
     const emp = P.working.find(e=> String(e.employeeId)===String(row.employeeId));
     if(!emp) return;
     const sel = document.querySelector(`.mlPromoChoice[data-id="${row.employeeId}"]`);
-    const type = (sel && sel.value==='change') ? 'change' : 'promotion';
+    // A Rank & File -> Staff status move (row.statusMovedToStaff, set in runCompanyUpload) is
+    // always tagged as a promotion — it isn't left to the dropdown, and it never depends on how
+    // the old Rank & File Job Grade number compares to the new Staff one, since those two grades
+    // come from separate, non-comparable ladders (see recordStatusSnapshot/statusAsOf).
+    const type = row.statusMovedToStaff ? 'promotion' : ((sel && sel.value==='change') ? 'change' : 'promotion');
     emp.promotionHistory = Array.isArray(emp.promotionHistory) ? emp.promotionHistory : [];
     emp.promotionHistory.push({
       ms: asOfMonth, type,
       fromPosition: row.prevPosition, fromJobGrade: row.prevJobGrade,
-      toPosition: row.newPosition, toJobGrade: row.newJobGrade
+      toPosition: row.newPosition, toJobGrade: row.newJobGrade,
+      statusChange: !!row.statusMovedToStaff,
+      fromEmploymentStatus: row.prevStatus, toEmploymentStatus: row.newStatus
     });
     if(type==='promotion') promoted++; else changed++;
   });
-  P.meta.promoted = promoted;
-  P.meta.changed = changed;
+  P.meta.promoted = (P.meta.promoted||0) + promoted;
+  P.meta.changed = (P.meta.changed||0) + changed;
   // Explicitly resolved — clear the modal directly rather than via closeModal(), which would
   // otherwise mistake this for an abandoned upload and cancel the whole staged upload.
   ui.modal = null;
@@ -5607,17 +5776,26 @@ async function skipMasterlistPromotions(){
   const P = MASTERLIST_PENDING;
   const {rows, thenCandidateIds} = ui.modal.arg;
   if(P){
+    let promoted=0, changed=0;
     rows.forEach(row=>{
       const emp = P.working.find(e=> String(e.employeeId)===String(row.employeeId));
       if(!emp) return;
+      // "Mark All as Change Only" is a bulk shortcut for ordinary Position/Job Grade edits — it
+      // must not downgrade a genuine Rank & File -> Staff status move to a non-promotion. Those
+      // rows still get tagged as a promotion even when the rest of the batch is skipped as changes.
+      const type = row.statusMovedToStaff ? 'promotion' : 'change';
       emp.promotionHistory = Array.isArray(emp.promotionHistory) ? emp.promotionHistory : [];
       emp.promotionHistory.push({
-        ms: P.asOfMonth, type:'change',
+        ms: P.asOfMonth, type,
         fromPosition: row.prevPosition, fromJobGrade: row.prevJobGrade,
-        toPosition: row.newPosition, toJobGrade: row.newJobGrade
+        toPosition: row.newPosition, toJobGrade: row.newJobGrade,
+        statusChange: !!row.statusMovedToStaff,
+        fromEmploymentStatus: row.prevStatus, toEmploymentStatus: row.newStatus
       });
+      if(type==='promotion') promoted++; else changed++;
     });
-    P.meta.changed = (P.meta.changed||0) + rows.length;
+    P.meta.promoted = (P.meta.promoted||0) + promoted;
+    P.meta.changed = (P.meta.changed||0) + changed;
   }
   ui.modal = null;
   afterMasterlistPromotionStep(thenCandidateIds);
@@ -5855,9 +6033,13 @@ async function confirmEditEmployee(){
   emp.position = g('em_pos');
   emp.jobGrade = g('em_grade');
   recordJobGradeSnapshot(emp, monthStr(new Date()), emp.jobGrade);
+  recordPositionSnapshot(emp, monthStr(new Date()), emp.position);
   emp.birthdate = g('em_birthdate');
   emp.gender = g('em_gender');
   emp.employmentStatus = g('em_status');
+  // Keep the Employment Status history (used by companyAnnualPromotions/execJobGradeMovement to
+  // spot a Rank & File -> Staff move) in sync with manual edits too, not just Master List uploads.
+  recordStatusSnapshot(emp, monthStr(new Date()), emp.employmentStatus);
   emp.dateHired = g('em_hired');
   emp.hireTagMonth = g('em_hireTagMonth') || '';
   const countsNewHireEl = document.getElementById('em_countsNewHire');
@@ -6014,6 +6196,23 @@ function fileToRows(file){
   });
 }
 
+// Loose name key (lowercased, trimmed, whitespace-collapsed Last+First) used only to spot a
+// likely same-person match across two employment-status rosters when the Employee ID itself
+// changes on regularization (a common practice: a Rank & File employee gets issued a brand-new
+// Staff ID rather than keeping the old one). This is a *candidate* match for HR to confirm on the
+// New Hire review screen — see findRankFileNameMatch — never an automatic merge.
+function normName(s){ return String(s||'').trim().toLowerCase().replace(/\s+/g,' '); }
+// Looks for an active (not separated) Rank & File employee at this company whose Last+First name
+// matches the given row. Used when a Staff Master List upload contains an ID that isn't
+// recognized anywhere yet (see runCompanyUpload's pendingNewHireRows branch) — instead of only
+// asking "New Hire?", HR also gets the option to flag it as a Rank & File -> Staff promotion,
+// which should never hinge on Job Grade numbers lining up across two different grade ladders.
+function findRankFileNameMatch(list, company, lastName, firstName){
+  const lastKey = normName(lastName), firstKey = normName(firstName);
+  if(!lastKey || !firstKey) return null;
+  return list.find(e=> e.company===company && e.employmentStatus==='Rank & File' && !e.dateSeparated
+    && normName(e.lastName)===lastKey && normName(e.firstName)===firstKey) || null;
+}
 function normGender(s){
   s = (s||'').trim();
   if(!s) return '';
@@ -6147,6 +6346,7 @@ async function runCompanyUpload({file, company, status, asOfMonth}){
       // pre-separation role isn't a meaningful "previous month" to compare against.
       const prevPosition = (working[exists].position||'').trim();
       const prevJobGrade = (working[exists].jobGrade||'').trim();
+      const prevStatus = working[exists].employmentStatus || '';
       working[exists] = {...working[exists], rosterSpans: priorSpans,
         lastName:get('lastName'), firstName:get('firstName'), middleName:get('middleName'),
         company, industry:industryOf(company), costCenter:get('costCenter'),
@@ -6157,6 +6357,8 @@ async function runCompanyUpload({file, company, status, asOfMonth}){
       };
       if(ccMoved) delete working[exists].departmentOverride;
       recordJobGradeSnapshot(working[exists], asOfMonth, get('jobGrade'));
+      recordPositionSnapshot(working[exists], asOfMonth, get('position'));
+      recordStatusSnapshot(working[exists], asOfMonth, status);
       // A rehire re-enters the reported roster in THIS month only — the months they were away
       // stay exactly as they were reported, and their earlier separation keeps its own closed
       // span. Someone who was already active simply keeps the span they already had, so a
@@ -6165,9 +6367,23 @@ async function runCompanyUpload({file, company, status, asOfMonth}){
       if(wasSeparated) rehired++; else updated++;
       const newPosition = get('position').trim();
       const newJobGrade = get('jobGrade').trim();
-      if(isForwardMonthUpload && !wasSeparated && prevPosition && prevJobGrade && newPosition && newJobGrade && (newPosition!==prevPosition || newJobGrade!==prevJobGrade)){
+      // Trigger the Promotion/Change review whenever Position and/or Job Grade changed — same as
+      // before — OR whenever Employment Status itself moved from Rank & File to Staff, even if
+      // the Position text and Job Grade string happen to be unchanged. A status move onto the
+      // Staff ladder is a promotion in its own right and must not depend on Position/Job Grade
+      // having changed, nor (per the review step itself) on the Job Grade *numbers* comparing
+      // favorably — Staff and Rank & File use separate, non-comparable Job Grade scales.
+      const statusMovedToStaff = !!prevStatus && prevStatus!==status && prevStatus==='Rank & File' && status==='Staff';
+      // The reverse direction — Staff down to Rank & File — must never trigger this review, even
+      // though the Position/Job Grade text will almost always differ (Staff and Rank & File sit on
+      // separate, non-comparable grade ladders, so crossing between them changes the text either
+      // way). Rank & File sits below Staff, so a move onto the Rank & File ladder can never be a
+      // promotion — only the upward move (Rank & File -> Staff, statusMovedToStaff above) should
+      // ever surface the Promoted/Transferred question.
+      const statusMovedToRankFile = !!prevStatus && prevStatus!==status && prevStatus==='Staff' && status==='Rank & File';
+      if(isForwardMonthUpload && !wasSeparated && !statusMovedToRankFile && ((prevPosition && prevJobGrade && newPosition && newJobGrade && (newPosition!==prevPosition || newJobGrade!==prevJobGrade)) || statusMovedToStaff)){
         pendingPromotionRows.push({employeeId:id, lastName:get('lastName'), firstName:get('firstName'),
-          prevPosition, prevJobGrade, newPosition, newJobGrade});
+          prevPosition, prevJobGrade, newPosition, newJobGrade, prevStatus, newStatus:status, statusMovedToStaff});
       }
     } else if(isBaselineUpload){
       // First-ever file for this company+status: this is the starting baseline, so add
@@ -6187,16 +6403,34 @@ async function runCompanyUpload({file, company, status, asOfMonth}){
         separationReason:'', separationRemarks:''
       });
       recordJobGradeSnapshot(working[working.length-1], asOfMonth, get('jobGrade'));
+      recordPositionSnapshot(working[working.length-1], asOfMonth, get('position'));
+      recordStatusSnapshot(working[working.length-1], asOfMonth, status);
       baselineAdded++;
     } else {
       // Not a baseline upload, and this ID isn't anywhere in the system yet — don't assume
       // it's a New Hire. Stage it and ask HR right after this upload finishes.
       const fileHireDate = normalizeDateInput(get('dateHired'));
-      pendingNewHireRows.push({
+      const row = {
         employeeId:id, lastName:get('lastName'), firstName:get('firstName'), middleName:get('middleName'),
         gender: normGender(get('gender')), position:get('position'), jobGrade:get('jobGrade'), birthdate: normalizeDateInput(get('birthdate')),
         costCenter:get('costCenter'), dateHired: fileHireDate || fmtDate(moStart)
-      });
+      };
+      // Task: a Rank & File -> Staff move where regularization also issues a new Employee ID
+      // shows up here as an "unrecognized ID" — same as a genuine new hire — because the match
+      // above is by ID only. Before assuming that, check for a same-named, still-active Rank &
+      // File employee at this company; if found, the New Hire review screen offers a dedicated
+      // "Promoted from Rank & File" choice instead of just Yes/No, so this can be tagged as a
+      // promotion (and excluded from New Hire counts) without ever needing Job Grade numbers
+      // from the two different ladders to agree.
+      if(status==='Staff'){
+        const match = findRankFileNameMatch(working, company, row.lastName, row.firstName);
+        if(match){
+          row.rfMatchEmployeeId = match.employeeId;
+          row.rfMatchPosition = match.position || '';
+          row.rfMatchJobGrade = match.jobGrade || '';
+        }
+      }
+      pendingNewHireRows.push(row);
     }
   }
 
@@ -6245,7 +6479,39 @@ async function runCompanyUpload({file, company, status, asOfMonth}){
    HR/Admin-only, single place that lists every export available for the currently-selected
    company, each with its own label describing exactly what's in the file, instead of an export
    button scattered inside a different sub-tab for each one. */
+// Year <select> options shared by the Promoted Employees, Rank & File -> Staff Movement, and
+// Transferred from Other Affiliates export panels, so HR can pull a past year's promotions/
+// transfers without first changing the Year/Month picker at the top of Company Detail.
+// `years` defaults to archiveYears() (current year + every year with an actual hire/separation on
+// file) — right for the Transfers panel, since detectTransfers is itself built on hire/separation
+// tag months. Promotions use promotionYearOptions() instead (see below), since a promotion can
+// land in a year that had no hire or separation at all.
+function exportYearOptionsHTML(selectedYear, years){
+  years = (years || archiveYears()).slice();
+  if(!years.includes(selectedYear)) years.push(selectedYear);
+  return years.sort((a,b)=> b-a).map(y=> `<option value="${y}" ${y===selectedYear?'selected':''}>${y}</option>`).join('');
+}
+// Years to offer for the Promoted Employees / Rank & File -> Staff Movement export panels: the
+// current year, plus every year that shows up in any employee's Job Grade or Employment Status
+// snapshot history (recordJobGradeSnapshot/recordStatusSnapshot) — the same on-file history
+// companyAnnualPromotions itself draws on — plus any extra years configured in Control Panel.
+// Unlike archiveYears(), this isn't tied to hire/separation tag months, so a promotion recorded
+// in a year with no hires or separations still gets its year listed.
+function promotionYearOptions(){
+  let ys = new Set([Math.max(MIN_YEAR, new Date().getFullYear())]);
+  EMP.forEach(e=>{
+    (Array.isArray(e.jobGradeHistory) ? e.jobGradeHistory : []).forEach(h=>{
+      const y = Number((h.ms||'').split('-')[0]); if(y>=MIN_YEAR) ys.add(y);
+    });
+    (Array.isArray(e.statusHistory) ? e.statusHistory : []).forEach(h=>{
+      const y = Number((h.ms||'').split('-')[0]); if(y>=MIN_YEAR) ys.add(y);
+    });
+  });
+  configExtraYears().forEach(y=> ys.add(y));
+  return Array.from(ys).sort((a,b)=> b-a);
+}
 function subExportCenter(st, period){
+  const exportYear = Number(ui.month.split('-')[0]) || new Date().getFullYear();
   return `
   <p class="hint" style="margin-bottom:14px;">Every export below downloads to your browser's Downloads folder. Company comes from the picker above (<b>${ui.company}</b>); each panel below has its own filters where it needs one.</p>
   ${exportMasterListControls()}
@@ -6262,8 +6528,16 @@ function subExportCenter(st, period){
   </div>
   <div class="panel" style="margin-top:14px;">
     <div class="panel-head"><h3>Hire &amp; Separation Archive <span class="pill rankfile" style="margin-left:8px;">Establishment Report format</span></h3></div>
-    <p class="hint">New Hires and Separations for ${Number(ui.month.split('-')[0]) || new Date().getFullYear()}, using whatever Company / Employment Status filters are currently set on the Hire &amp; Separation Archive tab (all companies/statuses if nothing's filtered there).</p>
+    <p class="hint">New Hires and Separations for ${exportYear}, using whatever Company / Employment Status filters are currently set on the Hire &amp; Separation Archive tab (all companies/statuses if nothing's filtered there).</p>
     <button class="btn primary" onclick="exportArchiveExcel()">Export to Excel</button>
+  </div>
+  <div class="panel" style="margin-top:14px;">
+    <div class="panel-head"><h3>Workforce Movement <span class="pill staff" style="margin-left:8px;">${ui.company}</span></h3></div>
+    <p class="hint">One Excel file for <b>${ui.company}</b>, covering the selected year, with three separate sheets: <b>Promoted Employees</b> (everyone flagged as promoted — a Job Grade increase, a Rank &amp; File → Staff move, or both — with their From/To Position and From/To Job Grade), <b>Rank &amp; File to Staff Movement</b> (just the cross-status subset of that same list), and <b>Transferred from Other Affiliates</b> (employees whose Name matched a Separation at another company and a New Hire at ${ui.company} within the year). Each sheet is still built the same way as the matching tab elsewhere in the app, so the numbers always agree.</p>
+    <div class="field-row">
+      <div class="field"><label>YEAR</label><select id="exp_workforce_year">${exportYearOptionsHTML(exportYear, workforceMovementYearOptions())}</select></div>
+    </div>
+    <button class="btn primary" onclick="exportWorkforceMovementExcel()">Export to Excel</button>
   </div>
   <div class="panel" style="margin-top:14px;">
     <div class="panel-head"><h3>Bound for Performance Appraisal <span class="pill intern" style="margin-left:8px;">Staff · 3rd/6th/9th month</span></h3></div>
@@ -6276,6 +6550,67 @@ function subExportCenter(st, period){
     <button class="btn primary" onclick="downloadRecruitExport()">Export CSV</button>
   </div>
   `;
+}
+// Years to offer for the merged "Workforce Movement" export panel — the union of
+// promotionYearOptions() (job grade/status snapshot history — what Promoted Employees and Rank &
+// File to Staff Movement are built from) and archiveYears() (hire/separation tag months — what
+// Transferred from Other Affiliates is built from via detectTransfers), so a year with data for
+// either sheet shows up, even if it has none for the other.
+function workforceMovementYearOptions(){
+  const ys = new Set([...promotionYearOptions(), ...archiveYears()]);
+  return Array.from(ys).sort((a,b)=> b-a);
+}
+// Reads the Workforce Movement panel's own YEAR <select> (falling back to the top Year/Month
+// picker's year if the element isn't there for some reason) so this export's year is independent
+// of whatever Monthly/Annual period happens to be selected at the top of Company Detail.
+function exportSelectedYear(selectId){
+  const el = document.getElementById(selectId);
+  const v = el ? Number(el.value) : NaN;
+  return !isNaN(v) && v ? v : (Number(ui.month.split('-')[0]) || new Date().getFullYear());
+}
+// Single export behind the "Workforce Movement" panel in Company Detail's Export tab
+// (subExportCenter above) — one workbook, one download, three sheets: Promoted Employees, Rank &
+// File to Staff Movement (the statusPromoted subset of the same list), and Transferred from Other
+// Affiliates. Each sheet reuses the exact same detection already driving its matching tab
+// elsewhere in the app (companyAnnualPromotions for the first two — the same source behind the
+// Promotions sub-tab — and detectTransfers for the third, the same source behind the Transfers
+// tab) so the numbers here always agree with what's shown on-screen. Every sheet is written even
+// when empty (header row only), so the file's shape never depends on what happened to have data
+// that year.
+function exportWorkforceMovementExcel(){
+  if(typeof XLSX === 'undefined'){ toast('Excel export isn\'t available right now — try refreshing the page.'); return; }
+  const year = exportSelectedYear('exp_workforce_year');
+  const asOfEnd = new Date(year,11,31,23,59,59);
+  const promoRows = companyAnnualPromotions(ui.company, year, asOfEnd);
+  const rfRows = promoRows.filter(r=> r.statusPromoted);
+  const transferRows = detectTransfers(year).filter(t=> t.toCompany===ui.company);
+
+  if(!promoRows.length && !transferRows.length){ toast(`No promotions or transfers on record for ${ui.company} in ${year}.`); return; }
+
+  const promoAoa = [['Year','ID #','Last Name','First Name','Middle Name','From Position','From Job Grade','From Job Grade Group','To Position','To Job Grade','To Job Grade Group','Employment Status','Rank & File → Staff','Month Promoted']]
+    .concat(promoRows.map(r=> [
+      year, r.emp.employeeId||'', r.emp.lastName||'', r.emp.firstName||'', r.emp.middleName||'',
+      r.startPosition||'', r.startGrade||'', r.startGroup||'',
+      r.curPosition||'', r.curGrade||'', r.curGroup||'',
+      statusLabel(r.emp.employmentStatus), r.statusPromoted ? 'Yes' : 'No', monthLabel(r.promotedMs)
+    ]));
+  const rfAoa = [['Year','ID #','Last Name','First Name','Middle Name','From Position','To Position','From Job Grade (Rank & File)','To Job Grade (Staff)','From Month','Month Promoted']]
+    .concat(rfRows.map(r=> [
+      year, r.emp.employeeId||'', r.emp.lastName||'', r.emp.firstName||'', r.emp.middleName||'',
+      r.startPosition||'', r.curPosition||'', r.startGrade||'', r.curGrade||'', monthLabel(r.fromMs), monthLabel(r.promotedMs)
+    ]));
+  const transferAoa = [['Year','Last Name','First Name','Middle Name','From Company (Affiliate)','To Company','Date Separated (From)','Date Hired (Into)','From ID','To ID','Same ID?']]
+    .concat(transferRows.map(t=> [
+      year, t.lastName||'', t.firstName||'', t.middleName||'', t.fromCompany||'', t.toCompany||'',
+      fmtDateMDY(t.dateSeparated), fmtDateMDY(t.dateHired), t.fromId||'', t.toId||'', t.sameId?'Yes':'No'
+    ]));
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(promoAoa), 'Promoted Employees');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rfAoa), 'Rank & File to Staff Movement');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(transferAoa), 'Transferred from Affiliates');
+  const scope = [ui.company||'Company', year].join('_').replace(/\s+/g,'-').replace(/[^\w\-]/g,'');
+  XLSX.writeFile(wb, `workforce_movement_${scope}.xlsx`);
 }
 /* ============ EXPORT MASTER LIST (per month, already uploaded) ============
    HR and Admin can pull back the roster on file for the currently-selected Company Detail
@@ -6450,11 +6785,18 @@ function handleUpload(){
         // Updating an existing record must not rebuild their roster history from scratch — carry
         // whatever months they were already reported under, then apply this file's change.
         rosterSpans: exists>=0 ? rosterSpansOf(EMP[exists]).map(sp=>({...sp})) : [],
-        jobGradeHistory: exists>=0 ? (EMP[exists].jobGradeHistory||[]).slice() : []
+        jobGradeHistory: exists>=0 ? (EMP[exists].jobGradeHistory||[]).slice() : [],
+        positionHistory: exists>=0 ? (EMP[exists].positionHistory||[]).slice() : [],
+        statusHistory: exists>=0 ? (EMP[exists].statusHistory||[]).slice() : []
       };
       syncRosterSpanFromRecord(emp);
       if(exists>=0){ EMP[exists] = emp; updated++; } else { EMP.push(emp); newHires++; }
       recordJobGradeSnapshot(emp, monthStr(new Date()), emp.jobGrade);
+      recordPositionSnapshot(emp, monthStr(new Date()), emp.position);
+      // Keep the Employment Status history in sync here too, so a Rank & File -> Staff move made
+      // through this bulk import path is detectable the same way as one from a Master List upload
+      // or a manual edit (see companyAnnualPromotions/execJobGradeMovement).
+      recordStatusSnapshot(emp, monthStr(new Date()), emp.employmentStatus);
       if(emp.dateSeparated) separated++;
       if(emp.company && emp.employmentStatus) touchedGroups.add(emp.company+'|'+emp.employmentStatus);
     }
@@ -6964,16 +7306,19 @@ function renderModal(){
     const P = MASTERLIST_PENDING;
     const asOfMonth = P ? P.asOfMonth : '';
     const openPrfs = P ? prfOpenOptionsFor(P.company) : [];
-    body = `<h3>Review New IDs — New Hire or Already Existed?</h3>
+    body = `<h3>Review New IDs — New Hire, Already Existed, or Promoted?</h3>
     <p class="hint">Nothing from this Master List upload is saved yet — it's staged until every review step here is completed.</p>
     <div style="max-height:380px;overflow:auto;margin:10px 0;border:1px solid var(--border);border-radius:6px;padding:8px 10px;">
       ${rows.map(r=>`
         <div style="padding:8px 0;border-bottom:1px solid var(--border);">
           <div style="font-size:13px;margin-bottom:6px;"><b>${r.lastName||''}, ${r.firstName||''}</b> — ID ${r.employeeId}${r.costCenter?` · ${r.costCenter}`:''}${r.position?` · ${r.position}`:''}</div>
+          ${r.rfMatchEmployeeId ? `
+          <div class="hint" style="margin-bottom:6px;color:var(--teal);">⬆ Matches an active <b>Rank &amp; File</b> employee on file with the same name — ID ${r.rfMatchEmployeeId}${r.rfMatchPosition?`, ${r.rfMatchPosition}`:''}${r.rfMatchJobGrade?` (Grade ${r.rfMatchJobGrade})`:''}. If this is the same person, choose "Promoted from Rank &amp; File" below — it's tagged as a promotion regardless of how the Job Grade numbers compare, since Staff and Rank &amp; File use different grade ladders.</div>` : ''}
           <div style="display:flex;gap:8px;flex-wrap:wrap;">
             <select class="mlNewHireChoice" data-id="${r.employeeId}" style="flex:1;min-width:220px;" onchange="checkNewHireDateWarning('${r.employeeId}')">
-              <option value="yes" selected>Yes — new hire, count for ${monthLabel(asOfMonth)}</option>
+              <option value="yes" ${r.rfMatchEmployeeId?'':'selected'}>Yes — new hire, count for ${monthLabel(asOfMonth)}</option>
               <option value="no">No — already existed, don't count</option>
+              ${r.rfMatchEmployeeId ? `<option value="promoted" selected>Promoted from Rank &amp; File (ID ${r.rfMatchEmployeeId}) — tag as a promotion, not a new hire</option>` : ''}
             </select>
             <input type="date" class="mlNewHireDate" data-id="${r.employeeId}" value="${r.dateHired||''}" style="flex:1;min-width:130px;" oninput="checkNewHireDateWarning('${r.employeeId}')">
           </div>
@@ -7024,18 +7369,23 @@ function renderModal(){
     <div style="max-height:380px;overflow:auto;margin:10px 0;border:1px solid var(--border);border-radius:6px;padding:8px 10px;">
       ${rows.map(r=>{
         const prevNum = jobGradeNumeric(r.prevJobGrade), newNum = jobGradeNumeric(r.newJobGrade);
-        const suggestPromotion = (prevNum!==null && newNum!==null) ? (newNum > prevNum) : (r.newPosition !== r.prevPosition);
+        const suggestPromotion = r.statusMovedToStaff ? true : ((prevNum!==null && newNum!==null) ? (newNum > prevNum) : (r.newPosition !== r.prevPosition));
         return `
         <div style="padding:8px 0;border-bottom:1px solid var(--border);">
           <div style="font-size:13px;margin-bottom:6px;"><b>${r.lastName||''}, ${r.firstName||''}</b> — ID ${r.employeeId}</div>
           <div class="hint" style="margin-bottom:6px;">
-            From: ${r.prevPosition} · ${r.prevJobGrade}<br>
-            To: ${r.newPosition} · ${r.newJobGrade}
+            From: ${r.prevPosition} · ${r.prevJobGrade}${r.prevStatus?` (${r.prevStatus})`:''}<br>
+            To: ${r.newPosition} · ${r.newJobGrade}${r.newStatus?` (${r.newStatus})`:''}
           </div>
+          ${r.statusMovedToStaff ? `
+          <div class="hint" style="margin-bottom:6px;color:var(--teal);">⬆ Moved from Rank &amp; File to Staff — always tagged as a promotion for ${monthLabel(asOfMonth)}, regardless of how the old and new Job Grade numbers compare (Staff and Rank &amp; File use separate grade ladders, so their numbers aren't comparable).</div>
+          <select class="mlPromoChoice" data-id="${r.employeeId}" style="width:100%;" disabled>
+            <option value="promotion" selected>Promoted — count as a promotion for ${monthLabel(asOfMonth)}</option>
+          </select>` : `
           <select class="mlPromoChoice" data-id="${r.employeeId}" style="width:100%;">
             <option value="promotion" ${suggestPromotion?'selected':''}>Promoted — count as a promotion for ${monthLabel(asOfMonth)}</option>
             <option value="change" ${!suggestPromotion?'selected':''}>Just a change — not a promotion (correction, lateral move, reclassification, etc.)</option>
-          </select>
+          </select>`}
         </div>
       `}).join('')}
     </div>
