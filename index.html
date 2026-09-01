@@ -239,7 +239,7 @@
 </style>
 </head>
 <body>
-<div id="syncFailBanner">⚠ Your last change could not be saved to the cloud (check your internet connection or Firebase database rules). It's kept safely in this browser only — reopening this site elsewhere may not show it yet.</div>
+<div id="syncFailBanner">⚠ Your last change could not be saved to the cloud (check your internet connection or Firebase database rules). It's kept safely in this browser only — reopening this site elsewhere may not show it yet. It will keep retrying automatically, or <button id="syncRetryBtn" onclick="retrySyncNow()" style="margin-left:2px;background:#fff;color:#7a3b1e;border:none;border-radius:14px;padding:3px 12px;font-size:11.5px;font-weight:600;cursor:pointer;">Retry now</button></div>
 <div class="shell" id="app"></div>
 <div id="syncBadge">☁ Sync not set up</div>
 
@@ -350,6 +350,7 @@ let ui = {
   transferFromCompany:'',
   transferToCompany:'',
   transferSearch:'',
+  movementsView:'transfers', // 'transfers' (cross-affiliate) | 'promotions' (Rank & File -> Staff, org-wide) — see renderTransfers
   positionView:'breakdown',
   deptSearch:'',
   costcenterSearch:'',
@@ -587,6 +588,34 @@ function schedulePush(){
   _pushTimer = setTimeout(pushToCloud, 900);
 }
 
+// ---- Push retry ----------------------------------------------------------
+// A push can fail mid-write for reasons that have nothing to do with the data itself — a dropped
+// wifi connection, a phone switching from wifi to mobile data, a laptop waking from sleep mid-
+// request. Previously a failed push just sat there showing the offline banner/badge until the
+// person happened to make ANOTHER edit somewhere (which re-triggers schedulePush) — there was no
+// actual retry, and clicking the "Sync" control only ever re-pulled (manualSync -> pullFromCloud),
+// which is a no-op while there's an unsynced local edit (see applyRemoteData's guard) — so a failed
+// save had no working manual retry either. This retries the SAME failed push automatically with
+// backoff, and again the moment the browser reports it's back online, or on demand via the
+// banner's "Retry now" button (retrySyncNow).
+let _pushRetryTimer = null;
+let _pushRetryDelay = 5000; // 5s, then 15s, then 45s, then holds at 60s between attempts
+function schedulePushRetry(){
+  clearTimeout(_pushRetryTimer);
+  _pushRetryTimer = setTimeout(()=>{
+    _pushRetryDelay = Math.min(_pushRetryDelay * 3, 60000);
+    pushToCloud();
+  }, _pushRetryDelay);
+}
+window.addEventListener('online', ()=>{
+  if (hasUnsyncedLocalChanges()){ _pushRetryDelay = 5000; clearTimeout(_pushRetryTimer); pushToCloud(); }
+});
+function retrySyncNow(){
+  _pushRetryDelay = 5000;
+  clearTimeout(_pushRetryTimer);
+  manualSync();
+}
+
 // ---- Firebase key sanitization ------------------------------------------
 // Realtime Database keys can't contain '.', '#', '$', '/', '[', or ']' — but
 // real cost center codes (e.g. "ABC-QA/C") do contain '/', and several CONFIG
@@ -688,10 +717,13 @@ async function pushToCloud(){
     _lastKnownUpdatedAt = payload.updatedAt; // set before the write so our own echo is recognized and skipped
     await _fbRef.set(fbSanitizeKeys(payload));
     _syncedChangeSeq = seqAtPush;
+    _pushRetryDelay = 5000;
+    clearTimeout(_pushRetryTimer);
     updateSyncBadge('synced', new Date(payload.updatedAt).toLocaleTimeString());
   }catch(err){
     console.warn('Cloud sync (push) failed:', err);
     updateSyncBadge('offline');
+    schedulePushRetry();
   }
 }
 
@@ -712,7 +744,11 @@ function manualSync(){
     alert('Cloud sync isn\'t configured yet.\n\nMake sure you have an internet connection (Firebase SDK loads from gstatic.com) and that FIREBASE_CONFIG near the top of the <script> tag is filled in, then reload.');
     return;
   }
-  pullFromCloud();
+  // If there's a local edit that hasn't made it to the cloud yet, re-send THAT rather than
+  // pulling — a pull is a no-op here anyway (applyRemoteData refuses to overwrite an unsynced
+  // local change), so this used to just spin the badge without actually retrying the save.
+  if (hasUnsyncedLocalChanges()) pushToCloud();
+  else pullFromCloud();
 }
 
 // Repairs a CONFIG object so every field the rest of the app depends on is present and the
@@ -2073,7 +2109,7 @@ const NAV_ITEMS = [
   ['recruitment','Recruitment Cost','Cost per hire and recruitment cost ratio by company'],
   ['prf','PRF Monitoring','Personnel Requisition Forms — request to onboarding, by business affiliate'],
   ['archive','Hire &amp; Separation Archive','New hires and separations, side by side, by month and year'],
-  ['transfers','Transfers','Employees who separated at one company and were hired at another — matched by name'],
+  ['transfers','Movements','Cross-affiliate transfers, and Rank &amp; File → Staff promotions org-wide'],
   ['appraisal','Bound for Performance Appraisal','Staff new hires approaching their 3rd, 6th and 9th month evaluation'],
   ['coe','Certificate of Employment','Generate and print a Certificate of Employment — editable per company'],
   ['data','Data Management','Upload the master file, add hires, mark separations'],
@@ -2637,7 +2673,7 @@ function renderOverview(){
     <div class="card"><div class="label">Separations</div><div class="value red">${sepAll.length}</div><div class="foot">${transferSummary.out ? `incl. ${transferSummary.out} transfer(s) out — ` : ''}${year} year-to-date</div></div>
     <div class="card"><div class="label">Overall Attrition</div><div class="value ${attr>3?'red':''}">${activeStartRateEligible.length? attr.toFixed(1):'0.0'}%</div><div class="foot">retention ${activeStartRateEligible.length? (100-attr).toFixed(1):'100.0'}% · ${statusScope?statusScopeLabel:'Staff &amp; Rank &amp; File'} · ${year} full year</div></div>
   </div>
-  ${(transferSummary.in || transferSummary.out) ? `<p class="hint" style="margin-top:6px;">${transferSummary.in + transferSummary.out} of the movement above looks like cross-affiliate transfers (matched by name) rather than external hires/separations — see <a href="javascript:void(0)" onclick="ui.tab='transfers'; render();">Transfers</a> for the detail.</p>` : ''}
+  ${(transferSummary.in || transferSummary.out) ? `<p class="hint" style="margin-top:6px;">${transferSummary.in + transferSummary.out} of the movement above looks like cross-affiliate transfers (matched by name) rather than external hires/separations — see <a href="javascript:void(0)" onclick="ui.tab='transfers'; ui.movementsView='transfers'; render();">Movements</a> for the detail.</p>` : ''}
 
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px;">
     <div class="panel">
@@ -3409,6 +3445,60 @@ function companyAnnualPromotions(company, year, asOfEnd){
   });
   return rows.sort((a,b)=> (b.curNum-b.startNum)-(a.curNum-a.startNum));
 }
+// Org-wide Rank & File -> Staff promotions for the Movements panel (task: "view all ranks
+// promoted to staff regardless of which company they started/moved"). companyAnnualPromotions
+// above is deliberately scoped to one company at a time for Company Detail; this covers every
+// company at once and keeps ONLY the Rank & File -> Staff status moves (a same-status Job Grade
+// rise is what Company Detail's own Promotions view already covers, so it's left out here to
+// avoid duplicating that list with a different scope). Two sources feed it:
+//  1) Same-record promotions — an employee whose OWN statusHistory shows Rank & File -> Staff
+//     within the year, same snapshot-history detection as companyAnnualPromotions but without a
+//     company filter. Company doesn't change here; it's shown for reference.
+//  2) Cross-affiliate promotions — detectTransfers already name-matches a Separation at one
+//     company with a New Hire at another; when the person left as Rank & File and the record
+//     picked up at the new company is Staff, that pair is folded in here too, since "regardless
+//     of which company they started/moved" is exactly this case: they didn't get promoted and
+//     then transfer, or transfer and then get promoted later — either way it's the same person's
+//     rank moving up somewhere between leaving one affiliate and being found at another.
+function detectStaffPromotions(year, asOfEnd){
+  const asOfMs = monthStr(asOfEnd);
+  const priorYearEndMs = `${year-1}-12`;
+  const rows = [];
+  EMP.filter(e=> !e.dateSeparated && isOnRosterAsOf(e, asOfEnd)).forEach(e=>{
+    const hist = Array.isArray(e.jobGradeHistory) ? e.jobGradeHistory.filter(h=> h.ms<=asOfMs) : [];
+    if(hist.length<2) return;
+    const priorEligible = hist.filter(h=> h.ms<=priorYearEndMs);
+    const baseline = priorEligible.length ? priorEligible[priorEligible.length-1] : hist[0];
+    const current = hist[hist.length-1];
+    if(!isRankFileToStaffMove(e, baseline.ms, current.ms)) return;
+    if(isPromotionDismissed(e, baseline.ms, current.ms)) return;
+    const promoPos = promotionHistoryPositionChange(e, baseline.ms, current.ms);
+    const promotedMs = promotionEffectiveMonth(e, baseline, current, jobGradeNumeric(baseline.jobGrade), true);
+    rows.push({
+      emp:e, fromCompany:e.company, toCompany:e.company,
+      startPosition: (promoPos && promoPos.fromPosition) || positionAsOf(e, baseline.ms) || e.position || '',
+      curPosition: (promoPos && promoPos.toPosition) || positionAsOf(e, current.ms) || e.position || '',
+      fromMs: baseline.ms, toMs: current.ms,
+      promotedMs, viaTransfer:false
+    });
+  });
+  const usedHireKeys = new Set(rows.map(r=> r.emp.employeeId+'|'+r.emp.company));
+  detectTransfers(year).forEach(t=>{
+    const sep = EMP.find(e=> String(e.employeeId)===String(t.fromId) && e.company===t.fromCompany);
+    const hire = EMP.find(e=> String(e.employeeId)===String(t.toId) && e.company===t.toCompany);
+    if(!sep || !hire) return;
+    const key = hire.employeeId+'|'+hire.company;
+    if(usedHireKeys.has(key)) return; // already counted above via this hire's own statusHistory
+    if(sep.employmentStatus!=='Rank & File' || STATUS_KEY(hire.employmentStatus)!=='staff') return;
+    usedHireKeys.add(key);
+    rows.push({
+      emp:hire, fromCompany:t.fromCompany, toCompany:t.toCompany,
+      startPosition: sep.position||'', curPosition: hire.position||'',
+      promotedMs: monthStr(parseDate(t.dateHired)||asOfEnd), viaTransfer:true
+    });
+  });
+  return rows.sort((a,b)=> (b.promotedMs||'').localeCompare(a.promotedMs||''));
+}
 // Admin-only "delete individually" for a promoted list — rather than an all-or-nothing bulk
 // delete, an Admin can dismiss one specific detected promotion (identified by the employee +
 // the exact from/to Job Grade snapshot months that produced it) without touching the employee's
@@ -4035,6 +4125,40 @@ function transferMatchesFilter(t){
   return `${t.lastName} ${t.firstName} ${t.middleName}`.toLowerCase().includes(q);
 }
 function renderTransfers(){
+  const switcher = `
+  <div class="field-row" style="margin-bottom:14px;">
+    <button class="btn ${(ui.movementsView||'transfers')==='transfers' ? 'primary' : ''}" onclick="ui.movementsView='transfers'; render();">Cross-Affiliate Transfers</button>
+    <button class="btn ${ui.movementsView==='promotions' ? 'primary' : ''}" onclick="ui.movementsView='promotions'; render();">Rank &amp; File → Staff Promotions</button>
+  </div>`;
+  return switcher + (ui.movementsView==='promotions' ? renderStaffPromotionsCategory() : renderTransfersCategory());
+}
+// Rank & File -> Staff Promotions category — org-wide, not scoped to one company (see
+// detectStaffPromotions above for why company doesn't gate this list the way it does elsewhere).
+function renderStaffPromotionsCategory(){
+  const year = Number(ui.month.split('-')[0]) || new Date().getFullYear();
+  const asOfEnd = monthBounds(ui.month).end;
+  const admin = isAdmin();
+  const rows = detectStaffPromotions(year, asOfEnd);
+  const body = rows.length ? `<div class="archive-table-wrap"><table class="simple archive-table">
+    <thead><tr><th>Name</th><th>Company</th><th>Started As</th><th></th><th>Promoted To</th><th class="ctr">Effective</th>${admin?'<th></th>':''}</tr></thead>
+    <tbody>${rows.map(r=>`<tr>
+      <td class="namecell">${escapeHtml(r.emp.lastName||'')}, ${escapeHtml(r.emp.firstName||'')} <span style="color:var(--dim2);font-size:11px;">(${escapeHtml(String(r.emp.employeeId))})</span>${r.viaTransfer?` <span class="pill staff" style="font-size:10px;" title="Left ${escapeHtml(r.fromCompany)} as Rank & File and was matched (by name) to a New Hire at ${escapeHtml(r.toCompany)} as Staff.">Cross-Affiliate</span>`:''}</td>
+      <td>${r.fromCompany===r.toCompany ? escapeHtml(r.fromCompany) : `${escapeHtml(r.fromCompany)} <span style="color:var(--dim2);">→</span> ${escapeHtml(r.toCompany)}`}</td>
+      <td>${escapeHtml(r.startPosition||'—')} <span class="pill" style="font-size:10px;">Rank &amp; File</span></td>
+      <td style="text-align:center;color:var(--dim2);">→</td>
+      <td>${escapeHtml(r.curPosition||'—')} <span class="pill staff" style="font-size:10px;">Staff</span></td>
+      <td class="ctr">${monthLabel(r.promotedMs)}</td>
+      ${admin?`<td>${r.viaTransfer?'':`<button class="btn small danger" onclick="openDismissPromotionModal('${r.emp.employeeId}','${r.fromMs}','${r.toMs}')">Delete</button>`}</td>`:''}
+    </tr>`).join('')}</tbody>
+  </table></div>` : '<div class="empty">No Rank &amp; File → Staff promotions detected for this year.</div>';
+  return `
+  <p class="hint" style="margin:0 0 10px;max-width:640px;">Every employee who moved from <b>Rank &amp; File</b> to <b>Staff</b> within <b>${year}</b>, across <b>every company</b> — whether the promotion happened on their existing record, or they left one affiliate as Rank &amp; File and were picked up at another (matched by name, same as the Transfers tab) already at or later promoted to Staff.</p>
+  <h2 class="section">Rank &amp; File → Staff Promotions <span class="n">${year} · ${rows.length} found</span></h2>
+  ${body}
+  <p class="hint">Change the Year at the top of the page to view a different year.</p>
+  `;
+}
+function renderTransfersCategory(){
   const year = Number(ui.month.split('-')[0]) || new Date().getFullYear();
   const companies = allCompanies().map(c=>c.company);
   const all = detectTransfers(year);
