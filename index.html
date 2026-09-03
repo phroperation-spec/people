@@ -306,7 +306,14 @@ const DEFAULT_CONFIG = {
   }
 };
 
-const STATUS_KEY = s => s==='Staff' ? 'staff' : (s==='Intern/OJT' ? 'intern' : 'rankfile');
+// Trimmed + case-insensitive on purpose: this drives Staff/Rank & File/Intern bucketing
+// everywhere in the app (headcount, Movements, every chart), so a Master List cell that came in
+// as "STAFF", "staff ", or with stray whitespace must still land in the right bucket instead of
+// silently falling through to the Rank & File default below.
+const STATUS_KEY = s => {
+  const v = String(s||'').trim().toLowerCase();
+  return v==='staff' ? 'staff' : (v==='intern/ojt' ? 'intern' : 'rankfile');
+};
 const STATUS_COLOR = {staff:'var(--blue)', rankfile:'var(--teal)', intern:'var(--violet)'};
 
 let ui = {
@@ -399,8 +406,16 @@ function parseDate(s){
   }
   // accept YYYY-MM-DD, MM/DD/YYYY
   let d;
-  if(/^\d{4}-\d{2}-\d{2}/.test(s)) d = new Date(s);
-  else d = new Date(s);
+  if(/^\d{4}-\d{2}-\d{2}/.test(s)){
+    // Built from the literal Y/M/D numbers (local midnight), not new Date(s) — a plain
+    // "YYYY-MM-DD" string is parsed by JS as UTC midnight, which silently rolls back to the
+    // previous calendar day everywhere local time is behind UTC (this bit Date Hired/Date
+    // Separated/Birthdate alike, since every <input type=date> in this app produces exactly
+    // this format). Building the Date from its own components sidesteps the UTC/local gap
+    // entirely, the same way every other date-producing path here already does (see fmtDate).
+    const [y,m,day] = s.slice(0,10).split('-').map(Number);
+    d = new Date(y, m-1, day);
+  } else d = new Date(s);
   if(isNaN(d.getTime())) return null;
   return d;
 }
@@ -734,8 +749,11 @@ async function startRealtimeSync(){
   _fbRef.on('value', snap => {
     const data = snap.val();
     if (!data || data.updatedAt === _lastKnownUpdatedAt) return; // ignore our own echo / empty node
-    applyRemoteData(data);
-    updateSyncBadge('synced', new Date(data.updatedAt).toLocaleTimeString());
+    // applyRemoteData itself refuses to apply while a local edit is still mid-push (see
+    // hasUnsyncedLocalChanges), returning false in that case. Only report "Synced" when it
+    // actually applied this snapshot — otherwise the badge would falsely claim we're caught up
+    // with the cloud while a local change is still waiting to go out.
+    if (applyRemoteData(data)) updateSyncBadge('synced', new Date(data.updatedAt).toLocaleTimeString());
   });
 }
 
@@ -1359,6 +1377,21 @@ function isOnRosterInMonth(emp, ms){
 function isOnRosterAsOf(emp, refDate){ return isOnRosterInMonth(emp, monthStr(refDate)); }
 // Puts someone on the reported roster starting at month `ms` — used when a Master List (or a
 // manual add/import) first brings them in, and when a separated person is rehired.
+// A roster span's `end` must land strictly AFTER its `start` — isOnRosterInMonth counts someone
+// for start <= month < end, so an end that lands ON OR BEFORE start makes the span zero/negative-
+// length and the person never appears in ANY month's headcount at all, despite being a perfectly
+// normal on-file record. This is easy to trigger without anyone intending it: a Hire Reporting
+// Month and Separation Reporting Month landing in the same month (e.g. someone hired and let go
+// within the same reporting month, or an already-separated New Hire & Separated Import where both
+// optional Reporting Month columns were left blank and each independently defaulted to "the month
+// this file is imported" — see handleUpload). Bumping the end to the month right after start keeps
+// them visible for at least that one month instead of silently vanishing.
+function safeSpanEnd(start, end){
+  if(!end) return '';
+  if(end > start) return end;
+  const [y,m] = start.split('-').map(Number);
+  return monthStr(new Date(y, m, 1));
+}
 function openRosterSpan(emp, ms){
   if(!ms) return;
   const spans = rosterSpansOf(emp).map(sp=>({...sp}));
@@ -1378,8 +1411,8 @@ function closeRosterSpan(emp, ms){
   if(!ms) return;
   const spans = rosterSpansOf(emp).map(sp=>({...sp}));
   const last = spans[spans.length-1];
-  if(!last){ spans.push({start:ms, end:ms}); }
-  else last.end = (ms < last.start) ? last.start : ms;
+  if(!last){ spans.push({start:ms, end: safeSpanEnd(ms, ms)}); }
+  else last.end = safeSpanEnd(last.start, (ms < last.start) ? last.start : ms);
   emp.rosterSpans = spans;
 }
 // Used by the manual edit modal and the New Hire & Separated import, where HR can change the
@@ -1388,10 +1421,10 @@ function syncRosterSpanFromRecord(emp){
   const spans = rosterSpansOf(emp).map(sp=>({...sp}));
   const start = hireTagMonthOf(emp) || '';
   const end = emp.dateSeparated ? (separationTagMonthOf(emp) || '') : '';
-  if(!spans.length){ if(start) emp.rosterSpans = [{start, end}]; return; }
+  if(!spans.length){ if(start) emp.rosterSpans = [{start, end: safeSpanEnd(start, end)}]; return; }
   const last = spans[spans.length-1];
   if(start && spans.length===1) last.start = start;
-  last.end = end && end >= last.start ? end : (end ? last.start : '');
+  last.end = safeSpanEnd(last.start, end);
   emp.rosterSpans = spans;
 }
 // Mirrors separationTagMonth: the employee's actual Date Hired is kept exactly as recorded, but
@@ -3445,25 +3478,54 @@ function companyAnnualPromotions(company, year, asOfEnd){
   });
   return rows.sort((a,b)=> (b.curNum-b.startNum)-(a.curNum-a.startNum));
 }
+// The month a record was FIRST put on file, regardless of what its Date Hired says. Every record,
+// however it was created (baseline upload, ordinary New Hire, Quick Add, or a "Promoted from Rank
+// & File" regularization under a brand-new Employee ID — see confirmMasterlistNewHires), gets its
+// first jobGradeHistory/statusHistory snapshot recorded at that upload's as-of month. Date Hired
+// isn't a safe stand-in for "when this happened": a regularized Staff record often keeps the
+// person's ORIGINAL hire date for tenure purposes (e.g. still shows a 2021 Date Hired even though
+// the Staff record itself was only added to the file in 2026), which would otherwise make a recent
+// promotion look like it happened years ago and drop out of "this year"'s Movements list entirely.
+function firstOnFileMonth(emp){
+  const statusFirst = Array.isArray(emp.statusHistory) && emp.statusHistory.length ? emp.statusHistory[0].ms : null;
+  const gradeFirst = Array.isArray(emp.jobGradeHistory) && emp.jobGradeHistory.length ? emp.jobGradeHistory[0].ms : null;
+  return statusFirst || gradeFirst || emp.hireTagMonth || null;
+}
 // Org-wide Rank & File -> Staff promotions for the Movements panel (task: "view all ranks
 // promoted to staff regardless of which company they started/moved"). companyAnnualPromotions
 // above is deliberately scoped to one company at a time for Company Detail; this covers every
 // company at once and keeps ONLY the Rank & File -> Staff status moves (a same-status Job Grade
 // rise is what Company Detail's own Promotions view already covers, so it's left out here to
-// avoid duplicating that list with a different scope). Two sources feed it:
+// avoid duplicating that list with a different scope). FOUR sources feed it, tried in order —
+// each one only catches a promotion that leaves a particular kind of trail on file, and real
+// Master List data doesn't always leave the same kind of trail:
 //  1) Same-record promotions — an employee whose OWN statusHistory shows Rank & File -> Staff
 //     within the year, same snapshot-history detection as companyAnnualPromotions but without a
 //     company filter. Company doesn't change here; it's shown for reference.
-//  2) Cross-affiliate promotions — detectTransfers already name-matches a Separation at one
-//     company with a New Hire at another; when the person left as Rank & File and the record
-//     picked up at the new company is Staff, that pair is folded in here too, since "regardless
-//     of which company they started/moved" is exactly this case: they didn't get promoted and
-//     then transfer, or transfer and then get promoted later — either way it's the same person's
-//     rank moving up somewhere between leaving one affiliate and being found at another.
+//  2) Cross-affiliate promotions where the old record WAS formally separated — detectTransfers
+//     already name-matches a Separation at one company with a New Hire at another; when the
+//     person left as Rank & File and the record picked up at the new company is Staff, that pair
+//     is folded in here too.
+//  3) Regularizations explicitly tagged during a Master List upload's "Promoted from Rank & File"
+//     review (see confirmMasterlistNewHires) — these issue a brand-new Employee ID, so there is
+//     no single record for Source 1 to compare against, but the app already recorded the link
+//     (promotedFromEmployeeId + a promotionHistory entry) at the moment HR confirmed it. That
+//     matched old Rank & File record is deliberately left ACTIVE at the time (see
+//     confirmMasterlistNewHires's own comment), so Source 2 never gets a Separation to pair it
+//     with either — this source reads the link directly instead of re-deriving it.
+//  4) The real-world fallback: someone whose old Rank & File record was simply never separated
+//     at all — it keeps showing up as a perfectly ordinary active Rank & File employee on that
+//     company's own Master List (e.g. RS016819, still "Rank & File" and active, while
+//     PT003020 — same person, matched by Last/First/Middle name — is active as Staff at another
+//     company). Nothing here was separated or explicitly linked, so Sources 1–3 can't see it; the
+//     only way to find it is exactly how HR would by eye when reconciling monthly Master Lists —
+//     name-matching the active Rank & File roster against the active Staff roster.
 function detectStaffPromotions(year, asOfEnd){
   const asOfMs = monthStr(asOfEnd);
   const priorYearEndMs = `${year-1}-12`;
+  const inYear = ms => !!ms && ms.slice(0,4)===String(year) && ms<=asOfMs;
   const rows = [];
+  // Source 1 — same record, statusHistory shows the Rank & File -> Staff move directly.
   EMP.filter(e=> !e.dateSeparated && isOnRosterAsOf(e, asOfEnd)).forEach(e=>{
     const hist = Array.isArray(e.jobGradeHistory) ? e.jobGradeHistory.filter(h=> h.ms<=asOfMs) : [];
     if(hist.length<2) return;
@@ -3479,10 +3541,12 @@ function detectStaffPromotions(year, asOfEnd){
       startPosition: (promoPos && promoPos.fromPosition) || positionAsOf(e, baseline.ms) || e.position || '',
       curPosition: (promoPos && promoPos.toPosition) || positionAsOf(e, current.ms) || e.position || '',
       fromMs: baseline.ms, toMs: current.ms,
-      promotedMs, viaTransfer:false
+      promotedMs, tag:null
     });
   });
   const usedHireKeys = new Set(rows.map(r=> r.emp.employeeId+'|'+r.emp.company));
+
+  // Source 2 — cross-affiliate, old record formally separated (detectTransfers' own name match).
   detectTransfers(year).forEach(t=>{
     const sep = EMP.find(e=> String(e.employeeId)===String(t.fromId) && e.company===t.fromCompany);
     const hire = EMP.find(e=> String(e.employeeId)===String(t.toId) && e.company===t.toCompany);
@@ -3494,9 +3558,80 @@ function detectStaffPromotions(year, asOfEnd){
     rows.push({
       emp:hire, fromCompany:t.fromCompany, toCompany:t.toCompany,
       startPosition: sep.position||'', curPosition: hire.position||'',
-      promotedMs: monthStr(parseDate(t.dateHired)||asOfEnd), viaTransfer:true
+      fromMs:'transfer', toMs: monthStr(parseDate(t.dateHired)||asOfEnd),
+      promotedMs: monthStr(parseDate(t.dateHired)||asOfEnd), tag:'transfer'
     });
   });
+
+  // Sources 3 & 4 — a single combined pass over every still-active Staff record not already
+  // claimed above. Both look for evidence this person was Rank & File before; they're combined
+  // into one pass (rather than run separately) so a person only ever gets ONE dismiss key
+  // regardless of which kind of evidence found them — otherwise dismissing the "regularized"
+  // version of a match wouldn't stop the broader name-match pass from re-adding the exact same
+  // person a moment later under a different key, which would make the Admin's Delete button
+  // unreliable.
+  //  3) Explicit link — the upload's own "Promoted from Rank & File" review (see
+  //     confirmMasterlistNewHires) already recorded promotedFromEmployeeId + a promotionHistory
+  //     entry; this is the most confident evidence, so it's tried first.
+  //  4) Name match fallback — nothing was explicitly linked, but the same person is still sitting
+  //     on an active Rank & File record somewhere (the old record was simply never separated/
+  //     closed out) — found by matching Last + First name against the active Rank & File roster,
+  //     the same way HR would by eye when reconciling monthly Master Lists (same Last+First-only
+  //     matching as the Cross-Affiliate Transfers tab — see normalizeNameKey).
+  const activeRfByName = {};
+  EMP.filter(e=> STATUS_KEY(e.employmentStatus)==='rankfile' && !e.dateSeparated && isOnRosterAsOf(e, asOfEnd))
+    .forEach(e=> { const k=normalizeNameKey(e); (activeRfByName[k]=activeRfByName[k]||[]).push(e); });
+  EMP.filter(e=> STATUS_KEY(e.employmentStatus)==='staff' && !e.dateSeparated && isOnRosterAsOf(e, asOfEnd)).forEach(hire=>{
+    const key = hire.employeeId+'|'+hire.company;
+    if(usedHireKeys.has(key)) return;
+    let rf = null, promo = null, tag = null;
+    if(hire.promotedFromEmployeeId){
+      const linked = EMP.find(e=> String(e.employeeId)===String(hire.promotedFromEmployeeId));
+      if(linked){
+        rf = linked; tag = 'regularized';
+        promo = Array.isArray(hire.promotionHistory)
+          ? hire.promotionHistory.find(h=> h.statusChange && h.fromEmploymentStatus==='Rank & File' && h.toEmploymentStatus==='Staff')
+          : null;
+      }
+    }
+    if(!rf){
+      const matches = activeRfByName[normalizeNameKey(hire)];
+      if(matches && matches.length){
+        // When one Last+First matches more than one active Rank & File record, prefer whichever
+        // hire date sits closest to this Staff record's own Date Hired — same tie-break heuristic
+        // detectTransfers already uses for exactly this kind of ambiguity.
+        const hireDate = parseDate(hire.dateHired) || asOfEnd;
+        rf = [...matches].sort((a,b)=>
+          Math.abs((parseDate(a.dateHired)||asOfEnd)-hireDate) - Math.abs((parseDate(b.dateHired)||asOfEnd)-hireDate)
+        )[0];
+        tag = 'unclosed';
+      }
+    }
+    if(!rf) return; // no evidence anywhere that this Staff hire used to be Rank & File
+    const promotedMs = (promo && promo.ms) || firstOnFileMonth(hire) || monthStr(parseDate(hire.dateHired)||asOfEnd);
+    // "Regularized" (and every other source above) is a one-time dated event, so it's only shown
+    // in the exact year it happened. "Unclosed" is different in kind — it's not a dated event at
+    // all, it's a standing data problem ("this person is STILL double-listed right now"). Gating
+    // it to the one year its earliest on-file trace happens to fall in would hide it from every
+    // later year too — including the current one — for anyone whose duplicate has existed since
+    // before this app started tracking history (exactly what made Borja's case invisible even
+    // after the name-match was fixed: his Rank & File record dates back to 2021). So it's shown
+    // in the selected year AND every year after, for as long as the duplicate remains unresolved.
+    if(tag==='unclosed'){
+      if(promotedMs>asOfMs) return; // hasn't happened yet as of the selected month
+    } else if(!inYear(promotedMs)) return;
+    if(isPromotionDismissed(hire, 'moved', promotedMs)) return;
+    usedHireKeys.add(key);
+    rows.push({
+      emp:hire, fromCompany:rf.company, toCompany:hire.company,
+      startPosition: (promo&&promo.fromPosition) || rf.position || '',
+      curPosition: (promo&&promo.toPosition) || hire.position || '',
+      fromMs:'moved', toMs:promotedMs,
+      promotedMs, tag,
+      staleRfRecord: tag==='unclosed' ? {employeeId:rf.employeeId, company:rf.company} : undefined
+    });
+  });
+
   return rows.sort((a,b)=> (b.promotedMs||'').localeCompare(a.promotedMs||''));
 }
 // Admin-only "delete individually" for a promoted list — rather than an all-or-nothing bulk
@@ -3878,7 +4013,13 @@ function handleRecruitUpload(){
     for(let r=1;r<rows.length;r++){
       const row = rows[r];
       const company = (row[cCompany]||'').trim();
-      const month = (row[cMonth]||'').trim();
+      // Normalize to zero-padded YYYY-MM before using it as the storage key — every lookup
+      // (getRecruitCost, the annual aggregates in getRecruitRecordAnnual) always generates a
+      // zero-padded key, so an unpadded month typed into the CSV by hand (e.g. "2026-9") would
+      // otherwise get stored under a key nothing ever looks up again, silently vanishing from
+      // Cost per Hire, the Recruitment Cost Ratio, and every annual total.
+      const monthRaw = (row[cMonth]||'').trim();
+      const month = normalizeMonthInput(monthRaw) || monthRaw;
       if(!company || !month) continue;
       const rec = {};
       RECRUIT_FIELDS.forEach(([k])=>{ rec[k] = fieldIdx[k]>=0 ? (Number(row[fieldIdx[k]])||0) : 0; });
@@ -4070,12 +4211,15 @@ function separationTable(list){
    system — each affiliate keeps its own Employee ID, so someone who leaves Company A and joins
    Company B simply shows up as an ordinary Separation on one side and an ordinary New Hire on
    the other, quite possibly under a different ID. This section detects likely transfers by
-   matching Last/First/Middle Name (normalized, not ID) between a Separation and a New Hire at a
+   matching Last/First Name (normalized, not ID) between a Separation and a New Hire at a
    DIFFERENT company, both tagged within the same year. It's a name-match heuristic meant for HR
-   to eyeball and counter-check the ID against — not an automatic, certain match. */
+   to eyeball and counter-check the ID against — not an automatic, certain match. Matching is on
+   Last+First only — Middle Name is left out on purpose: it's filled in inconsistently across
+   different companies'/cost centers' Master Lists (spelled out on one, blank or an initial on
+   another), and requiring it to agree would silently miss real matches. */
 function normalizeNameKey(e){
   const norm = s => String(s||'').trim().toLowerCase().replace(/\s+/g,' ');
-  return `${norm(e.lastName)}|${norm(e.firstName)}|${norm(e.middleName)}`;
+  return `${norm(e.lastName)}|${norm(e.firstName)}`;
 }
 function detectTransfers(year){
   const start = new Date(year,0,1), end = new Date(year,11,31,23,59,59);
@@ -4139,20 +4283,27 @@ function renderStaffPromotionsCategory(){
   const asOfEnd = monthBounds(ui.month).end;
   const admin = isAdmin();
   const rows = detectStaffPromotions(year, asOfEnd);
+  const unclosedCount = rows.filter(r=> r.tag==='unclosed').length;
+  const TAG_INFO = {
+    transfer:   {label:'Cross-Affiliate', title:(r)=> `Left ${r.fromCompany} as Rank & File and was matched (by name) to a New Hire at ${r.toCompany} as Staff.`},
+    regularized:{label:'Regularized', title:()=> `Tagged as "Promoted from Rank & File" during Master List upload — a new Employee ID was issued for the Staff record.`},
+    unclosed:   {label:'⚠ Old record still active', title:(r)=> `${r.fromCompany}'s own Master List still lists this person as an active Rank & File employee (Employee ID ${r.staleRfRecord?r.staleRfRecord.employeeId:''}) — matched here by Last/First name to the active Staff record at ${r.toCompany}. That Rank & File record should be closed out (marked separated/transferred) on its next Master List upload.`}
+  };
   const body = rows.length ? `<div class="archive-table-wrap"><table class="simple archive-table">
     <thead><tr><th>Name</th><th>Company</th><th>Started As</th><th></th><th>Promoted To</th><th class="ctr">Effective</th>${admin?'<th></th>':''}</tr></thead>
-    <tbody>${rows.map(r=>`<tr>
-      <td class="namecell">${escapeHtml(r.emp.lastName||'')}, ${escapeHtml(r.emp.firstName||'')} <span style="color:var(--dim2);font-size:11px;">(${escapeHtml(String(r.emp.employeeId))})</span>${r.viaTransfer?` <span class="pill staff" style="font-size:10px;" title="Left ${escapeHtml(r.fromCompany)} as Rank & File and was matched (by name) to a New Hire at ${escapeHtml(r.toCompany)} as Staff.">Cross-Affiliate</span>`:''}</td>
+    <tbody>${rows.map(r=>{ const info = r.tag && TAG_INFO[r.tag]; return `<tr>
+      <td class="namecell">${escapeHtml(r.emp.lastName||'')}, ${escapeHtml(r.emp.firstName||'')} <span style="color:var(--dim2);font-size:11px;">(${escapeHtml(String(r.emp.employeeId))})</span>${info?` <span class="pill ${r.tag==='unclosed'?'':'staff'}" style="font-size:10px;${r.tag==='unclosed'?'background:rgba(194,59,65,.14);color:var(--red);':''}" title="${escapeHtml(info.title(r))}">${info.label}</span>`:''}</td>
       <td>${r.fromCompany===r.toCompany ? escapeHtml(r.fromCompany) : `${escapeHtml(r.fromCompany)} <span style="color:var(--dim2);">→</span> ${escapeHtml(r.toCompany)}`}</td>
       <td>${escapeHtml(r.startPosition||'—')} <span class="pill" style="font-size:10px;">Rank &amp; File</span></td>
       <td style="text-align:center;color:var(--dim2);">→</td>
       <td>${escapeHtml(r.curPosition||'—')} <span class="pill staff" style="font-size:10px;">Staff</span></td>
-      <td class="ctr">${monthLabel(r.promotedMs)}</td>
-      ${admin?`<td>${r.viaTransfer?'':`<button class="btn small danger" onclick="openDismissPromotionModal('${r.emp.employeeId}','${r.fromMs}','${r.toMs}')">Delete</button>`}</td>`:''}
-    </tr>`).join('')}</tbody>
+      <td class="ctr">${r.tag==='unclosed' ? `Since ${monthLabel(r.promotedMs)}` : monthLabel(r.promotedMs)}</td>
+      ${admin?`<td><button class="btn small danger" onclick="openDismissPromotionModal('${r.emp.employeeId}','${r.fromMs}','${r.toMs}')">Delete</button></td>`:''}
+    </tr>`;}).join('')}</tbody>
   </table></div>` : '<div class="empty">No Rank &amp; File → Staff promotions detected for this year.</div>';
   return `
-  <p class="hint" style="margin:0 0 10px;max-width:640px;">Every employee who moved from <b>Rank &amp; File</b> to <b>Staff</b> within <b>${year}</b>, across <b>every company</b> — whether the promotion happened on their existing record, or they left one affiliate as Rank &amp; File and were picked up at another (matched by name, same as the Transfers tab) already at or later promoted to Staff.</p>
+  <p class="hint" style="margin:0 0 10px;max-width:640px;">Every employee who moved from <b>Rank &amp; File</b> to <b>Staff</b> within <b>${year}</b>, across <b>every company</b> — whether the promotion happened on their existing record, they left one affiliate as Rank &amp; File and were picked up at another already promoted to Staff, they were regularized under a new Employee ID during a Master List upload, or (flagged below) their old Rank &amp; File record simply hasn't been closed out yet and was found by matching Last/First name against the active Staff roster. That last kind isn't a dated event — it's an ongoing data problem, so it keeps showing up in every year from when it was first noticed through today, however far back that started, until the old record is closed out.</p>
+  ${unclosedCount ? `<p class="hint" style="color:var(--red);">⚠ ${unclosedCount} of these still have an active Rank &amp; File record on file at their old company — see the flagged rows below. Close those out on that company's next Master List upload so headcount there isn't overstated.</p>` : ''}
   <h2 class="section">Rank &amp; File → Staff Promotions <span class="n">${year} · ${rows.length} found</span></h2>
   ${body}
   <p class="hint">Change the Year at the top of the page to view a different year.</p>
