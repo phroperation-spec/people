@@ -526,6 +526,20 @@ const FIREBASE_SYNC_PATH = 'pgbEmployeeDemographics'; // node in the Realtime Da
 let _fbRef = null;
 let _lastKnownUpdatedAt = 0; // used to ignore the echo of our own writes coming back through the live listener
 
+// ---- 3-way merge base ------------------------------------------------------
+// The last {config, employees, recruitment} snapshot this device and the server are BOTH known to
+// have agreed on -- i.e. the state right after our last successful pull/live-update, or right after
+// our own last successful push (a push's own merged result becomes the new agreed point). This is
+// the "base" pushToCloud's 3-way merge (see mergeSyncState below) diffs against to tell "what did I
+// actually change" apart from "what was already like that before I started editing" -- which is
+// exactly the information the old blind `_fbRef.set(payload)` never had, and why two teammates
+// uploading Master Lists for two different companies around the same time could silently erase
+// each other's upload: whichever push landed second overwrote the ENTIRE shared node with its own
+// (already out of date) local copy, wiping out anything the other device had just added. Kept as a
+// deep clone so later local edits to CONFIG/EMP/RECRUIT can never retroactively change it.
+let _lastSyncedSnapshot = null;
+function snapshotSyncState(){ return JSON.parse(JSON.stringify({config:CONFIG, employees:EMP, recruitment:RECRUIT})); }
+
 // ---- Local-edit guard --------------------------------------------------
 // Same reasoning as the KPI tool: edits update CONFIG/EMP/RECRUIT locally first
 // and only reach the cloud ~900ms later (see schedulePush). Meanwhile the
@@ -669,6 +683,93 @@ function fbRestoreKeys(node){
   return node;
 }
 
+// ---- 3-way merge (see _lastSyncedSnapshot above for why this exists) ------------------------
+function deepEqualJSON(a,b){
+  if(a===b) return true;
+  if(a==null || b==null) return a===b;
+  if(typeof a!==typeof b) return false;
+  if(Array.isArray(a) !== Array.isArray(b)) return false;
+  if(typeof a==='object'){
+    const ak=Object.keys(a), bk=Object.keys(b);
+    if(ak.length!==bk.length) return false;
+    return ak.every(k=> Object.prototype.hasOwnProperty.call(b,k) && deepEqualJSON(a[k], b[k]));
+  }
+  return false;
+}
+function isPlainObj(v){ return !!v && typeof v==='object' && !Array.isArray(v); }
+// Generic 3-way merge for plain JSON values (objects/arrays/primitives) that don't need
+// identity-aware merging — used for CONFIG and RECRUIT. `base` is what both sides last agreed on;
+// `mine` is this device's current value; `theirs` is whatever the server has right now. A field
+// neither side touched since `base` passes through untouched; a field only one side touched keeps
+// that side's change; a genuine same-field conflict (both sides changed it, differently) recurses
+// into plain objects so unrelated sibling keys still merge correctly, and otherwise falls back to
+// "ours wins" — identical to the old behavior, just scoped to the one conflicting field instead of
+// the entire shared document.
+function threeWayMergeGeneric(base, mine, theirs){
+  if(mine===undefined && theirs===undefined) return undefined;
+  if(mine===undefined) return deepEqualJSON(theirs, base) ? undefined : theirs;
+  if(theirs===undefined) return deepEqualJSON(mine, base) ? undefined : mine;
+  if(deepEqualJSON(mine, theirs)) return theirs;
+  if(deepEqualJSON(mine, base)) return theirs;
+  if(deepEqualJSON(theirs, base)) return mine;
+  if(isPlainObj(mine) && isPlainObj(theirs)){
+    const b = isPlainObj(base) ? base : {};
+    const keys = new Set([...Object.keys(b), ...Object.keys(mine), ...Object.keys(theirs)]);
+    const out = {};
+    keys.forEach(k=>{
+      const v = threeWayMergeGeneric(b[k], mine[k], theirs[k]);
+      if(v!==undefined) out[k]=v;
+    });
+    return out;
+  }
+  return mine;
+}
+function byEmpId(arr){ const m=new Map(); (arr||[]).forEach(e=> m.set(String(e.employeeId), e)); return m; }
+// Identity-based (by Employee ID) 3-way merge for the EMPLOYEES roster specifically — this is the
+// one that actually matters for "teammates uploading Master Lists on their own devices at the same
+// time": two devices adding/updating DIFFERENT employees (different companies, different rows) no
+// longer stomp on each other just because both happened to save around the same moment.
+function mergeEmployeeArrays(base, mine, theirs){
+  base = base||[]; mine = mine||[]; theirs = theirs||[];
+  const baseM=byEmpId(base), mineM=byEmpId(mine), theirsM=byEmpId(theirs);
+  const order = []; const seen = new Set();
+  [theirs, mine, base].forEach(arr=> arr.forEach(e=>{ const id=String(e.employeeId); if(!seen.has(id)){ seen.add(id); order.push(id); } }));
+  const out=[];
+  order.forEach(id=>{
+    const b=baseM.get(id), m=mineM.get(id), t=theirsM.get(id);
+    if(m===undefined && t===undefined) return; // gone on both sides
+    if(m===undefined){ // we don't have this record (never did, or deleted it locally)
+      if(b===undefined){ out.push(t); return; } // brand new from them — keep it
+      if(deepEqualJSON(t,b)) return; // they didn't touch it either — honor our deletion
+      out.push(t); // they changed it since base — a real edit beats a stale local delete
+      return;
+    }
+    if(t===undefined){ // server doesn't have this record (new-from-us, or they deleted it)
+      if(b===undefined){ out.push(m); return; }
+      if(deepEqualJSON(m,b)) return; // we didn't touch it — honor their deletion
+      out.push(m); // we changed it since base — keep our edit rather than let their deletion win
+      return;
+    }
+    out.push(threeWayMergeGeneric(b, m, t));
+  });
+  return out;
+}
+// Combines this device's local state (`mine`) with whatever's currently on the server (`theirs`,
+// read fresh inside the Firebase transaction in pushToCloud) using `base` — the last point both
+// were known to agree on — to tell apart "I changed this" from "this was already like that". With
+// no known base yet (this device has never completed a sync), there's nothing to diff against, so
+// this degrades to the old plain-overwrite-with-mine behavior, which is the correct/harmless
+// fallback for that case (nothing to conflict with).
+function mergeSyncState(base, mine, theirs){
+  if(!base) base = mine;
+  if(!theirs) theirs = mine;
+  return {
+    config: threeWayMergeGeneric(base.config, mine.config, theirs.config) || {},
+    employees: mergeEmployeeArrays(base.employees, mine.employees, theirs.employees),
+    recruitment: threeWayMergeGeneric(base.recruitment, mine.recruitment, theirs.recruitment) || {}
+  };
+}
+
 // Shared by the one-time pull and the live listener below.
 function applyRemoteData(data){
   if (hasUnsyncedLocalChanges()) return false; // don't clobber an edit that's still on its way up
@@ -690,6 +791,9 @@ function applyRemoteData(data){
     changed = true;
   }
   if (data && data.updatedAt){ _lastKnownUpdatedAt = data.updatedAt; }
+  // This snapshot is now a point both this device and the server are known to agree on — the base
+  // the next push's 3-way merge (mergeSyncState) diffs against.
+  if (changed) _lastSyncedSnapshot = snapshotSyncState();
   if (changed && ready) render();
   return changed;
 }
@@ -708,6 +812,7 @@ async function pullFromCloud(){
       updateSyncBadge('synced', stamp);
     }else{
       // Nothing in the cloud yet (first-ever run) — seed it from whatever's local/default.
+      _lastSyncedSnapshot = null;
       updateSyncBadge('synced');
       pushToCloud();
     }
@@ -717,24 +822,50 @@ async function pullFromCloud(){
   }
 }
 
+// Pushes local edits to the cloud via a Firebase transaction rather than a blind `set()`: the
+// transaction hands us whatever is CURRENTLY on the server (which already includes any other
+// device's write that landed since our last sync, however recent), and mergeSyncState combines
+// that with our own local changes rather than replacing it outright. This is what actually fixes
+// concurrent Master List uploads from different devices "not syncing" — previously, whichever push
+// landed second (see the long comment above _lastSyncedSnapshot) silently wiped out the other
+// upload with its own stale local copy of the whole shared dataset. Firebase automatically re-runs
+// the update function if another write races with this one, so a losing attempt simply re-merges
+// against the newer data rather than failing.
 async function pushToCloud(){
   if (!firebaseReady()) return;
   await ensureFirebaseAuth();
   updateSyncBadge('syncing');
+  const seqAtPush = _localChangeSeq;
+  const base = _lastSyncedSnapshot;
+  let merged = null;
   try{
-    const payload = {
-      config: CONFIG,
-      employees: EMP,
-      recruitment: RECRUIT,
-      updatedAt: Date.now()
-    };
-    const seqAtPush = _localChangeSeq;
-    _lastKnownUpdatedAt = payload.updatedAt; // set before the write so our own echo is recognized and skipped
-    await _fbRef.set(fbSanitizeKeys(payload));
+    const result = await _fbRef.transaction(current => {
+      const mine = { config: CONFIG, employees: EMP, recruitment: RECRUIT };
+      const theirsRaw = current ? fbRestoreKeys(current) : null;
+      const theirs = theirsRaw
+        ? { config: sanitizeConfig(theirsRaw.config), employees: Array.isArray(theirsRaw.employees)?theirsRaw.employees:[], recruitment: theirsRaw.recruitment||{} }
+        : null;
+      merged = mergeSyncState(base, mine, theirs);
+      return fbSanitizeKeys({ config: merged.config, employees: merged.employees, recruitment: merged.recruitment, updatedAt: Date.now() });
+    }, undefined, false);
+    if (!result || !result.committed || !merged) throw new Error('transaction did not commit');
+    const committedVal = fbRestoreKeys(result.snapshot.val());
+    // Adopt the actually-committed (merged) result locally too, so this device immediately picks
+    // up whatever any other device contributed in the same round, instead of waiting for the next
+    // live-listener tick.
+    CONFIG = sanitizeConfig(committedVal.config);
+    EMP = Array.isArray(committedVal.employees) ? committedVal.employees : [];
+    RECRUIT = committedVal.recruitment || {};
+    try{ localStorage.setItem(LS_PREFIX+'config', JSON.stringify(CONFIG)); }catch(e){}
+    try{ localStorage.setItem(LS_PREFIX+'employees', JSON.stringify(EMP)); }catch(e){}
+    try{ localStorage.setItem(LS_PREFIX+'recruitment', JSON.stringify(RECRUIT)); }catch(e){}
+    _lastKnownUpdatedAt = committedVal.updatedAt;
+    _lastSyncedSnapshot = snapshotSyncState();
     _syncedChangeSeq = seqAtPush;
     _pushRetryDelay = 5000;
     clearTimeout(_pushRetryTimer);
-    updateSyncBadge('synced', new Date(payload.updatedAt).toLocaleTimeString());
+    updateSyncBadge('synced', new Date(committedVal.updatedAt).toLocaleTimeString());
+    if (ready) render();
   }catch(err){
     console.warn('Cloud sync (push) failed:', err);
     updateSyncBadge('offline');
