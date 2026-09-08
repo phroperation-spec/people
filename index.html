@@ -679,8 +679,18 @@ function fbSanitizeKeys(node){
   if (node && typeof node === 'object'){
     const out = {};
     Object.keys(node).forEach(k=>{
+      const v = node[k];
+      // A literal `undefined` value anywhere in the payload (as opposed to a key that's simply
+      // missing) makes Firebase reject the ENTIRE write with "Data returned contains undefined in
+      // property ..." — not just that one field, the whole save, for every device, until whatever
+      // produced it is gone from memory. That's exactly what promotedFromEmployeeId did (see the
+      // comment where it's set in confirmMasterlistNewHires) before it was fixed to use '' instead.
+      // Dropping the key here — same as JSON.stringify already does for undefined values — is a
+      // safety net so a future field with the same mistake degrades to "that one field didn't
+      // save" instead of "nobody's Master List uploads sync anymore".
+      if (v === undefined) return;
       const safeKey = k.replace(FB_KEY_UNSAFE_RE, c => FB_KEY_ESCAPES[c]);
-      out[safeKey] = fbSanitizeKeys(node[k]);
+      out[safeKey] = fbSanitizeKeys(v);
     });
     return out;
   }
@@ -6274,7 +6284,15 @@ async function confirmMasterlistNewHires(){
       // leaves every earlier month's headcount untouched.
       rosterSpans:[{start:asOfMonth, end:''}],
       dateSeparated:'', separationReason:'', separationRemarks:'',
-      promotedFromEmployeeId: isPromoted ? row.rfMatchEmployeeId : undefined
+      // Was `: undefined` for the "not promoted" case — an explicit `undefined` property (not just
+      // a missing key) on a plain object literal, unlike an omitted key, survives in memory and
+      // reaches the Firebase write as-is. Firebase's SDK rejects any write containing a literal
+      // `undefined` ANYWHERE in the payload with "Data returned contains undefined in property
+      // ...", and aborts the ENTIRE save — not just this one record. Once a single employee record
+      // like this existed in the shared roster, EVERY subsequent save, from every device, failed
+      // with that same error for as long as that record stayed in memory — this is the actual
+      // "Master List uploads don't sync" bug, not just the concurrent-overwrite race fixed above.
+      promotedFromEmployeeId: isPromoted ? row.rfMatchEmployeeId : ''
     });
     const newEmp = P.working[P.working.length-1];
     recordJobGradeSnapshot(newEmp, asOfMonth, row.jobGrade);
