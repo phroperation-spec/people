@@ -2302,6 +2302,7 @@ const NAV_ITEMS = [
   ['transfers','Movements','Cross-affiliate transfers, and Rank &amp; File → Staff promotions org-wide'],
   ['appraisal','Bound for Performance Appraisal','Staff new hires approaching their 3rd, 6th and 9th month evaluation'],
   ['coe','Certificate of Employment','Generate and print a Certificate of Employment — editable per company'],
+  ['masterlist','PGB Masterlist ↗','Open the PGB Employee Masterlist (HR Information System) in a new tab', 'https://pgb-masterlist.vercel.app/'],
   ['data','Data Management','Upload the master file, add hires, mark separations'],
   ['settings','Control Panel','Industries, companies, groupings and access']
 ];
@@ -2395,7 +2396,8 @@ function sidebar(){
   const unmapped = unmappedCostCenters();
   const dueAppraisals = pendingAppraisals().length;
   const EXEC_ALLOWED_TABS = ['overview','company','forecastreport'];
-  const navItems = NAV_ITEMS.filter(([k])=>{
+  const navItems = NAV_ITEMS.filter(([k,,,href])=>{
+    if(href) return true; // external links are visible to every role
     if(k==='settings') return isAdmin();
     if(ui.role==='Executive') return EXEC_ALLOWED_TABS.includes(k);
     return true;
@@ -2407,10 +2409,11 @@ function sidebar(){
       <h1>Employee Demographics</h1>
     </div>
     <nav>
-      ${navItems.map(([k,l])=>{
+      ${navItems.map(([k,l,,href])=>{
         let badge = '';
         if(k==='settings' && unmapped) badge = `<span style="margin-left:auto;background:var(--red);color:#fff;border-radius:10px;padding:1px 7px;font-size:10.5px;font-family:var(--mono);">${unmapped}</span>`;
         if(k==='appraisal' && dueAppraisals) badge = `<span style="margin-left:auto;background:var(--gold);color:#fff;border-radius:10px;padding:1px 7px;font-size:10.5px;font-family:var(--mono);">${dueAppraisals}</span>`;
+        if(href) return `<a class="navitem" href="${href}" target="_blank" rel="noopener noreferrer" style="text-decoration:none;color:inherit;"><span class="dot"></span>${l}${badge}</a>`;
         return `<div class="navitem ${ui.tab===k?'active':''}" onclick="ui.tab='${k}'; render();"><span class="dot"></span>${l}${badge}</div>`;
       }).join('')}
     </nav>
