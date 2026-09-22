@@ -2303,6 +2303,7 @@ const NAV_ITEMS = [
   ['appraisal','Bound for Performance Appraisal','Staff new hires approaching their 3rd, 6th and 9th month evaluation'],
   ['coe','Certificate of Employment','Generate and print a Certificate of Employment — editable per company'],
   ['masterlist','PGB Masterlist ↗','Open the PGB Employee Masterlist (HR Information System) in a new tab', 'https://pgb-masterlist.vercel.app/'],
+  ['ats','ATS','PGB Careers Applicant Tracking System — Job Portal, PRF, and Interview Grid links'],
   ['data','Data Management','Upload the master file, add hires, mark separations'],
   ['settings','Control Panel','Industries, companies, groupings and access']
 ];
@@ -2366,13 +2367,13 @@ function render(){
   // Task: Executives lost Transfers (removed from this list below) — Company Detail stays
   // allowed since that's where their Export access lives now (see companySubview's 'export'
   // branch and renderCompany's Export sub-tab, both gated on canViewCompanyExport()).
-  const EXEC_ALLOWED_TABS = ['overview','company','forecastreport'];
+  const EXEC_ALLOWED_TABS = ['overview','company','forecastreport','ats'];
   try{
     if(ui.tab==='settings' && !isAdmin()){
       body.innerHTML = '<div class="empty">The Control Panel is restricted to Admin users. Switch your role to Admin (bottom-left) if that\'s you, or ask your Admin for this change.</div>';
     }
     else if(ui.role==='Executive' && !EXEC_ALLOWED_TABS.includes(ui.tab)){
-      body.innerHTML = '<div class="empty">Executives can only access Trend &amp; Insight, Company Detail, and Executive Report. Switch your role (bottom-left) if that\'s not right, or ask HR/Admin for these other views.</div>';
+      body.innerHTML = '<div class="empty">Executives can only access Trend &amp; Insight, Company Detail, Executive Report, and ATS. Switch your role (bottom-left) if that\'s not right, or ask HR/Admin for these other views.</div>';
     }
     else if(ui.tab==='overview') body.innerHTML = renderOverview();
     else if(ui.tab==='company') body.innerHTML = renderCompany();
@@ -2384,6 +2385,7 @@ function render(){
     else if(ui.tab==='appraisal') body.innerHTML = renderAppraisal();
     else if(ui.tab==='coe') body.innerHTML = renderCOE();
     else if(ui.tab==='prf') body.innerHTML = renderPRF();
+    else if(ui.tab==='ats') body.innerHTML = renderATS();
     else if(ui.tab==='settings') body.innerHTML = renderSettings();
   }catch(err){
     console.error(err);
@@ -2395,7 +2397,7 @@ function render(){
 function sidebar(){
   const unmapped = unmappedCostCenters();
   const dueAppraisals = pendingAppraisals().length;
-  const EXEC_ALLOWED_TABS = ['overview','company','forecastreport'];
+  const EXEC_ALLOWED_TABS = ['overview','company','forecastreport','ats'];
   const navItems = NAV_ITEMS.filter(([k,,,href])=>{
     if(href) return true; // external links are visible to every role
     if(k==='settings') return isAdmin();
@@ -2433,12 +2435,12 @@ function sidebar(){
 function topbar(){
   const current = NAV_ITEMS.find(n=>n[0]===ui.tab);
   const [curYear, curMonthNum] = ui.month.split('-').map(Number);
-  const monthIrrelevant = ui.tab==='overview' || (ui.tab==='company' && ui.companyPeriod!=='monthly') || ui.tab==='archive' || ui.tab==='appraisal' || ui.tab==='coe' || (ui.tab==='forecastreport' && ui.reportPeriod!=='monthly');
+  const monthIrrelevant = ui.tab==='overview' || (ui.tab==='company' && ui.companyPeriod!=='monthly') || ui.tab==='archive' || ui.tab==='appraisal' || ui.tab==='coe' || ui.tab==='ats' || (ui.tab==='forecastreport' && ui.reportPeriod!=='monthly');
   const monthOffTitle = ui.tab==='overview'
     ? "Month isn't used here — Trend & Insight shows accumulated/annual data for the Year selected above."
     : (ui.tab==='appraisal'
     ? "Month isn't used here — evaluation due dates are tracked against today's date."
-    : (ui.tab==='coe' ? "Month isn't used here — the certificate uses its own Issued Date field." : (ui.tab==='forecastreport' ? "Month isn't used here — the Executive Report is showing the Annual period (Year picker up top still applies)." : "Month isn't used here — the Archive is browsed by year, showing all 12 months at once.")));
+    : (ui.tab==='coe' ? "Month isn't used here — the certificate uses its own Issued Date field." : (ui.tab==='ats' ? "Month isn't used here — ATS is just a set of quick links out to the external Careers platform." : (ui.tab==='forecastreport' ? "Month isn't used here — the Executive Report is showing the Annual period (Year picker up top still applies)." : "Month isn't used here — the Archive is browsed by year, showing all 12 months at once."))));
 
   return `
   <div class="topbar${ui.tab==='coe' ? ' coe-topbar' : ''}">
@@ -5995,6 +5997,47 @@ function renderExecReport(){
   </div>
 
   <p class="hint exec-noprint">This report is generated live from the current data on file and reflects the same figures shown elsewhere in this system (Trend &amp; Insight, Company Detail, Control Panel). Use <b>Print / Save PDF</b> above for a board-ready copy.</p>
+  `;
+}
+
+/* ============ ATS (PGB CAREERS) ============
+   Not a page of data pulled from this system — just a set of quick links out to the external
+   PGB Careers Applicant Tracking System, so HR (and Admin/Executive) don't have to keep the URLs
+   bookmarked separately. Each card opens its own part of the ATS in a new tab; nothing here reads
+   or writes anything in this app. */
+const ATS_LINKS = [
+  {
+    title: 'Job Portal',
+    desc: 'The public-facing careers site where applicants browse open positions and apply.',
+    url: 'https://pgb-careers.homebrew.com.ph/jobs'
+  },
+  {
+    title: 'PRF',
+    desc: 'Submit and track Personnel Requisition Forms directly in the ATS.',
+    url: 'https://pgb-careers.homebrew.com.ph/forms/recruitment'
+  },
+  {
+    title: 'Requestor/Approvers Interview Grid',
+    desc: 'Interview scheduling and feedback grid for requestors and approvers.',
+    url: 'https://pgb-careers.homebrew.com.ph/forms/interview'
+  },
+  {
+    title: "Recruiter's Portal",
+    desc: 'The recruiter-facing side of the ATS — manage applicants and requisitions end to end.',
+    url: 'https://pgb-careers.homebrew.com.ph/odoo'
+  }
+];
+function renderATS(){
+  return `
+  <p class="hint" style="margin:0 0 16px;">Quick links into the PGB Careers Applicant Tracking System — each opens in a new tab. Nothing on this page is data from this app; it's just a shortcut so you don't have to keep these URLs bookmarked elsewhere.</p>
+  <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;">
+    ${ATS_LINKS.map(l=>`
+    <div class="panel">
+      <div class="panel-head"><h3>${l.title}</h3></div>
+      <p class="hint" style="margin:0 0 14px;min-height:36px;">${l.desc}</p>
+      <a class="btn primary" href="${l.url}" target="_blank" rel="noopener noreferrer" style="text-decoration:none;display:inline-block;">Open ↗</a>
+    </div>`).join('')}
+  </div>
   `;
 }
 
