@@ -630,7 +630,7 @@ function updateSyncBadge(status, extra, errDetail){
 function schedulePush(){
   if (!firebaseReady()) return;
   clearTimeout(_pushTimer);
-  _pushTimer = setTimeout(pushToCloud, 900);
+  _pushTimer = setTimeout(pushToCloud, 400);
 }
 
 // ---- Push retry ----------------------------------------------------------
@@ -830,7 +830,7 @@ async function pullFromCloud(){
   updateSyncBadge('syncing');
   try{
     const snap = await _fbRef.once('value');
-    if (hasUnsyncedLocalChanges()) return; // a local edit landed while this pull was in flight
+    if (hasUnsyncedLocalChanges()){ _remoteSkipped = true; return; } // a local edit landed while this pull was in flight
     const data = snap.val();
     if (data){
       applyRemoteData(data);
@@ -857,45 +857,154 @@ async function pullFromCloud(){
 // upload with its own stale local copy of the whole shared dataset. Firebase automatically re-runs
 // the update function if another write races with this one, so a losing attempt simply re-merges
 // against the newer data rather than failing.
-async function pushToCloud(){
-  if (!firebaseReady()) return;
-  await ensureFirebaseAuth();
-  updateSyncBadge('syncing');
-  const seqAtPush = _localChangeSeq;
+// ---- Faster sync (delta writes) -------------------------------------------------------------
+// The full-merge push below (fullPushToCloud) runs a transaction on the WHOLE shared node — and a
+// Firebase transaction always re-uploads the entire value it returns, so every single edit (one
+// cost center, one employee's gender) re-sent the complete dataset: every employee with all their
+// job-grade / status / position history, plus all config and recruitment data. As the roster grew
+// that's what made each save take longer and longer to go through, and made other devices lag.
+// fastPushToCloud sends ONLY what changed since the last agreed snapshot (_lastSyncedSnapshot):
+//   • each edited employee record goes up through its own tiny transaction on employees/<index>,
+//     which first confirms that slot still holds the SAME Employee ID (so it can never land on the
+//     wrong person if another device added/removed someone at the same moment) and 3-way merges
+//     with whatever is on the server for that one person;
+//   • changed Config / Recruitment fields go up as a single multi-path update of just those paths;
+//   • updatedAt is written last, so other devices only pick the change up once all of it is there.
+// Anything structural — employees added or removed (Master List uploads, New Hires, deletes), a
+// very large batch of edited employees, no agreed snapshot yet, or any slot that no longer matches
+// — falls back to the original whole-node merge transaction, so nothing about the concurrency
+// protection is lost; the common everyday edit just no longer pays for the whole dataset.
+const FAST_PUSH_MAX_EMP = 50;
+let _pushInFlight = false, _pushQueued = false;
+let _remoteSkipped = false; // a remote change arrived while we had unsynced edits — adopt it after our push
+function fbSafeKey(k){
+  if (k === '') throw new Error('empty key');
+  return String(k).replace(FB_KEY_UNSAFE_RE, c => FB_KEY_ESCAPES[c]);
+}
+// Arrays are treated as single values (same as threeWayMergeGeneric) — only plain objects recurse.
+function collectDiffPaths(b, m, path, out){
+  if (deepEqualJSON(b, m)) return;
+  if (isPlainObj(b) && isPlainObj(m)){
+    new Set([...Object.keys(b), ...Object.keys(m)]).forEach(k=> collectDiffPaths(b[k], m[k], path+'/'+fbSafeKey(k), out));
+    return;
+  }
+  out[path] = (m === undefined) ? null : fbSanitizeKeys(m);
+}
+// Brings local state in line with what's now on the server after a push. If more local edits were
+// made while the push was in flight, they're rebased on top (3-way: what we pushed → what the
+// server has now → what we have now) instead of being overwritten, then go out on the next push.
+function adoptCommitted(mineAtPush, committed, seqAtPush){
+  const cs = {
+    config: sanitizeConfig(committed.config),
+    employees: Array.isArray(committed.employees) ? committed.employees : [],
+    recruitment: committed.recruitment || {}
+  };
+  const next = (_localChangeSeq === seqAtPush) ? cs : mergeSyncState(mineAtPush, {config:CONFIG, employees:EMP, recruitment:RECRUIT}, cs);
+  CONFIG = sanitizeConfig(next.config);
+  EMP = next.employees || [];
+  RECRUIT = next.recruitment || {};
+  try{ localStorage.setItem(LS_PREFIX+'config', JSON.stringify(CONFIG)); }catch(e){}
+  try{ localStorage.setItem(LS_PREFIX+'employees', JSON.stringify(EMP)); }catch(e){}
+  try{ localStorage.setItem(LS_PREFIX+'recruitment', JSON.stringify(RECRUIT)); }catch(e){}
+  if (committed.updatedAt) _lastKnownUpdatedAt = committed.updatedAt;
+  _lastSyncedSnapshot = JSON.parse(JSON.stringify(cs));
+  _remoteSkipped = false;
+  if (ready) render();
+}
+// Returns true if the change went up as a delta; false means "use the full merge instead".
+async function fastPushToCloud(seqAtPush, mine){
+  const base = _lastSyncedSnapshot;
+  if (!base) return false;
+  const be = base.employees || [], me = mine.employees || [];
+  if (be.length !== me.length) return false; // someone added/removed — structural, use full merge
+  const changedIdx = [];
+  for (let i=0; i<me.length; i++){
+    if (!be[i] || !me[i] || String(be[i].employeeId) !== String(me[i].employeeId)) return false;
+    if (!deepEqualJSON(be[i], me[i])){
+      changedIdx.push(i);
+      if (changedIdx.length > FAST_PUSH_MAX_EMP) return false; // big batch — one full write is cheaper
+    }
+  }
+  const paths = {};
+  collectDiffPaths(base.config, mine.config, 'config', paths);
+  collectDiffPaths(base.recruitment, mine.recruitment, 'recruitment', paths);
+
+  let serverDiffers = false;
+  const empRef = _fbRef.child('employees');
+  const results = await Promise.all(changedIdx.map(i=> empRef.child(String(i)).transaction(cur=>{
+    if (cur == null) return; // unknown / gone — abort, full merge will handle it
+    const t = fbRestoreKeys(cur);
+    if (String(t.employeeId) !== String(me[i].employeeId)) return; // slot now holds someone else — abort
+    return fbSanitizeKeys(threeWayMergeGeneric(be[i], me[i], t));
+  }, undefined, false)));
+  for (let k=0; k<results.length; k++){
+    const r = results[k];
+    if (!r || !r.committed) return false; // records already written are fine — the full merge re-merges them
+    if (!deepEqualJSON(fbRestoreKeys(r.snapshot.val()), me[changedIdx[k]])) serverDiffers = true;
+  }
+
+  const stamp = Date.now();
+  paths['updatedAt'] = stamp;
+  _lastKnownUpdatedAt = stamp; // so our own echo through the live listener is ignored
+  await _fbRef.update(paths);
+
+  if (serverDiffers || _remoteSkipped){
+    // Another device changed something in the meantime — pull the now-combined result from the
+    // local Firebase cache (kept current by the live listener, so no extra download) and adopt it.
+    const snap = await _fbRef.once('value');
+    const committed = fbRestoreKeys(snap.val() || {});
+    committed.updatedAt = committed.updatedAt || stamp;
+    adoptCommitted(mine, committed, seqAtPush);
+  }else{
+    _lastSyncedSnapshot = mine; // already a private deep clone taken at push start
+  }
+  return true;
+}
+// Original whole-node 3-way merge, used for structural changes and as the safe fallback. It hands
+// us whatever is CURRENTLY on the server (including any other device's write that landed since our
+// last sync), and mergeSyncState combines that with our own changes rather than replacing it.
+// Firebase re-runs the update function automatically if another write races with this one.
+async function fullPushToCloud(seqAtPush, mine){
   const base = _lastSyncedSnapshot;
   let merged = null;
+  const result = await _fbRef.transaction(current => {
+    const theirsRaw = current ? fbRestoreKeys(current) : null;
+    const theirs = theirsRaw
+      ? { config: sanitizeConfig(theirsRaw.config), employees: Array.isArray(theirsRaw.employees)?theirsRaw.employees:[], recruitment: theirsRaw.recruitment||{} }
+      : null;
+    merged = mergeSyncState(base, mine, theirs);
+    return fbSanitizeKeys({ config: merged.config, employees: merged.employees, recruitment: merged.recruitment, updatedAt: Date.now() });
+  }, undefined, false);
+  if (!result || !result.committed || !merged) throw new Error('transaction did not commit');
+  adoptCommitted(mine, fbRestoreKeys(result.snapshot.val()), seqAtPush);
+}
+async function pushToCloud(){
+  if (!firebaseReady()) return;
+  // One push at a time: an edit made while a push is in flight is queued and goes out right after,
+  // diffed against the result of this one (overlapping pushes used to race each other).
+  if (_pushInFlight){ _pushQueued = true; return; }
+  _pushInFlight = true;
   try{
-    const result = await _fbRef.transaction(current => {
-      const mine = { config: CONFIG, employees: EMP, recruitment: RECRUIT };
-      const theirsRaw = current ? fbRestoreKeys(current) : null;
-      const theirs = theirsRaw
-        ? { config: sanitizeConfig(theirsRaw.config), employees: Array.isArray(theirsRaw.employees)?theirsRaw.employees:[], recruitment: theirsRaw.recruitment||{} }
-        : null;
-      merged = mergeSyncState(base, mine, theirs);
-      return fbSanitizeKeys({ config: merged.config, employees: merged.employees, recruitment: merged.recruitment, updatedAt: Date.now() });
-    }, undefined, false);
-    if (!result || !result.committed || !merged) throw new Error('transaction did not commit');
-    const committedVal = fbRestoreKeys(result.snapshot.val());
-    // Adopt the actually-committed (merged) result locally too, so this device immediately picks
-    // up whatever any other device contributed in the same round, instead of waiting for the next
-    // live-listener tick.
-    CONFIG = sanitizeConfig(committedVal.config);
-    EMP = Array.isArray(committedVal.employees) ? committedVal.employees : [];
-    RECRUIT = committedVal.recruitment || {};
-    try{ localStorage.setItem(LS_PREFIX+'config', JSON.stringify(CONFIG)); }catch(e){}
-    try{ localStorage.setItem(LS_PREFIX+'employees', JSON.stringify(EMP)); }catch(e){}
-    try{ localStorage.setItem(LS_PREFIX+'recruitment', JSON.stringify(RECRUIT)); }catch(e){}
-    _lastKnownUpdatedAt = committedVal.updatedAt;
-    _lastSyncedSnapshot = snapshotSyncState();
+    await ensureFirebaseAuth();
+    updateSyncBadge('syncing');
+    const seqAtPush = _localChangeSeq;
+    const mine = snapshotSyncState(); // private copy — later edits can't change what this push sends
+    let done = false;
+    try{ done = await fastPushToCloud(seqAtPush, mine); }
+    catch(err){ console.warn('Fast sync failed — falling back to full merge:', err); done = false; }
+    if (!done) await fullPushToCloud(seqAtPush, mine);
     _syncedChangeSeq = seqAtPush;
     _pushRetryDelay = 5000;
     clearTimeout(_pushRetryTimer);
-    updateSyncBadge('synced', new Date(committedVal.updatedAt).toLocaleTimeString());
-    if (ready) render();
+    if (hasUnsyncedLocalChanges()) updateSyncBadge('syncing');
+    else updateSyncBadge('synced', new Date(_lastKnownUpdatedAt || Date.now()).toLocaleTimeString());
   }catch(err){
     console.warn('Cloud sync (push) failed:', err);
     updateSyncBadge('offline', null, fbErrText(err));
     schedulePushRetry();
+  }finally{
+    _pushInFlight = false;
+    if (_pushQueued){ _pushQueued = false; schedulePush(); }
   }
 }
 
@@ -911,6 +1020,7 @@ async function startRealtimeSync(){
     // actually applied this snapshot — otherwise the badge would falsely claim we're caught up
     // with the cloud while a local change is still waiting to go out.
     if (applyRemoteData(data)) updateSyncBadge('synced', new Date(data.updatedAt).toLocaleTimeString());
+    else if (hasUnsyncedLocalChanges()) _remoteSkipped = true; // picked up right after our push lands (see adoptCommitted)
   });
 }
 
@@ -3252,7 +3362,7 @@ function companySubview(sub, st, period){
   if(sub==='age'){
     const keyFn = e=> ageGroupOf(ageYears(e, period.end));
     const order = CONFIG.ageGroups.map(g=>g.label);
-    return subGroupBy(st, keyFn, 'Age Group', order, period, '', true) + deptCrossTab(st, keyFn, 'Age Group', order, period);
+    return subGroupBy(st, keyFn, 'Age Group', order, period, '', true) + genderCrossTab(st.active, keyFn, 'Age Group', order, period) + deptCrossTab(st, keyFn, 'Age Group', order, period);
   }
   if(sub==='tenure'){
     const keyFn = e=> tenureGroupOf(tenureYears(e, period.end));
@@ -3424,7 +3534,7 @@ function filterCostCenterBreakdown(){
    reused for status-filtered lists (Task D) as well as the full active roster.
    totalFirst: when true, the Total column is placed right after the row label (e.g. Position)
    instead of at the far end — used by the Position by Cost Center / Department views. */
-function crossTabGeneric(list, rowKeyFn, colKeyFn, rowLabel, colLabel, forcedOrder, period, titleOverride, totalFirst, searchTerm){
+function crossTabGeneric(list, rowKeyFn, colKeyFn, rowLabel, colLabel, forcedOrder, period, titleOverride, totalFirst, searchTerm, colOrder){
   const rowGroups = {};
   const cols = new Set();
   list.forEach(e=>{
@@ -3436,7 +3546,11 @@ function crossTabGeneric(list, rowKeyFn, colKeyFn, rowLabel, colLabel, forcedOrd
   });
   let rowKeys = forcedOrder ? forcedOrder.filter(k=>rowGroups[k]) : Object.keys(rowGroups).sort();
   Object.keys(rowGroups).forEach(k=>{ if(!rowKeys.includes(k)) rowKeys.push(k); });
-  const colKeys = Array.from(cols).sort();
+  // colOrder (optional): fixed column sequence (e.g. Male, Female, Other, Unspecified) — any
+  // observed column not in it trails alphabetically. Without it, columns sort alphabetically.
+  const colKeys = colOrder
+    ? colOrder.filter(c=>cols.has(c)).concat(Array.from(cols).filter(c=>!colOrder.includes(c)).sort())
+    : Array.from(cols).sort();
   if(!colKeys.length) return '';
   const q = (searchTerm||'').trim().toLowerCase();
   if(q) rowKeys = rowKeys.filter(k=> k.toLowerCase().includes(q));
@@ -3473,6 +3587,12 @@ function crossTabGeneric(list, rowKeyFn, colKeyFn, rowLabel, colLabel, forcedOrd
     <thead>${thead}</thead>
     <tbody>${rows}${totalRow}</tbody>
   </table>`;
+}
+// Gender breakdown of any grouping (Age Group, Job Grade Group…) — rows are the groups, columns
+// are Male / Female (plus Other / Unspecified only when such records exist), with row & column totals.
+const GENDER_ORDER = ['Male','Female','Other','Unspecified'];
+function genderCrossTab(list, keyFn, label, forcedOrder, period, titleOverride){
+  return crossTabGeneric(list, keyFn, e=> e.gender || 'Unspecified', label, 'Gender', forcedOrder, period, titleOverride || (label+' by Gender'), false, '', GENDER_ORDER);
 }
 // Kept for the existing age/tenure/gender/job-grade callers — now just a thin wrapper over
 // crossTabGeneric with the column dimension fixed to Department.
@@ -3729,6 +3849,7 @@ function subJobGradeByStatus(st, period){
       <thead><tr><th class="rowlabel">Job Grade Group</th><th>Headcount</th><th>% of ${label}</th></tr></thead>
       <tbody>${rows}<tr class="total"><td class="rowlabel">Total</td><td>${total}</td><td>100.0%</td></tr></tbody>
     </table>
+    ${genderCrossTab(list, keyFn, 'Job Grade Group', keys, period, `Job Grade — ${label} by Gender`)}
     ${crossTabGeneric(list, keyFn, e=>deptOfEmployee(e,true), 'Job Grade Group', 'Department', keys, period, `Job Grade — ${label} by Department`)}`;
   });
   out += `<p class="hint">Job Grade groups are configured per company &amp; employment status in the Control Panel — see the Job Grade Groups panel there. Intern/OJT isn't shown here since job grade structures apply to Staff and Rank &amp; File only.</p>`;
