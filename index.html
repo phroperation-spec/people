@@ -3641,6 +3641,67 @@ function filterPositionBreakdown(){
 // Position tab's own button with no arguments (always exports all four, same as always), and from
 // the Export tab's checkboxes (exp_pos_breakdown/department/costcenter/jobgrade), which lets HR
 // pick just the report(s) they need instead of the whole workbook.
+// Rows for one "<group> by Gender" table — same counting as genderCrossTab on screen: rows in the
+// given order (anything unlisted trails alphabetically), Male / Female columns plus Other /
+// Unspecified only when such records exist, a Total column and a Total row, then % Male / % Female.
+function genderCrossTabAoa(list, keyFn, rowLabel, forcedOrder){
+  const groups = {}; const cols = new Set();
+  list.forEach(e=>{
+    const rk = keyFn(e) || 'Unassigned';
+    const g = e.gender || 'Unspecified';
+    cols.add(g);
+    groups[rk] = groups[rk] || {};
+    groups[rk][g] = (groups[rk][g]||0) + 1;
+  });
+  const colKeys = GENDER_ORDER.filter(c=> cols.has(c)).concat(Array.from(cols).filter(c=> !GENDER_ORDER.includes(c)).sort());
+  let rowKeys = forcedOrder ? forcedOrder.filter(k=> groups[k]) : Object.keys(groups).sort();
+  Object.keys(groups).sort().forEach(k=>{ if(!rowKeys.includes(k)) rowKeys.push(k); });
+  const pct = (n,d)=> d ? (n/d*100).toFixed(1)+'%' : '—';
+  const out = [[rowLabel, ...colKeys, 'Total', '% Male', '% Female']];
+  const colTotals = {}; colKeys.forEach(c=> colTotals[c]=0);
+  let grand = 0;
+  rowKeys.forEach(rk=>{
+    const vals = colKeys.map(c=> (groups[rk][c]||0));
+    const tot = vals.reduce((a,b)=>a+b,0);
+    colKeys.forEach((c,i)=> colTotals[c]+=vals[i]); grand += tot;
+    out.push([rk, ...vals, tot, pct(groups[rk]['Male']||0, tot), pct(groups[rk]['Female']||0, tot)]);
+  });
+  out.push(['Total', ...colKeys.map(c=> colTotals[c]), grand, pct(colTotals['Male']||0, grand), pct(colTotals['Female']||0, grand)]);
+  return out;
+}
+function exportGenderBreakdownExcel(){
+  if(typeof XLSX === 'undefined'){ toast('Excel export isn\'t available right now — try refreshing the page.'); return; }
+  const ageBox = document.getElementById('exp_gender_age'), jgBox = document.getElementById('exp_gender_jobgrade');
+  const incAge = !ageBox || ageBox.checked, incJg = !jgBox || jgBox.checked;
+  if(!incAge && !incJg){ toast('Select at least one Gender report to export.'); return; }
+  const {st, period} = companyDetailContext();
+  if(!st.active.length){ toast(`No active employees for ${ui.company} in ${period.label}.`); return; }
+  const head = title => [[`${title} — ${ui.company} — ${period.label}`], []];
+  const wb = XLSX.utils.book_new();
+  if(incAge){
+    const keyFn = e=> ageGroupOf(ageYears(e, period.end));
+    const aoa = head('Age Group by Gender').concat(genderCrossTabAoa(st.active, keyFn, 'Age Group', CONFIG.ageGroups.map(g=>g.label)));
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(aoa), 'Age Group by Gender');
+  }
+  if(incJg){
+    // Same split as the Job Grade tab — Staff and Rank & File each get their own table, since the
+    // same Job Grade Group label can mean different grade ranges for each status.
+    let aoa = head('Job Grade by Gender');
+    const keyFn = e=> jobGradeGroupOf(e.company, e.employmentStatus, e.jobGrade) || 'Unclassified';
+    [['staff','Staff'],['rankfile','Rank & File']].forEach(([key,label], i)=>{
+      if(i) aoa.push([]);
+      aoa.push([label]);
+      if(!subStatusHasData(label)){ aoa.push([`No ${label} data has been fed for ${monthLabel(ui.month)} yet.`]); return; }
+      const list = st.active.filter(e=> STATUS_KEY(e.employmentStatus)===key);
+      if(!list.length){ aoa.push([`No active ${label} employees.`]); return; }
+      const order = jobGradeGroupsFor(ui.company, label).map(g=>g.label);
+      aoa = aoa.concat(genderCrossTabAoa(list, keyFn, 'Job Grade Group', order));
+    });
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(aoa), 'Job Grade by Gender');
+  }
+  const scope = [ui.company||'Company', period.label].join('_').replace(/\s+/g,'-').replace(/[^\w\-]/g,'');
+  XLSX.writeFile(wb, `gender_breakdown_${scope}.xlsx`);
+}
 function exportPositionExcel(){
   if(typeof XLSX === 'undefined'){ toast('Excel export isn\'t available right now — try refreshing the page.'); return; }
   const checkboxIds = {breakdown:'exp_pos_breakdown', department:'exp_pos_department', costcenter:'exp_pos_costcenter', jobgrade:'exp_pos_jobgrade'};
@@ -6872,6 +6933,12 @@ async function finalizeMasterlistUpload(){
     });
     if(prfChanged) await saveConfig();
   }
+  // A back-filled month earlier than the company's recorded first month becomes its new first
+  // month, so trends/derived months no longer trim it off as "before data existed".
+  if(P.isBackfillUpload && meta.backfilled){
+    const existing = CONFIG.companyBaselineMonth[company];
+    if(existing && asOfMonth < existing){ CONFIG.companyBaselineMonth[company] = asOfMonth; await saveConfig(); }
+  }
   if(isBaselineUpload && meta.baselineAdded){
     const existing = CONFIG.companyBaselineMonth[company];
     if(!existing || asOfMonth < existing){
@@ -6885,6 +6952,7 @@ async function finalizeMasterlistUpload(){
   let summary = `${monthLabel(asOfMonth)} for ${company} (${status}): ${meta.updated} updated`;
   if(alreadyUploaded) summary = `Re-upload — a Master List for ${monthLabel(asOfMonth)} was already on record. ` + summary;
   if(meta.baselineAdded) summary += `, ${meta.baselineAdded} record(s) added as the starting baseline roster (not counted as New Hires)`;
+  if(meta.backfilled) summary += `, ${meta.backfilled} employee(s) back-filled into ${monthLabel(asOfMonth)} (an earlier month than ${monthLabel(P.latestUploadedMonth)}, already on file — their current details were kept and only blanks filled in)`;
   if(meta.newHires) summary += `, ${meta.newHires} new hire(s) counted for ${monthLabel(asOfMonth)}`;
   if(meta.addedNotCounted) summary += `, ${meta.addedNotCounted} record(s) added without counting as a New Hire`;
   if(meta.rehired) summary += `, ${meta.rehired} rehire(s)`;
@@ -7273,16 +7341,27 @@ async function runCompanyUpload({file, company, status, asOfMonth}){
   const alreadyUploadedThisMonth = uploadedMonthsSoFar.includes(asOfMonth);
   const latestUploadedMonth = uploadedMonthsSoFar.length ? uploadedMonthsSoFar[uploadedMonthsSoFar.length-1] : null;
   const isForwardMonthUpload = !alreadyUploadedThisMonth && (!latestUploadedMonth || asOfMonth > latestUploadedMonth);
+  // Back-fill: a file for a month EARLIER than the latest month already on file for this
+  // company+status (e.g. August uploaded after September was already in). Previously, everyone
+  // in such a file who was already on record only had their details refreshed — their roster
+  // span still started at the later month, so the earlier month was marked "uploaded" but read 0
+  // headcount everywhere (Company Detail, Trend & Insight). It also overwrote everyone's CURRENT
+  // Position/Job Grade/Cost Center with the older month's values, and flagged people hired after
+  // that month for separation. A back-fill now (a) puts each listed person on the roster from
+  // this month, (b) records this month's Job Grade/Position/Status in their history, (c) only
+  // fills in details that are blank — newer data on file is kept — and (d) only asks about
+  // separations for people who were actually on the roster in this month.
+  const isBackfillUpload = !isBaselineUpload && !!latestUploadedMonth && asOfMonth < latestUploadedMonth;
 
   // Snapshot of who this group considered active BEFORE this upload.
-  const previousActiveIds = new Set(EMP.filter(e=> e.company===company && e.employmentStatus===status && !e.dateSeparated).map(e=> String(e.employeeId)));
+  const previousActiveIds = new Set(EMP.filter(e=> e.company===company && e.employmentStatus===status && !e.dateSeparated && (!isBackfillUpload || isOnRosterInMonth(e, asOfMonth))).map(e=> String(e.employeeId)));
   const fileIds = new Set();
 
   // Everything below is applied to `working` — a deep, private clone of the employee list — and
   // NEVER to the real EMP array or storage. It only becomes real via finalizeMasterlistUpload().
   const working = JSON.parse(JSON.stringify(EMP));
 
-  let updated=0, rehired=0, baselineAdded=0, skippedOtherCompany=0;
+  let updated=0, rehired=0, baselineAdded=0, skippedOtherCompany=0, backfilled=0;
   const pendingNewHireRows = [];
   const pendingPromotionRows = [];
   for(let r=1;r<rows.length;r++){
@@ -7299,6 +7378,31 @@ async function runCompanyUpload({file, company, status, asOfMonth}){
       continue;
     }
     fileIds.add(String(id));
+    if(exists>=0 && isBackfillUpload){
+      const rec = working[exists];
+      const sepMonth = rec.dateSeparated ? (separationTagMonthOf(rec) || '') : '';
+      // Still active, or separated only AFTER this month — they were genuinely on the roster then.
+      if(!rec.dateSeparated || (sepMonth && asOfMonth < sepMonth)){
+        const fill = (field, val) => { if(val && !String(rec[field]||'').trim()) rec[field] = val; };
+        fill('lastName', get('lastName')); fill('firstName', get('firstName')); fill('middleName', get('middleName'));
+        fill('costCenter', get('costCenter')); fill('position', get('position')); fill('jobGrade', get('jobGrade'));
+        if(get('gender')) fill('gender', normGender(get('gender')));
+        fill('birthdate', normalizeDateInput(get('birthdate'))); fill('dateHired', normalizeDateInput(get('dateHired')));
+        recordJobGradeSnapshot(rec, asOfMonth, get('jobGrade'));
+        recordPositionSnapshot(rec, asOfMonth, get('position'));
+        recordStatusSnapshot(rec, asOfMonth, status);
+        const spans = rosterSpansOf(rec).map(sp=>({...sp}));
+        if(!spans.some(sp=> sp.start && sp.start<=asOfMonth && (!sp.end || asOfMonth < sp.end))){
+          const next = spans.find(sp=> sp.start && sp.start > asOfMonth);
+          if(next) next.start = asOfMonth; else spans.push({start:asOfMonth, end: sepMonth ? safeSpanEnd(asOfMonth, sepMonth) : ''});
+          spans.sort((a,b)=> a.start<b.start?-1:(a.start>b.start?1:0));
+        }
+        rec.rosterSpans = spans;
+        backfilled++;
+        continue;
+      }
+      // Separated on/before this month yet listed in it — fall through to the normal handling.
+    }
     if(exists>=0){
       const wasSeparated = !!working[exists].dateSeparated;
       const priorSpans = rosterSpansOf(working[exists]).map(sp=>({...sp}));
@@ -7419,10 +7523,11 @@ async function runCompanyUpload({file, company, status, asOfMonth}){
     alreadyUploaded: alreadyUploadedThisMonth,
     rowCount: Math.max(0, rows.length-1),
     working,
-    meta: {updated, rehired, baselineAdded, skippedOtherCompany, newHires:0, addedNotCounted:0, promoted:0, changed:0, separated:0}
+    isBackfillUpload, latestUploadedMonth,
+    meta: {updated, rehired, baselineAdded, skippedOtherCompany, backfilled, newHires:0, addedNotCounted:0, promoted:0, changed:0, separated:0}
   };
 
-  let staged = `${monthLabel(asOfMonth)} for ${company} (${status}): ${updated} updated, ${baselineAdded} baseline, ${rehired} rehire(s) staged — `;
+  let staged = `${monthLabel(asOfMonth)} for ${company} (${status}): ${updated} updated, ${baselineAdded} baseline, ${rehired} rehire(s)${backfilled?`, ${backfilled} back-filled`:''} staged — `;
   const needsReview = pendingNewHireRows.length || pendingPromotionRows.length || candidateIds.length;
   if(needsReview){
     staged += 'nothing is saved yet. ';
@@ -7496,6 +7601,15 @@ function subExportCenter(st, period){
       <label style="display:flex;align-items:center;gap:6px;font-size:13px;"><input type="checkbox" id="exp_pos_jobgrade" checked> Position by Job Grade Group</label>
     </div>
     <button class="btn primary" onclick="exportPositionExcel()">Export Selected</button>
+  </div>
+  <div class="panel" style="margin-top:14px;">
+    <div class="panel-head"><h3>Gender Breakdown <span class="pill staff" style="margin-left:8px;">${period.label}</span></h3></div>
+    <p class="hint">Male / Female headcount for <b>${ui.company}</b> by Age Group and by Job Grade Group, for the period currently selected above (Monthly/Annual) — the same figures as the "by Gender" tables on the Age and Job Grade tabs. Each report becomes its own sheet.</p>
+    <div class="field-row" style="flex-wrap:wrap;gap:14px 22px;margin-bottom:10px;">
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;"><input type="checkbox" id="exp_gender_age" checked> Age Group by Gender</label>
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;"><input type="checkbox" id="exp_gender_jobgrade" checked> Job Grade by Gender (Staff &amp; Rank &amp; File)</label>
+    </div>
+    <button class="btn primary" onclick="exportGenderBreakdownExcel()">Export Selected</button>
   </div>
   <div class="panel" style="margin-top:14px;">
     <div class="panel-head"><h3>Hire &amp; Separation Archive <span class="pill rankfile" style="margin-left:8px;">Establishment Report format</span></h3></div>
