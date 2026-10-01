@@ -1686,7 +1686,11 @@ function closeRosterSpan(emp, ms){
 // hire/separation reporting months on a record directly: rebuild the latest span from those.
 function syncRosterSpanFromRecord(emp){
   const spans = rosterSpansOf(emp).map(sp=>({...sp}));
-  const start = hireTagMonthOf(emp) || '';
+  // Once someone already has roster months on file, only an EXPLICIT hire reporting month may move
+  // their start. Falling back to the raw Date Hired here (via hireTagMonthOf) dragged baseline-roster
+  // people — who have no hireTagMonth — back to their actual hire date (often years earlier) the
+  // moment any import or edit touched their record.
+  const start = (spans.length ? emp.hireTagMonth : hireTagMonthOf(emp)) || '';
   const end = emp.dateSeparated ? (separationTagMonthOf(emp) || '') : '';
   if(!spans.length){ if(start) emp.rosterSpans = [{start, end: safeSpanEnd(start, end)}]; return; }
   const last = spans[spans.length-1];
@@ -4579,7 +4583,9 @@ function handleRecruitUpload(){
       const month = normalizeMonthInput(monthRaw) || monthRaw;
       if(!company || !month) continue;
       const rec = {};
-      RECRUIT_FIELDS.forEach(([k])=>{ rec[k] = fieldIdx[k]>=0 ? (Number(row[fieldIdx[k]])||0) : 0; });
+      // Amounts like "8,000" or "₱8,000.50" used to read as 0 (Number() can't parse the comma).
+      const amt = v => Number(String(v==null?'':v).replace(/[₱,\s]|php/gi,'')) || 0;
+      RECRUIT_FIELDS.forEach(([k])=>{ rec[k] = fieldIdx[k]>=0 ? amt(row[fieldIdx[k]]) : 0; });
       RECRUIT[recruitKey(company, month)] = rec;
       count++;
     }
@@ -5681,7 +5687,7 @@ function newHireSeparatedImportPanel(){
       <p class="hint">Rows are applied <b>exactly as given</b> — nothing is auto-detected. Employment Status should match one of the statuses configured in Control Panel (Staff, Rank &amp; File, Intern/OJT, or any other you've added) — this same file works for onboarding or separating <b>any</b> employment status, including Intern/OJT. Because this writes directly to the shared employee record, changes here immediately flow through to the Active Roster, Company Detail, Trend &amp; Insight and Archive. Avoid using this for routine monthly refreshes — use Master List for that instead. <b>ID # is the same shared key</b> used by the Master List upload, so a person added here will be matched correctly the next time their company runs a Master List refresh.</p>
     </details>
     <div class="field-row">
-      <div class="field"><label>IMPORT FILE (.CSV)</label><input type="file" id="csvFile" accept=".csv" /></div>
+      <div class="field"><label>IMPORT FILE (.CSV / .XLSX)</label><input type="file" id="csvFile" accept=".csv,.xlsx,.xls" /></div>
     </div>
     <div class="field-row">
       <button class="btn primary" onclick="handleUpload()">Import</button>
@@ -7818,12 +7824,16 @@ function normStatus(s){
 function handleUpload(){
   const input = document.getElementById('csvFile');
   const msg = document.getElementById('uploadMsg');
-  if(!input.files.length){ msg.textContent = 'Choose a CSV file first.'; return; }
-  const reader = new FileReader();
-  reader.onload = async ()=>{
-    const rows = parseCSV(reader.result);
+  if(!input.files.length){ msg.textContent = 'Choose a file first.'; return; }
+  // Reads .csv AND Excel (.xlsx/.xls) through the same fileToRows reader the Master List upload
+  // uses — previously this only ever read the file as plain text, so an Excel file imported as
+  // unreadable garbage rows.
+  (async ()=>{
+    let rows;
+    try{ rows = await fileToRows(input.files[0]); }
+    catch(err){ msg.textContent = 'Could not read that file: ' + err.message; return; }
     if(rows.length<2){ msg.textContent = 'File appears empty.'; return; }
-    const headers = rows[0].map(h=>h.trim().toLowerCase());
+    const headers = rows[0].map(h=>String(h).trim().toLowerCase());
     const idx = (...candidates) => headers.findIndex(h=> candidates.some(name=>
       name==='id' ? h.split(/\s+/).some(tok=> tok.startsWith('id')) : h.includes(name)
     ));
@@ -7838,12 +7848,19 @@ function handleUpload(){
     const touchedGroups = new Set(); // `${company}|${status}` pairs seen, so grades can be auto-assigned after
     for(let r=1;r<rows.length;r++){
       const row = rows[r];
-      const get = k => map[k]>=0 ? (row[map[k]]||'').trim() : '';
+      const get = k => map[k]>=0 ? String(row[map[k]]===undefined||row[map[k]]===null ? '' : row[map[k]]).trim() : '';
       const id = get('employeeId');
       if(!id) continue;
       const exists = EMP.findIndex(e=> String(e.employeeId)===String(id));
-      const dateHired = normalizeDateInput(get('dateHired'));
-      const dateSeparated = normalizeDateInput(get('dateSeparated'));
+      // For an EXISTING ID, a blank cell now means "keep what's on file" — previously the whole
+      // record was rebuilt from the file row alone, so a separation row with only ID # + Date
+      // Separated + Reason filled in wiped that person's name, company, position, gender, etc.,
+      // and also dropped fields this file doesn't carry at all (e.g. the baseline-roster flag that
+      // keeps them out of New Hire counts, manual department overrides, promotion history).
+      const prev = exists>=0 ? EMP[exists] : null;
+      const keep = (field, val) => (val !== '' && val != null) ? val : (prev ? (prev[field] || '') : '');
+      const dateHired = keep('dateHired', normalizeDateInput(get('dateHired')));
+      const dateSeparated = keep('dateSeparated', normalizeDateInput(get('dateSeparated')));
 
       // Reporting month for a HIRE (task B): a brand-new ID gets tagged fresh — to the optional
       // Hire Reporting Month column if given, otherwise to the moment this file is imported —
@@ -7860,13 +7877,15 @@ function handleUpload(){
         separationTagMonth = unchanged ? EMP[exists].separationTagMonth : (normalizeMonthInput(get('reportingMonth')) || monthStr(new Date()));
       }
 
+      const company = keep('company', get('company'));
       const emp = {
-        employeeId:id, lastName:get('lastName'), firstName:get('firstName'), middleName:get('middleName'),
-        company:get('company'), industry:get('industry')||industryOf(get('company')), department:get('department'),
-        costCenter:get('costCenter'), gender:normGender(get('gender')), position:get('position'), jobGrade:get('jobGrade'), birthdate: normalizeDateInput(get('birthdate')),
-        employmentStatus:normStatus(get('employmentStatus')), dateHired, hireTagMonth, dateSeparated,
+        ...(prev ? JSON.parse(JSON.stringify(prev)) : {}),
+        employeeId:id, lastName:keep('lastName', get('lastName')), firstName:keep('firstName', get('firstName')), middleName:keep('middleName', get('middleName')),
+        company, industry:get('industry') || (prev && prev.company===company ? prev.industry : '') || industryOf(company), department:keep('department', get('department')),
+        costCenter:keep('costCenter', get('costCenter')), gender:keep('gender', normGender(get('gender'))), position:keep('position', get('position')), jobGrade:keep('jobGrade', get('jobGrade')), birthdate: keep('birthdate', normalizeDateInput(get('birthdate'))),
+        employmentStatus: get('employmentStatus') ? normStatus(get('employmentStatus')) : (prev ? prev.employmentStatus : normStatus('')), dateHired, hireTagMonth, dateSeparated,
         separationTagMonth,
-        separationReason:get('separationReason'), separationRemarks:get('separationRemarks'),
+        separationReason: dateSeparated ? keep('separationReason', get('separationReason')) : '', separationRemarks: dateSeparated ? keep('separationRemarks', get('separationRemarks')) : '',
         // Updating an existing record must not rebuild their roster history from scratch — carry
         // whatever months they were already reported under, then apply this file's change.
         rosterSpans: exists>=0 ? rosterSpansOf(EMP[exists]).map(sp=>({...sp})) : [],
@@ -7876,12 +7895,17 @@ function handleUpload(){
       };
       syncRosterSpanFromRecord(emp);
       if(exists>=0){ EMP[exists] = emp; updated++; } else { EMP.push(emp); newHires++; }
-      recordJobGradeSnapshot(emp, monthStr(new Date()), emp.jobGrade);
-      recordPositionSnapshot(emp, monthStr(new Date()), emp.position);
+      // A new record's first Job Grade / Position / Status snapshot is dated to its Hire Reporting
+      // Month, not the day of import — otherwise a hire reported under an earlier month (e.g.
+      // August, imported in October) had no grade on file for that month and showed up as
+      // "Unclassified" in that month's Job Grade breakdown.
+      const snapMonth = exists>=0 ? monthStr(new Date()) : (hireTagMonth || monthStr(new Date()));
+      recordJobGradeSnapshot(emp, snapMonth, emp.jobGrade);
+      recordPositionSnapshot(emp, snapMonth, emp.position);
       // Keep the Employment Status history in sync here too, so a Rank & File -> Staff move made
       // through this bulk import path is detectable the same way as one from a Master List upload
       // or a manual edit (see companyAnnualPromotions/execJobGradeMovement).
-      recordStatusSnapshot(emp, monthStr(new Date()), emp.employmentStatus);
+      recordStatusSnapshot(emp, snapMonth, emp.employmentStatus);
       if(emp.dateSeparated) separated++;
       if(emp.company && emp.employmentStatus) touchedGroups.add(emp.company+'|'+emp.employmentStatus);
     }
@@ -7894,8 +7918,7 @@ function handleUpload(){
     msg.textContent = `Import complete: ${newHires} new hire(s) added to the Active Roster, ${updated} existing record(s) updated (${separated} of those marked separated).` + (unmapped ? ` ${unmapped} cost center(s) across your companies need a department — assign them in the Control Panel.` : '');
     toast('New Hire & Separated Import complete — Active Roster updated.');
     render();
-  };
-  reader.readAsText(input.files[0]);
+  })();
 }
 function downloadTemplate(){
   const headers = ['Industry','Company','Department','Cost Center','ID #','Last Name','First Name','Middle Name','Gender','Position','Job Grade','Birthdate','Date Hired','Employment Status','Date Separated','Separation Reason','Separation Remarks','Hire Reporting Month','Separation Reporting Month'];
