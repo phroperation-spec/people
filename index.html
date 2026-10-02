@@ -7,6 +7,7 @@
 <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-database-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore-compat.js"></script>
 <style>
   :root{
     --bg:#F3F5FA;
@@ -8737,5 +8738,415 @@ async function confirmAddCompany(i){
 /* ============ INIT ============ */
 loadAll();
 </script>
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     SD RECORDS — LIVE SYNC from PGB Masterlist (pgb-masterlist.vercel.app)
+     Paste this whole block just before </body> in people/index.html.
+     Adds a 3rd view under Movements: "SD Records (Live)".
+     • Pulls "Employee Movement - SD Records" straight from the Masterlist page
+       every time the view opens, every 5 min while open, and on Refresh.
+     • Keeps ONLY records that match an ACTIVE employee in this app
+       (isActiveAsOf today) — by Employee ID + Name, then by Name.
+     ═══════════════════════════════════════════════════════════════════════════ -->
+<script>
+(function(){
+  const SD_SOURCE_URL = 'https://pgb-masterlist.vercel.app/';
+  const SD_REFRESH_MS = 5 * 60 * 1000;
+
+  const SD = window.SD_LIVE = { raw: [], matched: [], loading: false, error: '', syncedAt: null, timer: null };
+  ui.sdSearch = ui.sdSearch || '';
+  ui.sdCompany = ui.sdCompany || '';
+  ui.sdType = ui.sdType || '';
+
+  // ── name normalizer: strips accents (Ñ→N), punctuation, and JR/SR/II/III/IV suffixes ──
+  const SUF = /\b(JR|SR|II|III|IV)\b\.?/g;
+  const N = s => String(s||'').normalize('NFD').replace(/[̀-ͯ]/g,'')
+    .toUpperCase().replace(/[^A-Z ]/g,' ').replace(SUF,' ').replace(/\s+/g,' ').trim();
+
+  function matchActive(rec, pool){
+    const [ln, rest=''] = String(rec.NAME||'').split(',');
+    const L = N(ln), R = N(rest) + ' ';
+    const id = String(rec.IDNO||'').trim().toUpperCase();
+    const nameOk = e => N(e.lastName)===L && N(e.firstName) && R.startsWith(N(e.firstName)+' ');
+    const byId = pool.find(e => String(e.employeeId).trim().toUpperCase()===id && nameOk(e));
+    if(byId) return { emp: byId, how: 'ID + Name' };
+    const byName = pool.filter(nameOk);
+    if(byName.length===1) return { emp: byName[0], how: 'Name' };
+    if(byName.length>1){
+      // Name collision — prefer the one at the SD "Transfer To" company
+      const pick = byName.find(e => e.company===rec['TRANSFER TO']) || byName[0];
+      return { emp: pick, how: 'Name (multiple)' };
+    }
+    return null;
+  }
+
+  function movementType(r){
+    const t = [];
+    if(r['UPGRADED TO STAFF']) t.push('Upgraded to Staff');
+    if(r['TRANSFER FROM'] && r['TRANSFER TO'] && r['TRANSFER FROM']!==r['TRANSFER TO']) t.push('Cross-Affiliate Transfer');
+    if(r['DATE REHIRED']) t.push('Rehired');
+    if(!t.length && (r['TRANSFER FROM']||r['TRANSFER TO'])) t.push('Internal Movement');
+    return t;
+  }
+
+  function rebuildMatches(){
+    const now = new Date();
+    const active = EMP.filter(e => isActiveAsOf(e, now) && (e.lastName||e.firstName));
+    SD.matched = [];
+    SD.raw.forEach(r=>{
+      const m = matchActive(r, active);
+      if(!m) return;                         // ← active employees only
+      SD.matched.push({ ...r, _emp: m.emp, _how: m.how, _types: movementType(r) });
+    });
+    SD.matched.sort((a,b)=> (parseDate(b['TRANSFER EFFECTIVE DATE'])||0) - (parseDate(a['TRANSFER EFFECTIVE DATE'])||0));
+  }
+
+  async function sdFetch(){
+    if(SD.loading) return;
+    SD.loading = true; SD.error = ''; sdPaint();
+    try{
+      const res = await fetch(SD_SOURCE_URL + '?t=' + Date.now(), { cache: 'no-store' });
+      if(!res.ok) throw new Error('HTTP ' + res.status);
+      const html = await res.text();
+      const m = html.match(/window\._employeeMovement\s*=\s*(\[[\s\S]*?\]);\s*\n/);
+      if(!m) throw new Error('SD Records block not found on the Masterlist page');
+      SD.raw = JSON.parse(m[1]);
+      SD.syncedAt = new Date();
+      rebuildMatches();
+    }catch(e){ SD.error = String(e.message||e); }
+    SD.loading = false;
+    sdPaint();
+  }
+  window.sdLiveRefresh = sdFetch;
+
+  function filtered(){
+    const q = (ui.sdSearch||'').toLowerCase();
+    return SD.matched.filter(r=>{
+      if(ui.sdCompany && r['TRANSFER FROM']!==ui.sdCompany && r['TRANSFER TO']!==ui.sdCompany && r._emp.company!==ui.sdCompany) return false;
+      if(ui.sdType && !r._types.includes(ui.sdType)) return false;
+      if(q && !`${r.NAME} ${r.IDNO} ${r._emp.employeeId} ${r['TRANSFER FROM']} ${r['TRANSFER TO']} ${r.REMARKS} ${r._emp.position||''}`.toLowerCase().includes(q)) return false;
+      return true;
+    });
+  }
+
+  function tableHTML(list){
+    if(!list.length) return '<div class="empty">No SD records for active employees match this filter.</div>';
+    const rows = list.map(r=>{
+      const e = r._emp;
+      const xfer = r['TRANSFER FROM']!==r['TRANSFER TO'];
+      return `<tr>
+        <td class="namecell">${escapeHtml(r.NAME)}<div style="font-size:11px;color:var(--dim2);">${escapeHtml(e.position||'')}${e.jobGrade?' · '+(/^JG/i.test(String(e.jobGrade))?'':'JG ')+escapeHtml(String(e.jobGrade)):''}</div></td>
+        <td class="ctr" style="font-family:var(--mono);font-size:11px;">${escapeHtml(String(r.IDNO||''))}${String(r.IDNO).toUpperCase()!==String(e.employeeId).toUpperCase()?`<div title="ID in this app" style="color:var(--dim2);">${escapeHtml(String(e.employeeId))}</div>`:''}</td>
+        <td>${escapeHtml(e.company)}</td>
+        <td class="ctr">${fmtDateMDY(r['DATE HIRED'])}</td>
+        <td class="ctr">${fmtDateMDY(r['UPGRADED TO STAFF'])}</td>
+        <td>${escapeHtml(r['TRANSFER FROM']||'')}</td>
+        <td style="text-align:center;color:${xfer?'var(--green)':'var(--dim2)'};">→</td>
+        <td>${escapeHtml(r['TRANSFER TO']||'')}</td>
+        <td class="ctr">${fmtDateMDY(r['TRANSFER EFFECTIVE DATE'])}</td>
+        <td class="ctr">${fmtDateMDY(r['DATE REHIRED'])}</td>
+        <td style="font-size:12px;">${escapeHtml(r.REMARKS||'')}</td>
+        <td class="ctr" style="font-size:11px;color:var(--dim2);">${escapeHtml(r._types.join(', '))}</td>
+      </tr>`;
+    }).join('');
+    return `<div class="archive-table-wrap"><table class="simple archive-table">
+      <thead><tr><th>Name (SD)</th><th class="ctr">ID</th><th>Current Co.</th><th class="ctr">Date Hired</th><th class="ctr">Upgraded to Staff</th><th>From</th><th></th><th>To</th><th class="ctr">Effective</th><th class="ctr">Rehired</th><th>Remarks</th><th class="ctr">Type</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>`;
+  }
+
+  function card(label, value, foot){
+    return `<div class="card" style="padding:16px 20px;"><div class="label">${label}</div><div class="value" style="font-size:30px;">${value}</div><div class="foot">${foot}</div></div>`;
+  }
+
+  function renderSDLive(){
+    if(!SD.syncedAt && !SD.loading && !SD.error) setTimeout(sdFetch, 0);
+    const all = SD.matched, list = filtered();
+    const comps = [...new Set(all.flatMap(r=>[r['TRANSFER FROM'],r['TRANSFER TO'],r._emp.company]).filter(Boolean))].sort();
+    const types = ['Upgraded to Staff','Cross-Affiliate Transfer','Rehired','Internal Movement'];
+    const status = SD.loading ? '⏳ Syncing from Masterlist…'
+      : SD.error ? `<span style="color:var(--red);">⚠ Sync failed: ${escapeHtml(SD.error)}</span>`
+      : SD.syncedAt ? `● Live · last synced ${SD.syncedAt.toLocaleTimeString()} · auto-refresh every 5 min` : '';
+    return `
+    <div class="field-row" style="align-items:center;justify-content:space-between;">
+      <p class="hint" style="margin:0;max-width:640px;">Pulled live from <b>Employee Movement - SD Records</b> on the PGB Masterlist and matched to <b>active employees only</b> in this app (Employee ID + Name, then Name). Records for separated or unlisted employees are left out.</p>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <span class="hint" style="margin:0;font-size:12px;">${status}</span>
+        <button class="btn" onclick="sdLiveRefresh()">↻ Refresh</button>
+        <button class="btn" onclick="sdLiveExport()">⬇ Excel</button>
+      </div>
+    </div>
+    <div class="grid cards4" style="margin-top:12px;">
+      ${card('Active employees with SD record', all.length, `${SD.raw.length} SD records on Masterlist`)}
+      ${card('Upgraded to Staff', all.filter(r=>r._types.includes('Upgraded to Staff')).length, 'Rank &amp; File → Staff')}
+      ${card('Cross-Affiliate Transfers', all.filter(r=>r._types.includes('Cross-Affiliate Transfer')).length, 'From ≠ To company')}
+      ${card('Rehired', all.filter(r=>r._types.includes('Rehired')).length, 'Has Date Rehired')}
+    </div>
+    <div class="field-row" style="margin-top:12px;">
+      <input type="text" placeholder="Search name, ID, remarks…" value="${escapeHtml(ui.sdSearch)}" oninput="ui.sdSearch=this.value; sdPaintTable();" style="width:240px;">
+      <div class="field"><label>COMPANY</label><select onchange="ui.sdCompany=this.value; sdPaintTable();"><option value="">Any</option>${comps.map(c=>`<option ${ui.sdCompany===c?'selected':''}>${escapeHtml(c)}</option>`).join('')}</select></div>
+      <div class="field"><label>TYPE</label><select onchange="ui.sdType=this.value; sdPaintTable();"><option value="">Any</option>${types.map(t=>`<option ${ui.sdType===t?'selected':''}>${t}</option>`).join('')}</select></div>
+    </div>
+    <h2 class="section">SD Records — Active Employees <span class="n" id="sdLiveCount">${list.length} of ${all.length} shown</span></h2>
+    <div id="sdLiveTableWrap">${tableHTML(list)}</div>`;
+  }
+
+  window.sdPaintTable = function(){
+    const list = filtered();
+    const w = document.getElementById('sdLiveTableWrap'); if(w) w.innerHTML = tableHTML(list);
+    const c = document.getElementById('sdLiveCount'); if(c) c.textContent = `${list.length} of ${SD.matched.length} shown`;
+  };
+  function sdPaint(){ if(ui.tab==='transfers' && ui.movementsView==='sdlive') render(); }
+
+  window.sdLiveExport = function(){
+    const rows = filtered().map(r=>({
+      'IDNO (SD)': r.IDNO, 'Employee ID (App)': r._emp.employeeId, 'Name': r.NAME,
+      'Current Company': r._emp.company, 'Position': r._emp.position||'', 'Job Grade': r._emp.jobGrade||'',
+      'Date Hired': r['DATE HIRED'], 'Upgraded to Staff': r['UPGRADED TO STAFF'],
+      'Transfer From': r['TRANSFER FROM'], 'Transfer To': r['TRANSFER TO'],
+      'Transfer Effective Date': r['TRANSFER EFFECTIVE DATE'], 'Date Rehired': r['DATE REHIRED'],
+      'Remarks': r.REMARKS, 'Type': r._types.join(', '), 'Matched By': r._how
+    }));
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), 'SD Records (Active)');
+    XLSX.writeFile(wb, `SD_Records_Active_${new Date().toISOString().slice(0,10)}.xlsx`);
+  };
+
+  // ── hook into the Movements tab: add a 3rd switcher button ──
+  const _origRenderTransfers = window.renderTransfers;
+  window.renderTransfers = function(){
+    const v = ui.movementsView || 'transfers';
+    const html = (v==='sdlive') ? (() => { ui.movementsView='transfers'; const h=_origRenderTransfers(); ui.movementsView='sdlive'; return h; })() : _origRenderTransfers();
+    const btn = `<button class="btn ${v==='sdlive'?'primary':''}" onclick="ui.movementsView='sdlive'; render();">SD Records (Live)</button>`;
+    // insert our button after the Promotions button; when in sdlive, swap the body
+    let out = html.replace(/(Rank &amp; File → Staff Promotions<\/button>)/, `$1\n    ${btn}`);
+    if(v==='sdlive'){
+      out = out.replace(/class="btn primary" onclick="ui\.movementsView='transfers'/, `class="btn" onclick="ui.movementsView='transfers'`);
+      const cut = out.indexOf('</div>') + 6;           // end of switcher row
+      out = out.slice(0, cut) + renderSDLive();
+    }
+    return out;
+  };
+
+  // ── periodic refresh while the view is open; refresh on return to the tab ──
+  SD.timer = setInterval(()=>{ if(ui.tab==='transfers' && ui.movementsView==='sdlive' && !document.hidden) sdFetch(); }, SD_REFRESH_MS);
+  document.addEventListener('visibilitychange', ()=>{
+    if(!document.hidden && ui.tab==='transfers' && ui.movementsView==='sdlive' && SD.syncedAt && (Date.now()-SD.syncedAt) > 60000) sdFetch();
+  });
+  // re-match when this app's own roster changes (e.g. Firebase sync brought in new data)
+  const _origRender = window.render;
+  let _empSig = '';
+  window.render = function(){
+    const sig = EMP.length + '|' + EMP.filter(e=>e.dateSeparated).length;
+    if(SD.raw.length && sig!==_empSig){ _empSig = sig; rebuildMatches(); }
+    return _origRender.apply(this, arguments);
+  };
+})();
+</script>
+
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     OJT TRAINEES — LIVE SYNC from the PGB OJT Dashboard
+     (hrservicedeliverypgb-jpg.github.io/Primary-Group-of-Builders-OJT-Dashboard)
+     Paste this whole block just before </body> in people/index.html
+     (after the SD Records block if you added that one too).
+
+     What it does
+     • Listens to the OJT Dashboard's Firestore (ojt_state/trainees) in real time;
+       falls back to polling every 2 min if the live listener can't connect.
+     • Upserts every trainee into this app's Employee list as employmentStatus
+       "Intern/OJT", matched by Employee ID:
+         Date Started  → Date Hired
+         Affiliate     → Company (industry looked up from this app's company list)
+         Cost Center   → Cost Center     Position → Position     his/her → Gender
+     • Active in OJT Dashboard  → stays active here (Date Separated cleared).
+       Separated (archived) in OJT Dashboard → Date Separated = archive date here.
+       Restored in OJT Dashboard → re-activated here.
+     • Changes are saved through this app's own saveEmp(), so they go to the cloud
+       like any manual edit. Only Admin / HR sessions write; Executive sessions
+       just see the result.
+     • Trainees already in this app that are NOT on the OJT Dashboard are left alone.
+     ═══════════════════════════════════════════════════════════════════════════ -->
+<script>
+(function(){
+  const OJT_FB_CONFIG = {
+    apiKey: "AIzaSyCuaA8MKEE3w7ajYD5p3TvQDOBOqYLe1Is",
+    authDomain: "pgb-ojt-dashboard.firebaseapp.com",
+    projectId: "pgb-ojt-dashboard"
+  };
+  const OJT_DOC = 'ojt_state/trainees';
+  const OJT_REST = `https://firestore.googleapis.com/v1/projects/${OJT_FB_CONFIG.projectId}/databases/(default)/documents/${OJT_DOC}?key=${OJT_FB_CONFIG.apiKey}`;
+  const POLL_MS = 2 * 60 * 1000;
+
+  const S = window.OJT_SYNC = { list: null, receivedAt: null, mode: '', lastResult: null, error: '' };
+
+  // ── helpers ──
+  const up = s => String(s||'').trim().replace(/\s+/g,' ').toUpperCase();
+  function isoDate(v){
+    if(v==null || v==='') return '';
+    const s = String(v).trim();
+    if(/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0,10);
+    const d = parseDate(s);                       // handles Excel serials + MM/DD/YYYY
+    if(!d) return '';
+    return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  }
+  function splitName(t){
+    const [last, rest=''] = String(t.name||'').split(',');
+    const parts = rest.trim().split(/\s+/).filter(Boolean);
+    let middle = '';
+    if(parts.length > 1 && /^[A-Za-z]\.?$/.test(parts[parts.length-1])) middle = parts.pop().replace('.','');
+    return { lastName: up(t.ln || last), firstName: up(parts.join(' ')), middleName: up(middle) };
+  }
+  function industryOf(company){
+    const c = (allCompanies()||[]).find(x=>x.company===company);
+    return c ? c.industry : '';
+  }
+  // Firestore REST value → plain JS
+  function fsVal(v){
+    if(!v) return null;
+    if('stringValue' in v) return v.stringValue;
+    if('booleanValue' in v) return v.booleanValue;
+    if('integerValue' in v) return Number(v.integerValue);
+    if('doubleValue' in v) return v.doubleValue;
+    if('nullValue' in v) return null;
+    if('timestampValue' in v) return v.timestampValue;
+    if('mapValue' in v){ const o={}; for(const [k,x] of Object.entries(v.mapValue.fields||{})) o[k]=fsVal(x); return o; }
+    if('arrayValue' in v) return (v.arrayValue.values||[]).map(fsVal);
+    return null;
+  }
+
+  // What this app's record should look like for one trainee
+  function desired(t){
+    const sep = t.archived ? isoDate(t.archivedOn) : '';
+    const hired = isoDate(t.started);
+    return {
+      employeeId: up(t.id),
+      company: up(t.aff),
+      industry: industryOf(up(t.aff)),
+      costCenter: up(t.cc),
+      position: up(t.pos),
+      dateHired: hired,
+      dateSeparated: sep,
+      employmentStatus: 'Intern/OJT',
+      jobGrade: 'OJT',
+      school: t.school || '',
+      rosterSpans: hired ? [{ start: monthStr(parseDate(hired)), end: sep ? monthStr(parseDate(sep)) : '' }] : [],
+      hireTagMonth: '',
+      separationTagMonth: ''
+    };
+  }
+
+  function canWrite(){
+    return (ui.authRole==='Admin' || ui.authRole==='HR')
+      && typeof _lastKnownUpdatedAt!=='undefined' && _lastKnownUpdatedAt     // initial cloud pull done
+      && !(typeof hasUnsyncedLocalChanges==='function' && hasUnsyncedLocalChanges());
+  }
+
+  function reconcile(){
+    if(!S.list || !Array.isArray(EMP)) return null;
+    if(!canWrite()) return null;
+    const byId = {};
+    EMP.forEach(e=>{ if(STATUS_KEY(e.employmentStatus)==='intern' || e.ojtSource) byId[up(e.employeeId)] = e; });
+    const allIds = new Set(EMP.map(e=>up(e.employeeId)));
+    const res = { added:0, updated:0, separated:0, reactivated:0, skipped:[] };
+    const nowMs = monthStr(new Date());
+
+    S.list.forEach(t=>{
+      if(!t || !t.id) return;
+      const d = desired(t);
+      if(!d.dateHired){ res.skipped.push(`${t.name} (no Date Started)`); return; }
+      const ex = byId[d.employeeId];
+      if(!ex){
+        if(allIds.has(d.employeeId)){ res.skipped.push(`${t.name} (ID ${d.employeeId} already used by a non-OJT record)`); return; }
+        const n = splitName(t);
+        EMP.push({
+          ...n, ...d,
+          birthdate: '', department: '',
+          gender: t.pr==='her' ? 'Female' : (t.pr==='his' ? 'Male' : ''),
+          excludeFromHireCount: false,
+          separationReason: d.dateSeparated ? 'Separated (OJT Dashboard)' : '',
+          separationRemarks: '',
+          jobGradeHistory: [{ jobGrade:'OJT', ms: d.rosterSpans[0].start || nowMs }],
+          positionHistory: [{ position: d.position, ms: d.rosterSpans[0].start || nowMs }],
+          statusHistory:   [{ status:'Intern/OJT', ms: d.rosterSpans[0].start || nowMs }],
+          ojtSource: true
+        });
+        res.added++; if(d.dateSeparated) res.separated++;
+        return;
+      }
+      // existing trainee — patch only fields the OJT Dashboard owns
+      let changed = false;
+      const wasSep = !!ex.dateSeparated;
+      for(const k of Object.keys(d)){
+        const a = JSON.stringify(ex[k] ?? ''), b = JSON.stringify(d[k] ?? '');
+        if(a!==b){ ex[k] = d[k]; changed = true; }
+      }
+      if(!ex.gender && t.pr){ ex.gender = t.pr==='her' ? 'Female' : 'Male'; changed = true; }
+      if(d.dateSeparated && !ex.separationReason){ ex.separationReason = 'Separated (OJT Dashboard)'; changed = true; }
+      if(!d.dateSeparated && ex.separationReason==='Separated (OJT Dashboard)'){ ex.separationReason = ''; changed = true; }
+      if(!ex.ojtSource){ ex.ojtSource = true; changed = true; }
+      if(changed){
+        res.updated++;
+        if(!wasSep && d.dateSeparated) res.separated++;
+        if(wasSep && !d.dateSeparated) res.reactivated++;
+      }
+    });
+
+    S.lastResult = { ...res, at: new Date() };
+    if(res.added || res.updated){
+      saveEmp();
+      try{ render(); }catch(e){}
+      const bits = [];
+      if(res.added) bits.push(`${res.added} added`);
+      if(res.updated) bits.push(`${res.updated} updated`);
+      if(res.separated) bits.push(`${res.separated} separated`);
+      if(res.reactivated) bits.push(`${res.reactivated} re-activated`);
+      try{ toast('OJT Dashboard sync: ' + bits.join(', ')); }catch(e){}
+    }
+    if(res.skipped.length) console.warn('OJT sync skipped:', res.skipped);
+    return res;
+  }
+  window.ojtSyncNow = reconcile;
+
+  function receive(list, mode){
+    S.list = Array.isArray(list) ? list : [];
+    S.receivedAt = new Date(); S.mode = mode; S.error = '';
+    reconcile();
+  }
+
+  // ── source 1: real-time Firestore listener (separate named Firebase app) ──
+  function loadScript(src){ return new Promise((ok,no)=>{ const s=document.createElement('script'); s.src=src; s.onload=ok; s.onerror=no; document.head.appendChild(s); }); }
+  async function startRealtime(){
+    if(!window.firebase) throw new Error('Firebase SDK not loaded');
+    const v = (firebase.SDK_VERSION || '10.13.2');
+    if(!firebase.firestore) await loadScript(`https://www.gstatic.com/firebasejs/${v}/firebase-firestore-compat.js`);
+    const app = (firebase.apps||[]).find(a=>a.name==='ojt') || firebase.initializeApp(OJT_FB_CONFIG, 'ojt');
+    app.firestore().doc(OJT_DOC).onSnapshot(
+      snap => receive(snap.exists ? (snap.data().list||[]) : [], 'live'),
+      err  => { console.warn('OJT live listener failed, polling instead:', err); S.error = String(err.message||err); startPolling(); }
+    );
+  }
+  // ── source 2: REST polling fallback ──
+  let pollTimer = null;
+  async function pollOnce(){
+    try{
+      const r = await fetch(OJT_REST, { cache:'no-store' });
+      if(!r.ok) throw new Error('HTTP '+r.status);
+      const j = await r.json();
+      receive(fsVal(j.fields && j.fields.list) || [], 'polling');
+    }catch(e){ S.error = String(e.message||e); console.warn('OJT poll failed:', e); }
+  }
+  function startPolling(){ if(pollTimer) return; pollOnce(); pollTimer = setInterval(pollOnce, POLL_MS); }
+
+  startRealtime().catch(e=>{ console.warn('OJT realtime unavailable:', e); startPolling(); });
+
+  // Re-apply after this app replaces EMP (cloud pull / another device's save) or after sign-in.
+  let _t = null;
+  const _origRender = window.render;
+  window.render = function(){
+    const out = _origRender.apply(this, arguments);
+    if(S.list){ clearTimeout(_t); _t = setTimeout(reconcile, 1500); }
+    return out;
+  };
+})();
+</script>
+
 </body>
 </html>
