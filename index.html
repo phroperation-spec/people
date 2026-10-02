@@ -3,11 +3,15 @@
 <head>
 <meta charset="UTF-8">
 <title>Employee Demographics — PGB</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<!-- Speed: the Excel library (~900 KB) is only needed when you upload/export, so it loads in the
+     background (defer) instead of blocking the page from opening. The Firestore SDK is no longer
+     loaded up front at all — the OJT sync now uses a lightweight REST read every 5 hours and only
+     lazy-loads Firestore as a fallback if that read fails. -->
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<link rel="preconnect" href="https://people-analytics-e363f-default-rtdb.asia-southeast1.firebasedatabase.app">
 <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-database-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-auth-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore-compat.js"></script>
 <style>
   :root{
     --bg:#F3F5FA;
@@ -236,13 +240,21 @@
     background:#7a3b1e; color:#fff; font-family:var(--sans); font-size:12.5px;
     text-align:center; padding:6px 10px;
   }
-  @media print{ #syncBadge, #syncFailBanner{ display:none !important; } }
+  #ojtBadge{
+    position:fixed; right:12px; bottom:44px; z-index:9999; display:none;
+    background:rgba(26,32,54,0.85); color:#c3cbe0; font-family:var(--sans); border:none;
+    font-size:11px; padding:5px 10px; border-radius:20px; box-shadow:0 2px 8px rgba(0,0,0,.2);
+    cursor:pointer; letter-spacing:.2px;
+  }
+  #ojtBadge:hover{ background:rgba(26,32,54,1); color:#fff; }
+  @media print{ #syncBadge, #syncFailBanner, #ojtBadge{ display:none !important; } }
 </style>
 </head>
 <body>
 <div id="syncFailBanner">⚠ Your last change could not be saved to the cloud (check your internet connection or Firebase database rules)<span id="syncFailDetail"></span>. It's kept safely in this browser only — reopening this site elsewhere may not show it yet. It will keep retrying automatically, or <button id="syncRetryBtn" onclick="retrySyncNow()" style="margin-left:2px;background:#fff;color:#7a3b1e;border:none;border-radius:14px;padding:3px 12px;font-size:11.5px;font-weight:600;cursor:pointer;">Retry now</button></div>
 <div class="shell" id="app"></div>
 <div id="syncBadge">☁ Sync not set up</div>
+<button id="ojtBadge" type="button" onclick="ojtSyncNow()" title="OJT list syncs automatically every 5 hours. Click to refresh now.">🎓 OJT list</button>
 
 <script>
 /* ============ STATE ============ */
@@ -500,6 +512,80 @@ async function storageSet(key, value, shared){
   let localOk = false;
   try{ localStorage.setItem(LS_PREFIX+key, value); localOk = true; }catch(e){ localOk = false; }
   return (cloudOk || localOk) ? {key, value, shared:!!shared} : null;
+}
+
+/* ---------- Speed: coalesced local saves ----------
+   Every edit used to serialize the ENTIRE employee list to this browser's storage right away —
+   and several edits in a row (or one action that saves config + employees) did that repeatedly,
+   freezing the page for a moment each time. Now an edit just marks what changed; the actual
+   write happens once, ~250 ms after the last edit, during an idle moment. It's flushed
+   immediately if the tab is hidden or closed, so nothing is lost. Identical content is never
+   re-written (lsWrite remembers the last string it stored per key). The cloud push is unaffected
+   — it still goes out from memory ~400 ms after the edit, exactly as before. */
+const _lsLast = {};
+function lsWrite(key, str){
+  if(_lsLast[key] === str) return true;
+  try{ localStorage.setItem(LS_PREFIX+key, str); _lsLast[key] = str; return true; }catch(e){ return false; }
+}
+function _persistObj(key){ return key==='config' ? CONFIG : (key==='employees' ? EMP : RECRUIT); }
+const _persistPending = new Set();
+let _persistTimer = null;
+function queuePersist(key){
+  _persistPending.add(key);
+  clearTimeout(_persistTimer);
+  _persistTimer = setTimeout(()=>{
+    if(window.requestIdleCallback) requestIdleCallback(()=>flushPersist(), {timeout:1000});
+    else flushPersist();
+  }, 250);
+}
+function flushPersist(){
+  clearTimeout(_persistTimer); _persistTimer = null;
+  if(!_persistPending.size) return;
+  const keys = Array.from(_persistPending); _persistPending.clear();
+  keys.forEach(key=>{
+    const str = JSON.stringify(_persistObj(key));
+    const ok = lsWrite(key, str);
+    if(hasCloudStorage()){ try{ window.storage.set(key, str, true); }catch(e){} }
+    else if(!ok){
+      const label = key==='config' ? 'settings' : (key==='employees' ? 'employee data' : 'recruitment cost data');
+      try{ toast(`Warning: ${label} may not have saved in this browser (storage full?). The cloud copy is unaffected.`); }catch(e){}
+    }
+  });
+}
+window.addEventListener('pagehide', flushPersist);
+document.addEventListener('visibilitychange', ()=>{ if(document.hidden) flushPersist(); });
+
+/* ---------- Speed: gentle re-render for changes coming from OTHER devices / background sync ----------
+   render() rebuilds the whole screen. When it fired the instant another device saved, it could
+   wipe out what you were typing, jump focus, or stutter mid-upload. Background-triggered renders
+   now go through here: they're batched into one paint, and if you're currently typing in a field
+   they wait until you leave it. Your own clicks still re-render immediately as before. */
+let _bgRenderQueued = false, _bgRenderWaitingForBlur = false;
+function _userIsEditing(){
+  const a = document.activeElement;
+  if(!a || a===document.body) return false;
+  const app = document.getElementById('app');
+  if(app && !app.contains(a)) return false;
+  return a.tagName==='INPUT' || a.tagName==='TEXTAREA' || a.tagName==='SELECT' || a.isContentEditable;
+}
+function scheduleBackgroundRender(){
+  if(!ready) return;
+  if(_bgRenderQueued) return;
+  _bgRenderQueued = true;
+  requestAnimationFrame(()=>{
+    _bgRenderQueued = false;
+    if((typeof ui!=='undefined' && ui.modal) || _userIsEditing()){
+      if(!_bgRenderWaitingForBlur){
+        _bgRenderWaitingForBlur = true;
+        const retry = ()=>{ _bgRenderWaitingForBlur = false; document.removeEventListener('focusout', onOut, true); setTimeout(scheduleBackgroundRender, 300); };
+        const onOut = ()=> setTimeout(()=>{ if(!_userIsEditing() && !ui.modal) retry(); }, 50);
+        document.addEventListener('focusout', onOut, true);
+        setTimeout(()=>{ if(_bgRenderWaitingForBlur) retry(); }, 4000); // re-check (e.g. modal closed via a button, no focusout)
+      }
+      return;
+    }
+    try{ render(); }catch(e){ console.error(e); }
+  });
 }
 
 /* ---------- Cloud Sync (cross-device, via Firebase Realtime Database) ----------
@@ -798,31 +884,39 @@ function mergeSyncState(base, mine, theirs){
 }
 
 // Shared by the one-time pull and the live listener below.
+// Speed: compares what arrived against what's already here and only re-saves / re-renders the
+// parts that actually changed. Most live updates (e.g. our own merged push echoing back, or
+// another device touching one record) used to rewrite all three datasets to browser storage and
+// rebuild the whole screen even when nothing visible changed.
 function applyRemoteData(data){
   if (hasUnsyncedLocalChanges()) return false; // don't clobber an edit that's still on its way up
   data = fbRestoreKeys(data);
-  let changed = false;
+  let applied = false, changed = false;
   if (data && data.config){
-    CONFIG = sanitizeConfig(data.config);
-    try{ localStorage.setItem(LS_PREFIX+'config', JSON.stringify(CONFIG)); }catch(e){}
-    changed = true;
+    const cfg = sanitizeConfig(data.config);
+    const str = JSON.stringify(cfg);
+    if (str !== JSON.stringify(CONFIG)){ CONFIG = cfg; changed = true; }
+    lsWrite('config', str);
+    applied = true;
   }
   if (data && Array.isArray(data.employees)){
-    EMP = data.employees;
-    try{ localStorage.setItem(LS_PREFIX+'employees', JSON.stringify(EMP)); }catch(e){}
-    changed = true;
+    const str = JSON.stringify(data.employees);
+    if (str !== JSON.stringify(EMP)){ EMP = data.employees; changed = true; }
+    lsWrite('employees', str);
+    applied = true;
   }
   if (data && data.recruitment){
-    RECRUIT = data.recruitment;
-    try{ localStorage.setItem(LS_PREFIX+'recruitment', JSON.stringify(RECRUIT)); }catch(e){}
-    changed = true;
+    const str = JSON.stringify(data.recruitment);
+    if (str !== JSON.stringify(RECRUIT)){ RECRUIT = data.recruitment; changed = true; }
+    lsWrite('recruitment', str);
+    applied = true;
   }
   if (data && data.updatedAt){ _lastKnownUpdatedAt = data.updatedAt; }
   // This snapshot is now a point both this device and the server are known to agree on — the base
   // the next push's 3-way merge (mergeSyncState) diffs against.
-  if (changed) _lastSyncedSnapshot = snapshotSyncState();
-  if (changed && ready) render();
-  return changed;
+  if (applied && (changed || !_lastSyncedSnapshot)) _lastSyncedSnapshot = snapshotSyncState();
+  if (changed && ready) scheduleBackgroundRender();
+  return applied;
 }
 
 async function pullFromCloud(){
@@ -901,16 +995,22 @@ function adoptCommitted(mineAtPush, committed, seqAtPush){
     recruitment: committed.recruitment || {}
   };
   const next = (_localChangeSeq === seqAtPush) ? cs : mergeSyncState(mineAtPush, {config:CONFIG, employees:EMP, recruitment:RECRUIT}, cs);
-  CONFIG = sanitizeConfig(next.config);
-  EMP = next.employees || [];
-  RECRUIT = next.recruitment || {};
-  try{ localStorage.setItem(LS_PREFIX+'config', JSON.stringify(CONFIG)); }catch(e){}
-  try{ localStorage.setItem(LS_PREFIX+'employees', JSON.stringify(EMP)); }catch(e){}
-  try{ localStorage.setItem(LS_PREFIX+'recruitment', JSON.stringify(RECRUIT)); }catch(e){}
+  // Speed: only touch (and re-render) what actually differs from what's on screen — after a normal
+  // push with no other device involved, the committed result is identical to local data, so the
+  // old unconditional rewrite + full re-render was pure overhead (and the "buffering" after saves).
+  const nCfg = sanitizeConfig(next.config), nEmp = next.employees || [], nRec = next.recruitment || {};
+  const sCfg = JSON.stringify(nCfg), sEmp = JSON.stringify(nEmp), sRec = JSON.stringify(nRec);
+  let changed = false;
+  if (sCfg !== JSON.stringify(CONFIG)){ CONFIG = nCfg; changed = true; }
+  if (sEmp !== JSON.stringify(EMP)){ EMP = nEmp; changed = true; }
+  if (sRec !== JSON.stringify(RECRUIT)){ RECRUIT = nRec; changed = true; }
+  if (!_persistPending.size || _localChangeSeq === seqAtPush){
+    lsWrite('config', sCfg); lsWrite('employees', sEmp); lsWrite('recruitment', sRec);
+  }
   if (committed.updatedAt) _lastKnownUpdatedAt = committed.updatedAt;
   _lastSyncedSnapshot = JSON.parse(JSON.stringify(cs));
   _remoteSkipped = false;
-  if (ready) render();
+  if (changed && ready) scheduleBackgroundRender();
 }
 // Returns true if the change went up as a delta; false means "use the full merge instead".
 async function fastPushToCloud(seqAtPush, mine){
@@ -1010,18 +1110,33 @@ async function pushToCloud(){
 }
 
 // Live cross-device sync: any other device's write shows up here within moments.
+// Speed: bursts of updates (e.g. another device saving a Master List upload in several steps) are
+// coalesced — only the latest snapshot is processed, ~300 ms after things go quiet (never more than
+// 1.5 s late) — instead of decoding + re-rendering the whole dataset for every intermediate step.
+let _rtStarted = false, _rtPendingSnap = null, _rtTimer = null, _rtFirstAt = 0;
+function _processRealtimeSnap(){
+  _rtTimer = null; _rtFirstAt = 0;
+  const snap = _rtPendingSnap; _rtPendingSnap = null;
+  if (!snap) return;
+  const data = snap.val();
+  if (!data || data.updatedAt === _lastKnownUpdatedAt) return; // ignore our own echo / empty node / already-pulled data
+  // applyRemoteData itself refuses to apply while a local edit is still mid-push (see
+  // hasUnsyncedLocalChanges), returning false in that case. Only report "Synced" when it
+  // actually applied this snapshot — otherwise the badge would falsely claim we're caught up
+  // with the cloud while a local change is still waiting to go out.
+  if (applyRemoteData(data)) updateSyncBadge('synced', new Date(data.updatedAt).toLocaleTimeString());
+  else if (hasUnsyncedLocalChanges()) _remoteSkipped = true; // picked up right after our push lands (see adoptCommitted)
+}
 async function startRealtimeSync(){
-  if (!firebaseReady()) return;
+  if (!firebaseReady() || _rtStarted) return;
+  _rtStarted = true;
   await ensureFirebaseAuth();
   _fbRef.on('value', snap => {
-    const data = snap.val();
-    if (!data || data.updatedAt === _lastKnownUpdatedAt) return; // ignore our own echo / empty node
-    // applyRemoteData itself refuses to apply while a local edit is still mid-push (see
-    // hasUnsyncedLocalChanges), returning false in that case. Only report "Synced" when it
-    // actually applied this snapshot — otherwise the badge would falsely claim we're caught up
-    // with the cloud while a local change is still waiting to go out.
-    if (applyRemoteData(data)) updateSyncBadge('synced', new Date(data.updatedAt).toLocaleTimeString());
-    else if (hasUnsyncedLocalChanges()) _remoteSkipped = true; // picked up right after our push lands (see adoptCommitted)
+    _rtPendingSnap = snap;
+    const now = Date.now();
+    if (!_rtFirstAt) _rtFirstAt = now;
+    clearTimeout(_rtTimer);
+    _rtTimer = setTimeout(_processRealtimeSnap, (now - _rtFirstAt) > 1200 ? 0 : 300);
   });
 }
 
@@ -1148,6 +1263,10 @@ async function loadAll(){
   // listening for live updates from other devices.
   updateSyncBadge(firebaseReady() ? 'syncing' : 'unconfigured');
   if (firebaseReady()) await ensureFirebaseAuth(); // don't attempt a read until we're signed in, or the DB rules will reject it
+  // Speed: attach the live listener FIRST so the initial pull below is served from the same
+  // download. Previously the pull (once) and the listener (on) each fetched the entire dataset,
+  // so every page open downloaded everything twice.
+  startRealtimeSync();
   await pullFromCloud();
   if (shouldWaitForCloud){
     ready = true;
@@ -1200,9 +1319,11 @@ async function updateRolePassword(){
   document.getElementById('pwNew').value=''; document.getElementById('pwConfirm').value='';
   toast(role+' password updated.');
 }
-async function saveConfig(){ try{ const r = await storageSet('config', JSON.stringify(CONFIG), true); if(!r) toast('Warning: settings may not have saved. Please try again.'); }catch(e){ toast('Could not save settings.'); } markLocalChange(); schedulePush(); }
-async function saveEmp(){ try{ const r = await storageSet('employees', JSON.stringify(EMP), true); if(!r) toast('Warning: employee data may not have saved. Please try again.'); }catch(e){ toast('Could not save employee data.'); } markLocalChange(); schedulePush(); }
-async function saveRecruit(){ try{ const r = await storageSet('recruitment', JSON.stringify(RECRUIT), true); if(!r) toast('Warning: recruitment data may not have saved. Please try again.'); }catch(e){ toast('Could not save recruitment cost data.'); } markLocalChange(); schedulePush(); }
+// Speed: saves are coalesced (see queuePersist) — the in-memory data is already updated, the
+// browser copy is written once after a burst of edits, and the cloud push goes out as before.
+async function saveConfig(){ queuePersist('config'); markLocalChange(); schedulePush(); return true; }
+async function saveEmp(){ queuePersist('employees'); markLocalChange(); schedulePush(); return true; }
+async function saveRecruit(){ queuePersist('recruitment'); markLocalChange(); schedulePush(); return true; }
 
 const RECRUIT_FIELDS = [
   ['avgSalary','Recruitment Ave. Salary'],
@@ -7217,7 +7338,17 @@ async function confirmAddArchiveRecord(){
 }
 
 /* Generic file -> rows (array of arrays), supports .csv and .xlsx/.xls via SheetJS */
-function fileToRows(file){
+// Speed: the Excel library now loads in the background (see <head>); in the rare case someone
+// uploads in the first second or two after opening the page, wait briefly for it instead of failing.
+function waitForXLSX(ms=8000){
+  return new Promise(res=>{
+    if(typeof XLSX!=='undefined') return res(true);
+    const t0 = Date.now();
+    const iv = setInterval(()=>{ if(typeof XLSX!=='undefined' || Date.now()-t0>ms){ clearInterval(iv); res(typeof XLSX!=='undefined'); } }, 100);
+  });
+}
+async function fileToRows(file){
+  if(!file.name.toLowerCase().endsWith('.csv')) await waitForXLSX();
   return new Promise((resolve, reject)=>{
     const name = file.name.toLowerCase();
     if(name.endsWith('.csv')){
@@ -7230,7 +7361,8 @@ function fileToRows(file){
       const reader = new FileReader();
       reader.onload = ()=>{
         try{
-          const wb = XLSX.read(new Uint8Array(reader.result), {type:'array'});
+          // Speed: parse only the first sheet and skip formulas/HTML/styles we never use — much faster on big or multi-sheet workbooks.
+          const wb = XLSX.read(new Uint8Array(reader.result), {type:'array', sheets:0, cellFormula:false, cellHTML:false, cellStyles:false, bookVBA:false});
           const ws = wb.Sheets[wb.SheetNames[0]];
           const rows = XLSX.utils.sheet_to_json(ws, {header:1, raw:false, defval:''});
           resolve(rows.filter(r=> r.some(x=> String(x).trim()!=='')));
@@ -8949,8 +9081,13 @@ loadAll();
      (after the SD Records block if you added that one too).
 
      What it does
-     • Listens to the OJT Dashboard's Firestore (ojt_state/trainees) in real time;
-       falls back to polling every 2 min if the live listener can't connect.
+     • Reads the OJT Dashboard's Firestore (ojt_state/trainees) ONCE EVERY 5 HOURS
+       with a single lightweight REST call (no always-on live listener, no Firestore
+       SDK download). The last result is cached in this browser, so reopening or
+       refreshing the page within the 5-hour window does NOT re-download or re-sync.
+       The check runs in the background during idle time and only touches the
+       roster if something actually changed. Click the small "🎓 OJT" pill above
+       the sync badge (bottom-right) to force a refresh.
      • Upserts every trainee into this app's Employee list as employmentStatus
        "Intern/OJT", matched by Employee ID:
          Date Started  → Date Hired
@@ -8973,7 +9110,8 @@ loadAll();
   };
   const OJT_DOC = 'ojt_state/trainees';
   const OJT_REST = `https://firestore.googleapis.com/v1/projects/${OJT_FB_CONFIG.projectId}/databases/(default)/documents/${OJT_DOC}?key=${OJT_FB_CONFIG.apiKey}`;
-  const POLL_MS = 2 * 60 * 1000;
+  const SYNC_EVERY_MS = 5 * 60 * 60 * 1000;          // 5 hours
+  const CACHE_KEY = (typeof LS_PREFIX!=='undefined' ? LS_PREFIX : 'pgb_') + 'ojtCache';
 
   const S = window.OJT_SYNC = { list: null, receivedAt: null, mode: '', lastResult: null, error: '' };
 
@@ -9103,46 +9241,115 @@ loadAll();
     if(res.skipped.length) console.warn('OJT sync skipped:', res.skipped);
     return res;
   }
-  window.ojtSyncNow = reconcile;
 
-  function receive(list, mode){
+  // ── list fingerprint: skip reconcile entirely when the OJT list hasn't changed ──
+  function sig(list){ try{ return list.length + ':' + JSON.stringify(list).length + ':' + hash(JSON.stringify(list)); }catch(e){ return String(Math.random()); } }
+  function hash(str){ let h = 5381; for(let i=0;i<str.length;i++) h = ((h<<5)+h + str.charCodeAt(i))|0; return (h>>>0).toString(36); }
+  let _reconciledSig = '';   // list signature last reconciled cleanly against EMP
+  let _pending = false;      // a reconcile is owed (data arrived before login / initial cloud pull)
+
+  function runReconcile(){
+    if(!S.list) return;
+    const sg = sig(S.list);
+    if(sg===_reconciledSig){ _pending = false; return; }
+    const r = reconcile();
+    if(r){ _reconciledSig = sg; _pending = false; }   // done (with or without changes)
+    else _pending = true;                              // not allowed to write yet — retry later
+  }
+  function idle(fn){ (window.requestIdleCallback || (f=>setTimeout(f,200)))(fn, {timeout:3000}); }
+
+  function readCache(){
+    try{ const c = JSON.parse(localStorage.getItem(CACHE_KEY)||'null'); if(c && Array.isArray(c.list) && c.at) return c; }catch(e){}
+    return null;
+  }
+  function writeCache(list, at){ try{ localStorage.setItem(CACHE_KEY, JSON.stringify({ list, at })); }catch(e){} }
+
+  function updateBadge(state){
+    const el = document.getElementById('ojtBadge'); if(!el) return;
+    el.style.display = '';
+    const t = d => d.toLocaleTimeString([], {hour:'numeric', minute:'2-digit'});
+    if(state==='busy'){ el.textContent = '🎓 OJT · refreshing…'; return; }
+    if(S.error && !S.receivedAt){ el.textContent = '🎓 OJT · offline ⟳'; return; }
+    el.textContent = S.receivedAt ? `🎓 OJT · ${t(S.receivedAt)} ⟳` : '🎓 OJT ⟳';
+    const next = _dueAt ? `\nNext automatic sync: ${new Date(_dueAt).toLocaleString()}` : '';
+    el.title = `OJT list syncs automatically every 5 hours.${S.receivedAt ? `\nLast synced: ${S.receivedAt.toLocaleString()}` : ''}${next}${S.error ? `\nLast error: ${S.error}` : ''}\nClick to refresh now.`;
+  }
+  function receive(list, mode, at){
     S.list = Array.isArray(list) ? list : [];
-    S.receivedAt = new Date(); S.mode = mode; S.error = '';
-    reconcile();
+    S.receivedAt = new Date(at || Date.now()); S.mode = mode; S.error = '';
+    idle(runReconcile);
   }
 
-  // ── source 1: real-time Firestore listener (separate named Firebase app) ──
-  function loadScript(src){ return new Promise((ok,no)=>{ const s=document.createElement('script'); s.src=src; s.onload=ok; s.onerror=no; document.head.appendChild(s); }); }
-  async function startRealtime(){
+  // ── one-shot fetch (REST first; lazy-load Firestore SDK only as a fallback) ──
+  function loadScript(src){ return new Promise((ok,no)=>{ const s=document.createElement('script'); s.src=src; s.async=true; s.onload=ok; s.onerror=no; document.head.appendChild(s); }); }
+  async function fetchViaSdk(){
     if(!window.firebase) throw new Error('Firebase SDK not loaded');
     const v = (firebase.SDK_VERSION || '10.13.2');
     if(!firebase.firestore) await loadScript(`https://www.gstatic.com/firebasejs/${v}/firebase-firestore-compat.js`);
     const app = (firebase.apps||[]).find(a=>a.name==='ojt') || firebase.initializeApp(OJT_FB_CONFIG, 'ojt');
-    app.firestore().doc(OJT_DOC).onSnapshot(
-      snap => receive(snap.exists ? (snap.data().list||[]) : [], 'live'),
-      err  => { console.warn('OJT live listener failed, polling instead:', err); S.error = String(err.message||err); startPolling(); }
-    );
+    const snap = await app.firestore().doc(OJT_DOC).get();
+    return snap.exists ? (snap.data().list||[]) : [];
   }
-  // ── source 2: REST polling fallback ──
-  let pollTimer = null;
-  async function pollOnce(){
-    try{
-      const r = await fetch(OJT_REST, { cache:'no-store' });
-      if(!r.ok) throw new Error('HTTP '+r.status);
-      const j = await r.json();
-      receive(fsVal(j.fields && j.fields.list) || [], 'polling');
-    }catch(e){ S.error = String(e.message||e); console.warn('OJT poll failed:', e); }
+  let _inFlight = null;
+  function fetchNow(){
+    if(_inFlight) return _inFlight;
+    updateBadge('busy');
+    _inFlight = (async ()=>{
+      let list, mode = 'rest';
+      try{
+        const ctrl = window.AbortController ? new AbortController() : null;
+        const to = ctrl ? setTimeout(()=>ctrl.abort(), 20000) : null;
+        const r = await fetch(OJT_REST, { cache:'no-store', signal: ctrl ? ctrl.signal : undefined });
+        if(to) clearTimeout(to);
+        if(!r.ok) throw new Error('HTTP '+r.status);
+        const j = await r.json();
+        list = fsVal(j.fields && j.fields.list) || [];
+      }catch(e){
+        console.warn('OJT REST read failed, trying Firestore SDK once:', e);
+        try{ list = await fetchViaSdk(); mode = 'sdk'; }
+        catch(e2){ S.error = String(e2.message||e2); console.warn('OJT sync failed — will retry in 30 min:', e2); schedule(30*60*1000); return null; }
+      }
+      const at = Date.now();
+      writeCache(list, at);
+      receive(list, mode, at);
+      schedule(SYNC_EVERY_MS);
+      return list;
+    })().finally(()=>{ _inFlight = null; updateBadge(); });
+    return _inFlight;
   }
-  function startPolling(){ if(pollTimer) return; pollOnce(); pollTimer = setInterval(pollOnce, POLL_MS); }
 
-  startRealtime().catch(e=>{ console.warn('OJT realtime unavailable:', e); startPolling(); });
+  // ── 5-hour scheduler (survives refreshes via the cached timestamp) ──
+  let _timer = null, _dueAt = 0;
+  function schedule(ms){ clearTimeout(_timer); _dueAt = Date.now() + ms; _timer = setTimeout(()=> idle(fetchNow), ms); }
+  // Background tabs throttle timers; when the tab comes back, catch up if a sync is overdue.
+  document.addEventListener('visibilitychange', ()=>{ if(!document.hidden && _dueAt && Date.now() >= _dueAt) idle(fetchNow); });
 
-  // Re-apply after this app replaces EMP (cloud pull / another device's save) or after sign-in.
+  // Manual refresh: ojtSyncNow() forces a fresh read right away.
+  window.ojtSyncNow = async function(){
+    _reconciledSig = '';
+    const list = await fetchNow();
+    try{ toast(list ? `OJT list refreshed (${list.length} trainees).` : 'OJT list refresh failed — check your connection.'); }catch(e){}
+    return S.lastResult;
+  };
+
+  // ── start-up: use the cached list if it's fresh, otherwise fetch (after the page has settled) ──
+  const cached = readCache();
+  if(cached){
+    S.list = cached.list; S.receivedAt = new Date(cached.at); S.mode = 'cache';
+    _pending = true;                                   // reconcile once the cloud data + login are ready
+  }
+  const age = cached ? (Date.now() - cached.at) : Infinity;
+  if(age >= SYNC_EVERY_MS) setTimeout(()=> idle(fetchNow), 8000);   // let the app finish loading first
+  else schedule(SYNC_EVERY_MS - age);
+  updateBadge();
+
+  // Retry an owed reconcile after renders (cloud pull finished, user signed in) — but ONLY while
+  // one is owed. It no longer re-runs after every single render, which was the main source of lag.
   let _t = null;
   const _origRender = window.render;
   window.render = function(){
     const out = _origRender.apply(this, arguments);
-    if(S.list){ clearTimeout(_t); _t = setTimeout(reconcile, 1500); }
+    if(_pending && S.list){ clearTimeout(_t); _t = setTimeout(()=> idle(runReconcile), 2000); }
     return out;
   };
 })();
