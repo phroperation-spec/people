@@ -1356,9 +1356,37 @@ function costPerHire(company, ms){
   const hires = EMP.filter(e=>{ const {start,end}=monthBounds(ms); return e.company===company && isHiredIn(e,start,end); }).length;
   return hires ? cost/hires : null;
 }
-function recruitRatio(company, ms){
+// Share of org-wide recruitment spend (what used to be labelled "Recruitment Cost Ratio"). Kept as a
+// secondary column — it always sums to 100% across companies, so it shows WHO spent, not how efficiently.
+function recruitShare(company, ms){
   const total = orgRecruitCost(ms);
   return total ? (getRecruitCost(company,ms)/total*100) : null;
+}
+/* ---- Recruitment Cost Ratio (realistic, industry-standard definition) ----
+   RCR = Total Recruitment Cost ÷ Total First-Year Compensation of the hires it produced × 100.
+   First-year compensation = the new hires' combined monthly basic pay × 13 (12 months + the
+   mandatory 13th-month pay under PD 851). The pay figure is entered per company per month in
+   Edit Breakdown / the CSV ("New Hires' Total Monthly Basic Pay"), because this app doesn't
+   store individual salaries. Returns null when either side is missing, so a company with costs
+   but no pay entered shows "—" rather than a misleading 0% or 100%. */
+const RECRUIT_PAY_FIELD = 'hiresMonthlyPay';
+const FIRST_YEAR_PAY_MONTHS = 13;
+const RCR_CHECK_THRESHOLD = 50; // above this, the inputs are almost certainly wrong — flag for review
+function getHiresPay(company, ms){ return Number(getRecruitRecord(company, ms)[RECRUIT_PAY_FIELD]) || 0; }
+function getHiresPayAnnual(company, year){ return yearMonths(year).reduce((s,ms)=> s + getHiresPay(company, ms), 0); }
+function rcrFrom(cost, monthlyPay){ return (cost > 0 && monthlyPay > 0) ? cost / (monthlyPay * FIRST_YEAR_PAY_MONTHS) * 100 : null; }
+function recruitRatio(company, ms){ return rcrFrom(getRecruitCost(company, ms), getHiresPay(company, ms)); }
+// Org-level RCR only counts companies that have BOTH cost and new-hire pay entered for the
+// period — otherwise a company's cost with no matching pay would inflate the org figure.
+function orgRecruitRatio(ms){
+  let cost = 0, pay = 0;
+  allCompanies().forEach(c=>{ const k = getRecruitCost(c.company, ms), p = getHiresPay(c.company, ms); if(k>0 && p>0){ cost += k; pay += p; } });
+  return rcrFrom(cost, pay);
+}
+function rcrCell(v){
+  if(v===null) return '<span title="Enter the new hires\' total monthly basic pay in Edit Breakdown to compute this">—</span>';
+  const txt = v.toFixed(1)+'%';
+  return v > RCR_CHECK_THRESHOLD ? `<span style="color:var(--red);font-weight:600;" title="Unusually high — check the cost and new-hire pay entered">${txt} ⚠</span>` : txt;
 }
 /* Annual (12-month) aggregates */
 function yearMonths(year){ return Array.from({length:12}, (_,i)=> `${year}-${String(i+1).padStart(2,'0')}`); }
@@ -1384,9 +1412,15 @@ function costPerHireAnnual(company, year){
   const hires = hiresInYear(company, year);
   return hires ? cost/hires : null;
 }
-function recruitRatioAnnual(company, year){
+function recruitShareAnnual(company, year){
   const total = orgRecruitCostAnnual(year);
   return total ? (getRecruitCostAnnual(company,year)/total*100) : null;
+}
+function recruitRatioAnnual(company, year){ return rcrFrom(getRecruitCostAnnual(company, year), getHiresPayAnnual(company, year)); }
+function orgRecruitRatioAnnual(year){
+  let cost = 0, pay = 0;
+  allCompanies().forEach(c=>{ const k = getRecruitCostAnnual(c.company, year), p = getHiresPayAnnual(c.company, year); if(k>0 && p>0){ cost += k; pay += p; } });
+  return rcrFrom(cost, pay);
 }
 
 function toast(msg){
@@ -4431,7 +4465,7 @@ function subMovement(list, dateLabel, dateField, period){
   <div class="grid cards3" style="margin-bottom:22px;">
     <div class="card"><div class="label">Recruitment Cost</div><div class="value" style="font-size:20px;">${peso(getRecruitCost(ui.company, ui.month))}</div><div class="foot">${monthLabel(ui.month)} · <a href="#" onclick="event.preventDefault(); ui.tab='recruitment'; render();">edit in Recruitment Cost</a></div></div>
     <div class="card"><div class="label">Cost per Hire</div><div class="value" style="font-size:20px;">${costPerHire(ui.company, ui.month)!==null ? peso(Math.round(costPerHire(ui.company, ui.month))) : '—'}</div><div class="foot">${list.length} hire(s) this month</div></div>
-    <div class="card"><div class="label">Recruitment Cost Ratio</div><div class="value" style="font-size:20px;">${recruitRatio(ui.company, ui.month)!==null ? recruitRatio(ui.company, ui.month).toFixed(1)+'%' : '—'}</div><div class="foot">share of org-wide recruitment spend</div></div>
+    <div class="card"><div class="label">Recruitment Cost Ratio</div><div class="value" style="font-size:20px;">${rcrCell(recruitRatio(ui.company, ui.month))}</div><div class="foot">cost ÷ new hires' first-year pay${recruitShare(ui.company, ui.month)!==null ? ` · ${recruitShare(ui.company, ui.month).toFixed(1)}% of org spend` : ''}</div></div>
   </div>` : (dateField==='dateHired' ? `<p class="hint">Recruitment cost figures are tracked monthly — switch to the Monthly view to see them here, or check the Recruitment Cost tab for the Annual Overview.</p>` : '');
 
   // Task A: for the Separated view, show what tenure people had when they left, and why —
@@ -4572,34 +4606,39 @@ function renderRecruitmentMonthly(){
     const hires = EMP.filter(e=> e.company===c.company && isHiredIn(e,start,end)).length;
     const cph = costPerHire(c.company, ui.month);
     const ratio = recruitRatio(c.company, ui.month);
+    const share = recruitShare(c.company, ui.month);
+    const pay = getHiresPay(c.company, ui.month);
     return `<tr>
       <td class="rowlabel">${c.company}<div class="hint" style="margin:0;">${c.industry}</div></td>
       <td>${peso(cost)}</td>
       <td>${hires ? `<a href="#" onclick="event.preventDefault(); goToCompanyNewHire('${c.company}','monthly','${ui.month}');" style="color:var(--gold);cursor:pointer;text-decoration:underline;" title="View who was hired">${hires}</a>` : hires}</td>
       <td>${cph!==null ? peso(Math.round(cph)) : '—'}</td>
-      <td>${ratio!==null ? ratio.toFixed(1)+'%' : '—'}</td>
+      <td>${pay ? peso(pay) : '—'}</td>
+      <td>${rcrCell(ratio)}</td>
+      <td>${share!==null ? share.toFixed(1)+'%' : '—'}</td>
       <td><button class="btn small" onclick="openRecruitDetailModal('${c.company}')">Edit Breakdown</button></td>
     </tr>`;
   }).join('');
 
   return `
   ${recruitViewToggle()}
-  <div class="grid cards3">
+  <div class="grid cards4">
     <div class="card"><div class="label">Total Recruitment Cost</div><div class="value">${peso(orgCost)}</div><div class="foot">${monthLabel(ui.month)}</div></div>
     <div class="card"><div class="label">New Hires</div><div class="value green">${orgHires ? `<a href="#" onclick="event.preventDefault(); goToArchiveHires('${curYear}','');" style="color:inherit;text-decoration:underline;cursor:pointer;" title="View the full hire list in the Archive">${orgHires}</a>` : orgHires}</div><div class="foot">${monthLabel(ui.month)} · click to view the list</div></div>
     <div class="card"><div class="label">Avg. Cost per Hire</div><div class="value">${orgHires? peso(Math.round(orgCost/orgHires)) : '—'}</div><div class="foot">organization-wide</div></div>
+    <div class="card"><div class="label">Recruitment Cost Ratio</div><div class="value">${rcrCell(orgRecruitRatio(ui.month))}</div><div class="foot">cost ÷ new hires' first-year pay</div></div>
   </div>
 
   <h2 class="section">Recruitment Cost by Company <span class="n">${monthLabel(ui.month)} · click a New Hires count to see who they are, or Edit Breakdown to enter expense details</span></h2>
   <table class="demo">
-    <thead><tr><th class="rowlabel">Company</th><th>Recruitment Cost</th><th>New Hires</th><th>Cost per Hire</th><th>Recruitment Cost Ratio</th><th></th></tr></thead>
-    <tbody>${rows || '<tr><td colspan="6" class="empty">No companies configured yet.</td></tr>'}</tbody>
+    <thead><tr><th class="rowlabel">Company</th><th>Recruitment Cost</th><th>New Hires</th><th>Cost per Hire</th><th>New Hires' Monthly Basic Pay</th><th>Recruitment Cost Ratio</th><th>Share of Org Spend</th><th></th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="8" class="empty">No companies configured yet.</td></tr>'}</tbody>
   </table>
-  <p class="hint" style="margin-top:10px;">Recruitment Cost is the sum of six expense items — Recruitment Ave. Salary, Hiring Manager/Interviewer Time, Load Allocation, Recruitment Ad Posting, Travel Expense, and Recruitment Collaterals. Cost per Hire = Recruitment Cost ÷ New Hires that month (drawn straight from Company Detail's New Hire data — the same count you'd see there). Recruitment Cost Ratio = a company's share (%) of that month's total organization-wide recruitment spend.</p>
+  <p class="hint" style="margin-top:10px;">Recruitment Cost is the sum of six expense items — Recruitment Ave. Salary, Hiring Manager/Interviewer Time, Load Allocation, Recruitment Ad Posting, Travel Expense, and Recruitment Collaterals. Cost per Hire = Recruitment Cost ÷ New Hires that month (drawn straight from Company Detail's New Hire data — the same count you'd see there). <b>Recruitment Cost Ratio</b> = Recruitment Cost ÷ (New Hires' total monthly basic pay × 13) × 100 — i.e., what it cost to hire, as a % of the first-year pay (12 months + 13th month) of the people hired. Lower is more efficient. It shows "—" until the new hires' pay is entered in Edit Breakdown, and is flagged ⚠ above ${RCR_CHECK_THRESHOLD}% so wrong inputs stand out. <b>Share of Org Spend</b> is each company's % of the month's total recruitment spend (the figure this column used to show). Tip: recruiting costs often land a month or two before the hire — the Annual Overview gives the fairest ratio.</p>
 
   <div class="panel" style="margin-top:24px;">
     <div class="panel-head"><h3>Bulk Upload Recruitment Cost</h3></div>
-    <p class="hint">Upload a CSV with columns: <b>Company, Month (YYYY-MM), Recruitment Ave Salary, Hiring Manager/Interviewer Time, Load Allocation, Recruitment Ad Posting, Travel Expense, Recruitment Collaterals</b>. Matching rows for the same company and month are overwritten.</p>
+    <p class="hint">Upload a CSV with columns: <b>Company, Month (YYYY-MM), Recruitment Ave Salary, Hiring Manager/Interviewer Time, Load Allocation, Recruitment Ad Posting, Travel Expense, Recruitment Collaterals</b>, plus optional <b>New Hires Monthly Basic Pay</b> (needed for the Recruitment Cost Ratio). Matching rows for the same company and month are overwritten.</p>
     <div class="field-row">
       <input type="file" id="recruitFile" accept=".csv">
       <button class="btn primary" onclick="handleRecruitUpload()">Upload</button>
@@ -4623,12 +4662,16 @@ function renderRecruitmentAnnual(){
     const hires = hiresInYear(c.company, year);
     const cph = costPerHireAnnual(c.company, year);
     const ratio = recruitRatioAnnual(c.company, year);
+    const share = recruitShareAnnual(c.company, year);
+    const pay = getHiresPayAnnual(c.company, year);
     return `<tr>
       <td class="rowlabel">${c.company}<div class="hint" style="margin:0;">${c.industry}</div></td>
       <td>${peso(cost)}</td>
       <td>${hires ? `<a href="#" onclick="event.preventDefault(); goToCompanyNewHire('${c.company}','annual','${year}');" style="color:var(--gold);cursor:pointer;text-decoration:underline;" title="View who was hired">${hires}</a>` : hires}</td>
       <td>${cph!==null ? peso(Math.round(cph)) : '—'}</td>
-      <td>${ratio!==null ? ratio.toFixed(1)+'%' : '—'}</td>
+      <td>${pay ? peso(pay) : '—'}</td>
+      <td>${rcrCell(ratio)}</td>
+      <td>${share!==null ? share.toFixed(1)+'%' : '—'}</td>
     </tr>`;
   }).join('');
 
@@ -4646,16 +4689,17 @@ function renderRecruitmentAnnual(){
       </select>
     </div>
   </div>
-  <div class="grid cards3">
+  <div class="grid cards4">
     <div class="card"><div class="label">Total Recruitment Cost</div><div class="value">${peso(orgCost)}</div><div class="foot">${year}, all companies</div></div>
     <div class="card"><div class="label">New Hires</div><div class="value green">${orgHires ? `<a href="#" onclick="event.preventDefault(); goToArchiveHires('${year}','');" style="color:inherit;text-decoration:underline;cursor:pointer;" title="View the full hire list in the Archive">${orgHires}</a>` : orgHires}</div><div class="foot">${year}, all companies · click to view the list</div></div>
     <div class="card"><div class="label">Avg. Cost per Hire</div><div class="value">${orgHires? peso(Math.round(orgCost/orgHires)) : '—'}</div><div class="foot">organization-wide, ${year}</div></div>
+    <div class="card"><div class="label">Recruitment Cost Ratio</div><div class="value">${rcrCell(orgRecruitRatioAnnual(year))}</div><div class="foot">${year} cost ÷ new hires' first-year pay</div></div>
   </div>
 
   <h2 class="section">Annual Recruitment Cost by Company <span class="n">${year} · sum of all 12 months · click a New Hires count to see who they are</span></h2>
   <table class="demo">
-    <thead><tr><th class="rowlabel">Company</th><th>Recruitment Cost</th><th>New Hires</th><th>Cost per Hire</th><th>Recruitment Cost Ratio</th></tr></thead>
-    <tbody>${rows || '<tr><td colspan="5" class="empty">No companies configured yet.</td></tr>'}</tbody>
+    <thead><tr><th class="rowlabel">Company</th><th>Recruitment Cost</th><th>New Hires</th><th>Cost per Hire</th><th>New Hires' Monthly Basic Pay (sum)</th><th>Recruitment Cost Ratio</th><th>Share of Org Spend</th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="7" class="empty">No companies configured yet.</td></tr>'}</tbody>
   </table>
 
   <h2 class="section">Annual Spend by Expense Type <span class="n">${year} · organization-wide</span></h2>
@@ -4663,7 +4707,7 @@ function renderRecruitmentAnnual(){
     <thead><tr><th class="rowlabel">Expense Type</th><th>Total</th></tr></thead>
     <tbody>${fieldRows}</tbody>
   </table>
-  <p class="hint" style="margin-top:10px;">Recruitment Cost Ratio here is each company's share (%) of the full year's organization-wide recruitment spend.</p>
+  <p class="hint" style="margin-top:10px;"><b>Recruitment Cost Ratio</b> = the year's Recruitment Cost ÷ (sum of each month's New Hires' monthly basic pay × 13) × 100 — recruiting cost as a % of the hires' first-year pay. Only companies with both figures entered count toward the organization-wide ratio. <b>Share of Org Spend</b> = each company's % of the year's total recruitment spend.</p>
   `;
 }
 
@@ -4674,6 +4718,8 @@ async function confirmRecruitDetail(){
     const el = document.getElementById('rd_'+k);
     if(el) await setRecruitField(company, ui.month, k, el.value);
   }
+  const payEl = document.getElementById('rd_'+RECRUIT_PAY_FIELD);
+  if(payEl) await setRecruitField(company, ui.month, RECRUIT_PAY_FIELD, payEl.value);
   closeModal();
   toast('Recruitment cost breakdown saved.');
 }
@@ -4693,6 +4739,7 @@ function handleRecruitUpload(){
       avgSalary: idx('ave salary'), interviewerTime: idx('interviewer'), loadAllocation: idx('load'),
       adPosting: idx('ad posting'), travelExpense: idx('travel'), collaterals: idx('collateral')
     };
+    const cPay = idx('basic pay'); // optional "New Hires Monthly Basic Pay" column
     let count = 0;
     for(let r=1;r<rows.length;r++){
       const row = rows[r];
@@ -4709,6 +4756,8 @@ function handleRecruitUpload(){
       // Amounts like "8,000" or "₱8,000.50" used to read as 0 (Number() can't parse the comma).
       const amt = v => Number(String(v==null?'':v).replace(/[₱,\s]|php/gi,'')) || 0;
       RECRUIT_FIELDS.forEach(([k])=>{ rec[k] = fieldIdx[k]>=0 ? amt(row[fieldIdx[k]]) : 0; });
+      // Older CSVs without the pay column keep whatever pay was already entered for that month.
+      rec[RECRUIT_PAY_FIELD] = cPay>=0 ? amt(row[cPay]) : (Number(getRecruitRecord(company, month)[RECRUIT_PAY_FIELD]) || 0);
       RECRUIT[recruitKey(company, month)] = rec;
       count++;
     }
@@ -4720,15 +4769,16 @@ function handleRecruitUpload(){
   reader.readAsText(input.files[0]);
 }
 function downloadRecruitTemplate(){
-  const headers = ['Company','Month','Recruitment Ave Salary','Hiring Manager/Interviewer Time','Load Allocation','Recruitment Ad Posting','Travel Expense','Recruitment Collaterals'];
-  downloadCSV([headers, ['Company A', ui.month, '8000','3000','1500','2500','1000','800']], 'recruitment_cost_template.csv');
+  const headers = ['Company','Month','Recruitment Ave Salary','Hiring Manager/Interviewer Time','Load Allocation','Recruitment Ad Posting','Travel Expense','Recruitment Collaterals','New Hires Monthly Basic Pay'];
+  downloadCSV([headers, ['Company A', ui.month, '8000','3000','1500','2500','1000','800','54000']], 'recruitment_cost_template.csv');
 }
 function downloadRecruitExport(){
-  const headers = ['Company','Month','Recruitment Ave Salary','Hiring Manager/Interviewer Time','Load Allocation','Recruitment Ad Posting','Travel Expense','Recruitment Collaterals'];
+  const headers = ['Company','Month','Recruitment Ave Salary','Hiring Manager/Interviewer Time','Load Allocation','Recruitment Ad Posting','Travel Expense','Recruitment Collaterals','New Hires Monthly Basic Pay','Recruitment Cost Ratio (%)'];
   const rows = Object.keys(RECRUIT).map(k=>{
     const [company,month] = k.split('|');
     const rec = getRecruitRecord(company, month);
-    return [company, month, ...RECRUIT_FIELDS.map(([f])=> rec[f]||0)];
+    const r = recruitRatio(company, month);
+    return [company, month, ...RECRUIT_FIELDS.map(([f])=> rec[f]||0), rec[RECRUIT_PAY_FIELD]||0, r===null ? '' : r.toFixed(1)];
   });
   downloadCSV([headers, ...rows], 'recruitment_cost_export.csv');
 }
@@ -8522,7 +8572,13 @@ function renderModal(){
       <div class="field" style="margin-bottom:10px;">
         <label>${label.toUpperCase()}</label>
         <input type="number" id="rd_${k}" value="${rec[k]||''}" placeholder="0">
+        ${k==='avgSalary' ? `<div class="hint" style="margin:4px 0 0;">The share of the <b>recruiters'</b> salary spent on this company's hiring this month — not the new hires' pay (that goes below).</div>` : ''}
       </div>`).join('')}
+    <div class="field" style="margin:16px 0 10px;padding-top:12px;border-top:1px solid var(--line, #ddd);">
+      <label>NEW HIRES' TOTAL MONTHLY BASIC PAY <span style="font-weight:400;text-transform:none;">(not a cost — used for the Recruitment Cost Ratio)</span></label>
+      <input type="number" id="rd_${RECRUIT_PAY_FIELD}" value="${rec[RECRUIT_PAY_FIELD]||''}" placeholder="0">
+      <div class="hint" style="margin:4px 0 0;">Add up the monthly basic pay of everyone hired at ${company} this month. The ratio uses this × 13 as their first-year pay.</div>
+    </div>
     <div style="margin-top:14px;"><button class="btn primary" onclick="confirmRecruitDetail()">Save</button> <button class="btn" onclick="closeModal()">Cancel</button></div>`;
   } else if(ui.modal.type==='separate'){
     const emp = EMP.find(e=> String(e.employeeId)===String(ui.modal.arg));
