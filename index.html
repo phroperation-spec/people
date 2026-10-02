@@ -2603,13 +2603,13 @@ function render(){
   // Task: Executives lost Transfers (removed from this list below) — Company Detail stays
   // allowed since that's where their Export access lives now (see companySubview's 'export'
   // branch and renderCompany's Export sub-tab, both gated on canViewCompanyExport()).
-  const EXEC_ALLOWED_TABS = ['overview','company','forecastreport','ats'];
+  const EXEC_ALLOWED_TABS = ['overview','company','forecastreport']; // ATS + PGB Masterlist link removed for Executives
   try{
     if(ui.tab==='settings' && !isAdmin()){
       body.innerHTML = '<div class="empty">The Control Panel is restricted to Admin users. Switch your role to Admin (bottom-left) if that\'s you, or ask your Admin for this change.</div>';
     }
     else if(ui.role==='Executive' && !EXEC_ALLOWED_TABS.includes(ui.tab)){
-      body.innerHTML = '<div class="empty">Executives can only access Trend &amp; Insight, Company Detail, Executive Report, and ATS. Switch your role (bottom-left) if that\'s not right, or ask HR/Admin for these other views.</div>';
+      body.innerHTML = '<div class="empty">Executives can only access Trend &amp; Insight, Company Detail, and Executive Report. Switch your role (bottom-left) if that\'s not right, or ask HR/Admin for these other views.</div>';
     }
     else if(ui.tab==='overview') body.innerHTML = renderOverview();
     else if(ui.tab==='company') body.innerHTML = renderCompany();
@@ -2633,11 +2633,12 @@ function render(){
 function sidebar(){
   const unmapped = unmappedCostCenters();
   const dueAppraisals = pendingAppraisals().length;
-  const EXEC_ALLOWED_TABS = ['overview','company','forecastreport','ats'];
+  const EXEC_ALLOWED_TABS = ['overview','company','forecastreport']; // ATS + PGB Masterlist link removed for Executives
   const navItems = NAV_ITEMS.filter(([k,,,href])=>{
-    if(href) return true; // external links are visible to every role
     if(k==='settings') return isAdmin();
+    // Executives only see their allowed tabs — this also hides external links such as PGB Masterlist ↗
     if(ui.role==='Executive') return EXEC_ALLOWED_TABS.includes(k);
+    if(href) return true; // external links are visible to Admin / HR
     return true;
   });
   return `
