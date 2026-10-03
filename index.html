@@ -5,8 +5,7 @@
 <title>Employee Demographics — PGB</title>
 <!-- Speed: the Excel library (~900 KB) is only needed when you upload/export, so it loads in the
      background (defer) instead of blocking the page from opening. The Firestore SDK is no longer
-     loaded up front at all — the OJT sync now uses a lightweight REST read every 5 hours and only
-     lazy-loads Firestore as a fallback if that read fails. -->
+     loaded at all (the OJT Dashboard sync has been removed). -->
 <script defer src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="preconnect" href="https://people-analytics-e363f-default-rtdb.asia-southeast1.firebasedatabase.app">
 <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
@@ -254,7 +253,6 @@
 <div id="syncFailBanner">⚠ Your last change could not be saved to the cloud (check your internet connection or Firebase database rules)<span id="syncFailDetail"></span>. It's kept safely in this browser only — reopening this site elsewhere may not show it yet. It will keep retrying automatically, or <button id="syncRetryBtn" onclick="retrySyncNow()" style="margin-left:2px;background:#fff;color:#7a3b1e;border:none;border-radius:14px;padding:3px 12px;font-size:11.5px;font-weight:600;cursor:pointer;">Retry now</button></div>
 <div class="shell" id="app"></div>
 <div id="syncBadge">☁ Sync not set up</div>
-<button id="ojtBadge" type="button" onclick="ojtSyncNow()" title="OJT list syncs automatically every 5 hours. Click to refresh now.">🎓 OJT list</button>
 
 <script>
 /* ============ STATE ============ */
@@ -268,7 +266,7 @@ const DEFAULT_CONFIG = {
     {name:'Industry I', companies:['Company A','Company B']},
     {name:'Industry II', companies:['Company C','Company D','Company E']}
   ],
-  statuses: ['Staff','Rank & File','Intern/OJT'],
+  statuses: ['Staff','Rank & File'],
   ageGroups: [
     {label:'Under 25', min:0, max:24},
     {label:'25–34', min:25, max:34},
@@ -900,6 +898,7 @@ function applyRemoteData(data){
     applied = true;
   }
   if (data && Array.isArray(data.employees)){
+    data.employees = stripInternEmp(data.employees);
     const str = JSON.stringify(data.employees);
     if (str !== JSON.stringify(EMP)){ EMP = data.employees; changed = true; }
     lsWrite('employees', str);
@@ -912,6 +911,7 @@ function applyRemoteData(data){
     applied = true;
   }
   if (data && data.updatedAt){ _lastKnownUpdatedAt = data.updatedAt; }
+  maybePushInternPurge();
   // This snapshot is now a point both this device and the server are known to agree on — the base
   // the next push's 3-way merge (mergeSyncState) diffs against.
   if (applied && (changed || !_lastSyncedSnapshot)) _lastSyncedSnapshot = snapshotSyncState();
@@ -998,7 +998,7 @@ function adoptCommitted(mineAtPush, committed, seqAtPush){
   // Speed: only touch (and re-render) what actually differs from what's on screen — after a normal
   // push with no other device involved, the committed result is identical to local data, so the
   // old unconditional rewrite + full re-render was pure overhead (and the "buffering" after saves).
-  const nCfg = sanitizeConfig(next.config), nEmp = next.employees || [], nRec = next.recruitment || {};
+  const nCfg = sanitizeConfig(next.config), nEmp = stripInternEmp(next.employees || []), nRec = next.recruitment || {};
   const sCfg = JSON.stringify(nCfg), sEmp = JSON.stringify(nEmp), sRec = JSON.stringify(nRec);
   let changed = false;
   if (sCfg !== JSON.stringify(CONFIG)){ CONFIG = nCfg; changed = true; }
@@ -1205,7 +1205,39 @@ function sanitizeConfig(cfg){
   if(!Array.isArray(cfg.ageGroups) || !cfg.ageGroups.length) cfg.ageGroups = JSON.parse(JSON.stringify(DEFAULT_CONFIG.ageGroups));
   if(!Array.isArray(cfg.tenureGroups) || !cfg.tenureGroups.length) cfg.tenureGroups = JSON.parse(JSON.stringify(DEFAULT_CONFIG.tenureGroups));
   if(!Array.isArray(cfg.users) || !cfg.users.length) cfg.users = JSON.parse(JSON.stringify(DEFAULT_CONFIG.users));
+  // Intern/OJT has been removed from this app entirely — strip the status and every config entry
+  // tied to it (upload log, job grade groups, position→grade maps).
+  const isInternStatus = st=> /intern|ojt/i.test(String(st||''));
+  const before = JSON.stringify([cfg.statuses, Object.keys(cfg.uploadLog), cfg.jobGradeGroups, cfg.positionJobGrades]);
+  cfg.statuses = cfg.statuses.filter(st=> !isInternStatus(st));
+  if(!cfg.statuses.length) cfg.statuses = DEFAULT_CONFIG.statuses.slice();
+  Object.keys(cfg.uploadLog).forEach(k=>{ if(isInternStatus(k.split('|').slice(1).join('|'))) delete cfg.uploadLog[k]; });
+  [cfg.jobGradeGroups, cfg.positionJobGrades].forEach(map=> Object.keys(map||{}).forEach(c=>{
+    if(map[c] && typeof map[c]==='object') Object.keys(map[c]).forEach(st=>{ if(isInternStatus(st)) delete map[c][st]; });
+  }));
+  if(JSON.stringify([cfg.statuses, Object.keys(cfg.uploadLog), cfg.jobGradeGroups, cfg.positionJobGrades]) !== before) _internPurgePending = true;
   return cfg;
+}
+// ── Intern/OJT permanent removal ──
+// Every Intern/OJT employee record (manually added or from the old OJT Dashboard sync) is dropped
+// locally the moment data loads, so nobody sees it. The deletion is pushed to the shared cloud
+// database the next time an Admin is signed in.
+var _internPurgePending = false;
+function isInternEmp(e){ return !!e && (e.ojtSource || /intern|ojt/i.test(String(e.employmentStatus||''))); }
+function stripInternEmp(arr){
+  if(!Array.isArray(arr)) return arr;
+  const out = arr.filter(e=> !isInternEmp(e));
+  if(out.length !== arr.length) _internPurgePending = true;
+  return out;
+}
+function maybePushInternPurge(){
+  if(!_internPurgePending || typeof isAdmin!=='function' || !isAdmin()) return;
+  _internPurgePending = false;
+  setTimeout(async ()=>{
+    EMP = stripInternEmp(EMP); _internPurgePending = false;
+    await saveConfig(); await saveEmp();
+    try{ toast('Intern/OJT records permanently removed from the shared database.'); }catch(e){}
+  }, 1500);
 }
 
 async function loadAll(){
@@ -1236,7 +1268,7 @@ async function loadAll(){
   });
   try{
     const e = await storageGet('employees', true);
-    EMP = e ? JSON.parse(e.value) : [];
+    EMP = stripInternEmp(e ? JSON.parse(e.value) : []);
     if (e) hadLocalCache = true;
   }catch(e){ EMP = []; }
   try{
@@ -1273,6 +1305,7 @@ async function loadAll(){
     render();
   }
   startRealtimeSync();
+  maybePushInternPurge();
 }
 /* ============ AUTH (per-role password, SHA-256 hashed) ============ */
 async function sha256Hex(str){
@@ -1293,6 +1326,7 @@ async function attemptLogin(){
     ui.authRole = role; ui.role = role; ui.loginError = '';
     try{ localStorage.setItem(LS_PREFIX+'session', JSON.stringify({role, at:Date.now()})); }catch(e){}
     render();
+    maybePushInternPurge();
   }else{
     ui.loginError = 'Incorrect password for '+role+'.';
     render();
@@ -2337,7 +2371,8 @@ function orgTrend(company, companiesList){
   // Industry — when no single company is picked. Ignored if `company` is set, since a single
   // company is already the narrowest possible scope.
   const scopeList = (!company && companiesList && companiesList.length) ? companiesList : null;
-  const inScope = e=> scopeList ? scopeList.includes(e.company) : (!company || e.company===company);
+  // Intern/OJT is excluded from Trend & Insight entirely (headcount trend included).
+  const inScope = e=> STATUS_KEY(e.employmentStatus)!=='intern' && (scopeList ? scopeList.includes(e.company) : (!company || e.company===company));
   // A scope only has a baseline recorded if its first Master List went through this app. When
   // it's missing, fall back to the earliest reporting month actually on file for that scope —
   // otherwise every month before real data existed reads as a legitimate headcount of 0.
@@ -2404,7 +2439,7 @@ function compositionDonut(byStatus, total){
     <div class="donut-legend">
       <div><span class="sw" style="background:var(--blue);"></span>Staff — <b>${byStatus.staff}</b> <span style="color:var(--dim);">(${staffPct.toFixed(0)}%)</span></div>
       <div><span class="sw" style="background:var(--teal);"></span>Rank &amp; File — <b>${byStatus.rankfile}</b> <span style="color:var(--dim);">(${rankPct.toFixed(0)}%)</span></div>
-      <div><span class="sw" style="background:var(--violet);"></span>Intern/OJT — <b>${byStatus.intern}</b> <span style="color:var(--dim);">(${internPct.toFixed(0)}%)</span></div>
+      ${byStatus.intern ? `<div><span class="sw" style="background:var(--violet);"></span>Intern/OJT — <b>${byStatus.intern}</b> <span style="color:var(--dim);">(${internPct.toFixed(0)}%)</span></div>` : ''}
     </div>
   </div>`;
 }
@@ -3029,7 +3064,8 @@ function renderOverview(){
     ).join('')}
   </div>`;
 
-  const inScope = e=> (!scopeCompany || e.company===scopeCompany) && (!scopeIndustry || industryOf(e.company)===scopeIndustry) && (!statusScope || STATUS_KEY(e.employmentStatus)===statusScope);
+  // Intern/OJT (incl. the OJT Dashboard sync list) is never part of Trend & Insight.
+  const inScope = e=> STATUS_KEY(e.employmentStatus)!=='intern' && (!scopeCompany || e.company===scopeCompany) && (!scopeIndustry || industryOf(e.company)===scopeIndustry) && (!statusScope || STATUS_KEY(e.employmentStatus)===statusScope);
   const RATE_STATUSES = ['staff','rankfile'];
   // Task: the Workforce Snapshot (Total Headcount, Composition, Gender/Age/Tenure) must reflect
   // reported data for THIS year, per employment status — not just "this company had SOMETHING
@@ -3081,7 +3117,7 @@ function renderOverview(){
   </div>
   <div class="field-row" style="align-items:center;justify-content:space-between;margin-top:8px;">
     ${statusToggle}
-    <p class="hint" style="margin:0;">Staff and Rank &amp; File demographics can be viewed separately, or Overall (blended) — Intern/OJT isn't broken out here since it isn't part of Retention/Attrition.</p>
+    <p class="hint" style="margin:0;">Staff and Rank &amp; File demographics can be viewed separately, or Overall (blended) — Intern/OJT is not tracked on this platform.</p>
   </div>
 
   <h2 class="section">Workforce Snapshot <span class="n">${scopeLabel} · ${statusScopeLabel} · ${year} · as of ${asOfLabel}</span></h2>
@@ -3093,7 +3129,7 @@ function renderOverview(){
     </div>
     ${statusScope ? '' : `<div class="panel" style="flex:1;min-width:280px;max-width:420px;">
       <div class="panel-head"><h3>Workforce Composition</h3></div>
-      ${compositionDonut({staff: activeAll.filter(e=>STATUS_KEY(e.employmentStatus)==='staff').length, rankfile: activeAll.filter(e=>STATUS_KEY(e.employmentStatus)==='rankfile').length, intern: activeAll.filter(e=>STATUS_KEY(e.employmentStatus)==='intern').length}, activeAll.length)}
+      ${compositionDonut({staff: activeAll.filter(e=>STATUS_KEY(e.employmentStatus)==='staff').length, rankfile: activeAll.filter(e=>STATUS_KEY(e.employmentStatus)==='rankfile').length, intern: 0}, activeAll.length)}
     </div>`}
     <div class="panel" style="flex:1;min-width:280px;max-width:420px;">
       <div class="panel-head"><h3>New Hires vs. Already Employed <span style="font-weight:400;color:var(--dim);font-size:11px;">${year}</span></h3></div>
@@ -3170,7 +3206,7 @@ function overviewTable(year, scopeIndustry, scopeCompany){
   if(!companies.length) return '<div class="empty">No companies configured yet.</div>';
   const byInd = {};
   companies.forEach(c=>{ (byInd[c.industry] = byInd[c.industry]||[]).push(c.company); });
-  const statuses = CONFIG.statuses || [];
+  const statuses = (CONFIG.statuses || []).filter(s=> STATUS_KEY(s)!=='intern'); // Intern/OJT excluded from Trend & Insight
 
   // Per-company, per-EXACT-employment-status stats ACCUMULATED for the selected year — kept
   // separate per real status name (Staff, Rank & File, Intern/OJT, or any custom status added
@@ -3245,7 +3281,7 @@ function overviewTable(year, scopeIndustry, scopeCompany){
       ${cohortBlocks}
     </tbody>
   </table>
-  <p class="hint">Headcount and Movement rows are accumulated for <b>${year}</b> and broken out per employment status — each row shows <b>—</b> if that specific status hasn't had a Master List, Quick Add, or New Hire &amp; Separated Import touch ${year} yet at that company. Overall Attrition/Retention Rate is shown once, at scope level, in the Movement &amp; Separation cards above — see it there or per-cohort just below. <b>Annual Cohort Split</b> takes ${nhYear} and divides everyone active that year, per status, into two mutually-exclusive groups — people hired <b>in ${nhYear}</b> (New Hires) versus people already on the roster <b>before ${nhYear}</b> (Existing Employees) — so you can see whether that year's departures skewed toward new joiners or tenured staff, and shows <b>n/a</b> Attrition/Retention for Intern/OJT since it isn't a meaningful figure for that status. Change the Year picker up top to view a different year.</p>`;
+  <p class="hint">Headcount and Movement rows are accumulated for <b>${year}</b> and broken out per employment status — each row shows <b>—</b> if that specific status hasn't had a Master List, Quick Add, or New Hire &amp; Separated Import touch ${year} yet at that company. Overall Attrition/Retention Rate is shown once, at scope level, in the Movement &amp; Separation cards above — see it there or per-cohort just below. <b>Annual Cohort Split</b> takes ${nhYear} and divides everyone active that year, per status, into two mutually-exclusive groups — people hired <b>in ${nhYear}</b> (New Hires) versus people already on the roster <b>before ${nhYear}</b> (Existing Employees) — so you can see whether that year's departures skewed toward new joiners or tenured staff. Change the Year picker up top to view a different year.</p>`;
 }
 
 // Same underlying data as overviewTable() above (companyStatusStatsAnnual / anyMonthUploadedInYear
@@ -3259,7 +3295,7 @@ function overviewExportRows(year, scopeIndustry, scopeCompany){
   if(scopeIndustry) companies = companies.filter(c=> c.industry===scopeIndustry);
   if(scopeCompany) companies = companies.filter(c=> c.company===scopeCompany);
   if(!companies.length) return [['No companies configured yet.']];
-  const statuses = CONFIG.statuses || [];
+  const statuses = (CONFIG.statuses || []).filter(s=> STATUS_KEY(s)!=='intern'); // Intern/OJT excluded from Trend & Insight
 
   const stats = {};
   companies.forEach(c=>{
@@ -3333,7 +3369,8 @@ function exportOverviewExcel(){
   const statusScope = (ui.overviewStatusScope==='staff' || ui.overviewStatusScope==='rankfile') ? ui.overviewStatusScope : '';
   const statusScopeLabel = statusScope==='staff' ? 'Staff' : (statusScope==='rankfile' ? 'Rank & File' : 'Overall');
 
-  const inScope = e=> (!scopeCompany || e.company===scopeCompany) && (!scopeIndustry || industryOf(e.company)===scopeIndustry) && (!statusScope || STATUS_KEY(e.employmentStatus)===statusScope);
+  // Intern/OJT (incl. the OJT Dashboard sync list) is never part of Trend & Insight.
+  const inScope = e=> STATUS_KEY(e.employmentStatus)!=='intern' && (!scopeCompany || e.company===scopeCompany) && (!scopeIndustry || industryOf(e.company)===scopeIndustry) && (!statusScope || STATUS_KEY(e.employmentStatus)===statusScope);
   const RATE_STATUSES = ['staff','rankfile'];
   const statusReported = e => anyMonthUploadedInYear(e.company, e.employmentStatus, year);
 
@@ -3366,8 +3403,7 @@ function exportOverviewExcel(){
   if(!statusScope){
     snapshotRows.push(
       ['Staff', activeAll.filter(e=>STATUS_KEY(e.employmentStatus)==='staff').length],
-      ['Rank & File', activeAll.filter(e=>STATUS_KEY(e.employmentStatus)==='rankfile').length],
-      ['Intern/OJT', activeAll.filter(e=>STATUS_KEY(e.employmentStatus)==='intern').length]
+      ['Rank & File', activeAll.filter(e=>STATUS_KEY(e.employmentStatus)==='rankfile').length]
     );
   }
   snapshotRows.push(
@@ -3549,10 +3585,9 @@ function subHeadcount(st, period){
   // Monthly/Annual period selector, which only drives the Overall block above).
   const nhYear = Number(ui.month.split('-')[0]) || new Date().getFullYear();
   return `
-  <div class="grid cards3">
+  <div class="grid cards3" style="grid-template-columns:repeat(2,1fr);">
     <div class="card"><div class="label">Staff</div><div class="value" style="color:var(--blue)">${subStatusHasData('Staff') ? st.byStatus.staff : noDataCell('Staff')}</div></div>
     <div class="card"><div class="label">Rank &amp; File</div><div class="value" style="color:var(--teal)">${subStatusHasData('Rank & File') ? st.byStatus.rankfile : noDataCell('Rank & File')}</div></div>
-    <div class="card"><div class="label">Intern / OJT</div><div class="value" style="color:var(--violet)">${subStatusHasData('Intern/OJT') ? st.byStatus.intern : noDataCell('Intern/OJT')}</div></div>
   </div>
   <h2 class="section">Retention &amp; Attrition <span class="n">${period.label} · Staff &amp; Rank &amp; File only</span></h2>
   <div class="grid cards3" style="grid-template-columns:repeat(2,1fr);margin-bottom:14px;">
@@ -3599,14 +3634,14 @@ function subGroupBy(st, keyFn, label, forcedOrder, period, searchTerm, showPct){
     ? cell(n, d, bold)
     : `<td style="color:var(--dim);" title="No ${statusLabel} data has been fed for ${monthLabel(ui.month)} yet.">— no data</td>`;
   const rows = keys.map(k=>`
-    <tr><td class="rowlabel">${k}</td>${statusCell('Staff', groups[k].staff, colTotals.staff)}${statusCell('Rank & File', groups[k].rankfile, colTotals.rankfile)}${statusCell('Intern/OJT', groups[k].intern, colTotals.intern)}${cell(groups[k].total, colTotals.total, true)}</tr>
+    <tr><td class="rowlabel">${k}</td>${statusCell('Staff', groups[k].staff, colTotals.staff)}${statusCell('Rank & File', groups[k].rankfile, colTotals.rankfile)}${cell(groups[k].total, colTotals.total, true)}</tr>
   `).join('');
   const totalRow = showPct ? `
-    <tr class="total"><td class="rowlabel">Total</td>${statusCell('Staff', colTotals.staff, colTotals.staff, true)}${statusCell('Rank & File', colTotals.rankfile, colTotals.rankfile, true)}${statusCell('Intern/OJT', colTotals.intern, colTotals.intern, true)}${cell(colTotals.total, colTotals.total, true)}</tr>` : '';
+    <tr class="total"><td class="rowlabel">Total</td>${statusCell('Staff', colTotals.staff, colTotals.staff, true)}${statusCell('Rank & File', colTotals.rankfile, colTotals.rankfile, true)}${cell(colTotals.total, colTotals.total, true)}</tr>` : '';
   return `
   <h2 class="section">${label} Breakdown <span class="n">${keys.length} group(s) · ${period.label}</span></h2>
   <table class="demo">
-    <thead><tr><th class="rowlabel">${label}</th><th>Staff</th><th>Rank &amp; File</th><th>Intern/OJT</th><th>Total</th></tr></thead>
+    <thead><tr><th class="rowlabel">${label}</th><th>Staff</th><th>Rank &amp; File</th><th>Total</th></tr></thead>
     <tbody>${rows}${totalRow}</tbody>
   </table>`;
 }
@@ -3657,20 +3692,20 @@ function subCostCenterByDept(st, period, searchTerm){
     let ccKeys = Object.keys(groups[dept]).sort();
     if(q && !dept.toLowerCase().includes(q)) ccKeys = ccKeys.filter(cc=> cc.toLowerCase().includes(q));
     const subtotal = {staff:0, rankfile:0, intern:0, total:0};
-    body += `<tr class="stathead"><td colspan="5">${dept}</td></tr>`;
+    body += `<tr class="stathead"><td colspan="4">${dept}</td></tr>`;
     ccKeys.forEach(cc=>{
       const g = groups[dept][cc];
       subtotal.staff+=g.staff; subtotal.rankfile+=g.rankfile; subtotal.intern+=g.intern; subtotal.total+=g.total;
-      body += `<tr><td class="rowlabel">${cc}</td>${statusTd('Staff', g.staff)}${statusTd('Rank & File', g.rankfile)}${statusTd('Intern/OJT', g.intern)}<td><b>${g.total}</b></td></tr>`;
+      body += `<tr><td class="rowlabel">${cc}</td>${statusTd('Staff', g.staff)}${statusTd('Rank & File', g.rankfile)}<td><b>${g.total}</b></td></tr>`;
     });
-    body += `<tr class="total"><td class="rowlabel">Subtotal — ${dept}</td>${statusTd('Staff', subtotal.staff, true)}${statusTd('Rank & File', subtotal.rankfile, true)}${statusTd('Intern/OJT', subtotal.intern, true)}<td><b>${subtotal.total}</b></td></tr>`;
+    body += `<tr class="total"><td class="rowlabel">Subtotal — ${dept}</td>${statusTd('Staff', subtotal.staff, true)}${statusTd('Rank & File', subtotal.rankfile, true)}<td><b>${subtotal.total}</b></td></tr>`;
     grand.staff+=subtotal.staff; grand.rankfile+=subtotal.rankfile; grand.intern+=subtotal.intern; grand.total+=subtotal.total;
   });
-  body += `<tr class="total"><td class="rowlabel">Grand Total</td>${statusTd('Staff', grand.staff, true)}${statusTd('Rank & File', grand.rankfile, true)}${statusTd('Intern/OJT', grand.intern, true)}<td><b>${grand.total}</b></td></tr>`;
+  body += `<tr class="total"><td class="rowlabel">Grand Total</td>${statusTd('Staff', grand.staff, true)}${statusTd('Rank & File', grand.rankfile, true)}<td><b>${grand.total}</b></td></tr>`;
   return `
   <h2 class="section">Cost Center Breakdown <span class="n">grouped by department · ${period.label}</span></h2>
   <table class="demo">
-    <thead><tr><th class="rowlabel">Cost Center</th><th>Staff</th><th>Rank &amp; File</th><th>Intern/OJT</th><th>Total</th></tr></thead>
+    <thead><tr><th class="rowlabel">Cost Center</th><th>Staff</th><th>Rank &amp; File</th><th>Total</th></tr></thead>
     <tbody>${body}</tbody>
   </table>`;
 }
@@ -3876,7 +3911,7 @@ function exportPositionExcel(){
   const deptKeyFn = e=> deptOfEmployee(e, true);
 
   const breakdownRows = [['Position','Job Grade Group','Employment Status','Headcount','% of Status']];
-  [['staff','Staff'],['rankfile','Rank & File'],['intern','Intern/OJT']].forEach(([key,label])=>{
+  [['staff','Staff'],['rankfile','Rank & File']].forEach(([key,label])=>{
     const list = st.active.filter(e=> STATUS_KEY(e.employmentStatus)===key);
     if(!list.length) return;
     const groups = {};
@@ -3936,7 +3971,7 @@ function exportPositionExcel(){
 // Task A: Staff and Rank & File (and Intern/OJT) each get their own Position Breakdown table —
 // they're no longer counted together in shared columns of a single table.
 function subPositionBreakdownByStatus(st, period, keyFn, searchTerm){
-  const statusDefs = [['staff','Staff'],['rankfile','Rank & File'],['intern','Intern/OJT']];
+  const statusDefs = [['staff','Staff'],['rankfile','Rank & File']];
   const q = (searchTerm||'').trim().toLowerCase();
   let out = '';
   statusDefs.forEach(([key,label])=>{
@@ -4799,7 +4834,7 @@ function archiveYears(){
 function archiveMatchesFilter(e){
   if(ui.archiveCompany && e.company!==ui.archiveCompany) return false;
   if(ui.archiveStatus && e.employmentStatus!==ui.archiveStatus) return false;
-  if(ui.archiveStatus!=='Intern/OJT' && STATUS_KEY(e.employmentStatus)==='intern') return false;
+  if(isInternEmp(e)) return false;
   return true;
 }
 function renderArchive(){
@@ -5857,7 +5892,7 @@ function newHireSeparatedImportPanel(){
       <p class="hint">Use this to <b>add a batch of new hires</b>, <b>mark a batch of separations</b>, or do first-time system setup / correct historical records where you already know the exact details. Upload a CSV with these columns (any order): <b>Industry, Company, Department, Cost Center, ID #, Last Name, First Name, Middle Name, Gender, Position, Job Grade, Birthdate, Date Hired, Employment Status, Date Separated, Separation Reason, Separation Remarks, Hire Reporting Month, Separation Reporting Month</b> (both optional). Age is calculated automatically from Birthdate and always stays current, so it's never uploaded directly. <b>Download the Template below</b> — it includes one filled-out example row of each type.</p>
       <p class="hint"><b>To add a New Hire:</b> use a new ID # and fill in Industry, Company, Department, Cost Center, Last Name, First Name, Gender, Position, Job Grade, Birthdate, Employment Status, and Date Hired. Leave Date Separated, Separation Reason, and Separation Remarks <b>blank</b> — they'll be added straight onto the Active Roster as active. Date Hired is kept exactly as entered, but the month this hire is <b>counted</b> under (Overview, Company Detail, Archive, Recruitment Cost) comes from <b>Hire Reporting Month</b> if given, otherwise it defaults to the month you run this import, regardless of what Date Hired says.</p>
       <p class="hint"><b>To mark a Separation:</b> use the <b>existing</b> ID # already on file, and fill in Date Separated plus a Separation Reason that matches one of the options in the Control Panel (Remarks optional). The rest of that row's fields will simply overwrite the existing record — that row moves to the Hire &amp; Separation Archive. Date Separated is kept exactly as you enter it, but it is <b>not</b> what decides which month the separation is counted under in Overview/Company Detail/Archive — that's controlled by <b>Separation Reporting Month</b> (format YYYY-MM). Leave it blank and it defaults to the month you're running this import in.</p>
-      <p class="hint">Rows are applied <b>exactly as given</b> — nothing is auto-detected. Employment Status should match one of the statuses configured in Control Panel (Staff, Rank &amp; File, Intern/OJT, or any other you've added) — this same file works for onboarding or separating <b>any</b> employment status, including Intern/OJT. Because this writes directly to the shared employee record, changes here immediately flow through to the Active Roster, Company Detail, Trend &amp; Insight and Archive. Avoid using this for routine monthly refreshes — use Master List for that instead. <b>ID # is the same shared key</b> used by the Master List upload, so a person added here will be matched correctly the next time their company runs a Master List refresh.</p>
+      <p class="hint">Rows are applied <b>exactly as given</b> — nothing is auto-detected. Employment Status should match one of the statuses configured in Control Panel (Staff, Rank &amp; File, or any other you've added) — this same file works for onboarding or separating <b>any</b> of those statuses. Rows marked Intern/OJT are skipped — Intern/OJT is no longer tracked on this platform. Because this writes directly to the shared employee record, changes here immediately flow through to the Active Roster, Company Detail, Trend &amp; Insight and Archive. Avoid using this for routine monthly refreshes — use Master List for that instead. <b>ID # is the same shared key</b> used by the Master List upload, so a person added here will be matched correctly the next time their company runs a Master List refresh.</p>
     </details>
     <div class="field-row">
       <div class="field"><label>IMPORT FILE (.CSV / .XLSX)</label><input type="file" id="csvFile" accept=".csv,.xlsx,.xls" /></div>
@@ -6219,10 +6254,9 @@ function renderExecReport(){
       <div class="card"><div class="label">New Hires</div><div class="value green">${st.hired.length}${execDelta(st.hired.length, prevSt?prevSt.hired.length:null, {label:period.prevLabel})}</div></div>
       <div class="card"><div class="label">Separations</div><div class="value red">${st.separated.length}${execDelta(st.separated.length, prevSt?prevSt.separated.length:null, {label:period.prevLabel, higherIsBad:true})}</div></div>
     </div>
-    <div class="grid cards3" style="margin-top:12px;">
+    <div class="grid cards3" style="grid-template-columns:repeat(2,1fr);margin-top:12px;">
       <div class="card"><div class="label">Staff</div><div class="value" style="color:var(--blue);font-size:20px;">${st.byStatus?st.byStatus.staff:active.filter(e=>STATUS_KEY(e.employmentStatus)==='staff').length}</div></div>
       <div class="card"><div class="label">Rank &amp; File</div><div class="value" style="color:var(--teal);font-size:20px;">${st.byStatus?st.byStatus.rankfile:active.filter(e=>STATUS_KEY(e.employmentStatus)==='rankfile').length}</div></div>
-      <div class="card"><div class="label">Intern/OJT</div><div class="value" style="color:var(--violet);font-size:20px;">${st.byStatus?st.byStatus.intern:active.filter(e=>STATUS_KEY(e.employmentStatus)==='intern').length}</div></div>
     </div>
     <div class="grid cards3" style="grid-template-columns:repeat(2,1fr);margin-top:12px;">
       <div class="card"><div class="label">Retention Rate</div><div class="value green" style="font-size:20px;">${st.retentionRate.toFixed(1)}%${execDelta(st.retentionRate, prevSt?prevSt.retentionRate:null, {label:period.prevLabel, suffix:'pts', decimals:1})}</div></div>
@@ -7237,6 +7271,7 @@ async function confirmEditEmployee(){
   const emp = EMP.find(e=> String(e.employeeId)===String(ui.modal.arg));
   if(!emp) return;
   const g = id=> document.getElementById(id).value.trim();
+  if(g('em_sepDate') && !matchSepReason(g('em_sepReason'))){ toast('Please select a Separation Reason from the list — reasons are managed in the Control Panel.'); return; }
   emp.lastName = g('em_last');
   emp.firstName = g('em_first');
   emp.middleName = g('em_middle');
@@ -7266,7 +7301,7 @@ async function confirmEditEmployee(){
   emp.dateSeparated = sepDate;
   if(sepDate){
     emp.separationTagMonth = g('em_tagMonth') || monthStr(new Date());
-    emp.separationReason = g('em_sepReason');
+    emp.separationReason = matchSepReason(g('em_sepReason'));
     emp.separationRemarks = g('em_sepRemarks');
   } else {
     emp.separationTagMonth = '';
@@ -7372,13 +7407,14 @@ async function confirmAddArchiveRecord(){
     if(cc) await addManualCostCenter(company, cc);
   }
   const sepDate = g('ar_sepDate');
+  if(sepDate && !matchSepReason(g('ar_sepReason'))){ msgEl.textContent = 'Please select a Separation Reason from the list — reasons are managed in the Control Panel.'; toast('Please select a Separation Reason.'); return; }
   const emp = {
     employeeId:id, lastName:g('ar_last'), firstName:g('ar_first'), middleName:g('ar_middle'),
     company, industry:industryOf(company), department:'', costCenter:cc,
     position:g('ar_pos'), jobGrade:g('ar_grade'), birthdate:g('ar_birthdate'), gender:g('ar_gender'), employmentStatus:g('ar_status'),
     dateHired:g('ar_hired'), hireTagMonth: g('ar_hireTagMonth') || monthStr(new Date()), dateSeparated:sepDate,
     separationTagMonth: sepDate ? (g('ar_tagMonth') || monthStr(new Date())) : '',
-    separationReason: sepDate ? g('ar_sepReason') : '',
+    separationReason: sepDate ? matchSepReason(g('ar_sepReason')) : '',
     separationRemarks: sepDate ? g('ar_sepRemarks') : ''
   };
   syncRosterSpanFromRecord(emp);
@@ -8028,13 +8064,35 @@ function handleUpload(){
       dateHired: idx('hire'), employmentStatus: idx('status'), dateSeparated: idx('separat'),
       separationReason: idx('reason'), separationRemarks: idx('remark'), reportingMonth: idx('separation reporting month','sep reporting month'), hireReportingMonth: idx('hire reporting month','hire tag month')
     };
-    let newHires=0, updated=0, separated=0;
+    // Pre-check before anything is saved: every row that ends up separated must carry a Separation
+    // Reason that matches the Control Panel list (case-insensitive). Free-text reasons are rejected.
+    const badReasonRows = [];
+    for(let r=1;r<rows.length;r++){
+      const row = rows[r];
+      const get = k => map[k]>=0 ? String(row[map[k]]===undefined||row[map[k]]===null ? '' : row[map[k]]).trim() : '';
+      const id = get('employeeId');
+      if(!id) continue;
+      if(/intern|ojt/i.test(get('employmentStatus'))) continue;
+      const prev = EMP.find(e=> String(e.employeeId)===String(id));
+      const dateSep = normalizeDateInput(get('dateSeparated')) || (prev ? (prev.dateSeparated||'') : '');
+      if(!dateSep) continue;
+      const fileReason = get('separationReason');
+      const ok = fileReason ? !!matchSepReason(fileReason) : !!(prev && matchSepReason(prev.separationReason));
+      if(!ok) badReasonRows.push(`row ${r+1} (ID ${id}${fileReason ? `: "${fileReason}"` : ': blank'})`);
+    }
+    if(badReasonRows.length){
+      msg.textContent = `Import stopped — nothing was saved. ${badReasonRows.length} separated row(s) have a missing or invalid Separation Reason: ${badReasonRows.slice(0,10).join(', ')}${badReasonRows.length>10?', …':''}. Use only these reasons from the Control Panel: ${CONFIG.separationReasons.join(', ')}.`;
+      toast('Import stopped — fix the Separation Reasons and upload again.');
+      return;
+    }
+    let newHires=0, updated=0, separated=0, skippedIntern=0;
     const touchedGroups = new Set(); // `${company}|${status}` pairs seen, so grades can be auto-assigned after
     for(let r=1;r<rows.length;r++){
       const row = rows[r];
       const get = k => map[k]>=0 ? String(row[map[k]]===undefined||row[map[k]]===null ? '' : row[map[k]]).trim() : '';
       const id = get('employeeId');
       if(!id) continue;
+      if(/intern|ojt/i.test(get('employmentStatus'))){ skippedIntern++; continue; }
       const exists = EMP.findIndex(e=> String(e.employeeId)===String(id));
       // For an EXISTING ID, a blank cell now means "keep what's on file" — previously the whole
       // record was rebuilt from the file row alone, so a separation row with only ID # + Date
@@ -8069,7 +8127,7 @@ function handleUpload(){
         costCenter:keep('costCenter', get('costCenter')), gender:keep('gender', normGender(get('gender'))), position:keep('position', get('position')), jobGrade:keep('jobGrade', get('jobGrade')), birthdate: keep('birthdate', normalizeDateInput(get('birthdate'))),
         employmentStatus: get('employmentStatus') ? normStatus(get('employmentStatus')) : (prev ? prev.employmentStatus : normStatus('')), dateHired, hireTagMonth, dateSeparated,
         separationTagMonth,
-        separationReason: dateSeparated ? keep('separationReason', get('separationReason')) : '', separationRemarks: dateSeparated ? keep('separationRemarks', get('separationRemarks')) : '',
+        separationReason: dateSeparated ? (matchSepReason(get('separationReason')) || matchSepReason(prev && prev.separationReason)) : '', separationRemarks: dateSeparated ? keep('separationRemarks', get('separationRemarks')) : '',
         // Updating an existing record must not rebuild their roster history from scratch — carry
         // whatever months they were already reported under, then apply this file's change.
         rosterSpans: exists>=0 ? rosterSpansOf(EMP[exists]).map(sp=>({...sp})) : [],
@@ -8099,7 +8157,7 @@ function handleUpload(){
       await autoAssignPositionJobGrades(tCompany, tStatus);
     }
     const unmapped = unmappedCostCenters();
-    msg.textContent = `Import complete: ${newHires} new hire(s) added to the Active Roster, ${updated} existing record(s) updated (${separated} of those marked separated).` + (unmapped ? ` ${unmapped} cost center(s) across your companies need a department — assign them in the Control Panel.` : '');
+    msg.textContent = `Import complete: ${newHires} new hire(s) added to the Active Roster, ${updated} existing record(s) updated (${separated} of those marked separated).` + (skippedIntern ? ` ${skippedIntern} Intern/OJT row(s) skipped — Intern/OJT is no longer tracked.` : '') + (unmapped ? ` ${unmapped} cost center(s) across your companies need a department — assign them in the Control Panel.` : '');
     toast('New Hire & Separated Import complete — Active Roster updated.');
     render();
   })();
@@ -8487,11 +8545,19 @@ async function handleAddManualCC(){
 async function addStatus(){
   const v = document.getElementById('newStatus').value.trim();
   if(!v) return;
+  if(/intern|ojt/i.test(v)){ toast('Intern/OJT has been removed from this platform and can\'t be added back as a status.'); return; }
   if(!CONFIG.statuses.includes(v)) CONFIG.statuses.push(v);
   await saveConfig(); render();
 }
 async function removeStatus(i){ CONFIG.statuses.splice(i,1); await saveConfig(); render(); }
 
+// Separation Reasons are a closed list managed in the Control Panel — every manual entry point
+// (Quick Add, Edit, bulk import) must resolve to one of these exact values, never free text.
+function matchSepReason(v){
+  const t = String(v||'').trim().toLowerCase();
+  if(!t) return '';
+  return (CONFIG.separationReasons||[]).find(r=> r.toLowerCase()===t) || '';
+}
 async function addSepReason(){
   const v = document.getElementById('newSepReason').value.trim();
   if(!v) return;
@@ -8837,7 +8903,7 @@ function renderModal(){
         <div class="field"><label>SEPARATION REPORTING MONTH</label><input type="month" id="em_tagMonth" value="${separationTagMonthOf(emp)||''}"></div>
       </div>
       <div class="field-row">
-        <div class="field" style="flex:1;"><label>SEPARATION REASON</label><select id="em_sepReason"><option value="">None</option>${CONFIG.separationReasons.map(r=>`<option ${r===emp.separationReason?'selected':''}>${r}</option>`).join('')}</select></div>
+        <div class="field" style="flex:1;"><label>SEPARATION REASON</label><select id="em_sepReason"><option value="">Select reason… (required if separated)</option>${CONFIG.separationReasons.map(r=>`<option ${r===emp.separationReason?'selected':''}>${r}</option>`).join('')}</select></div>
         <div class="field" style="flex:2;"><label>REMARKS</label><input type="text" id="em_sepRemarks" value="${emp.separationRemarks||''}" style="width:100%;"></div>
       </div>
       <p class="hint">Clear Date Separated to move this person back onto the Active Roster. Reporting Months control which month each event is counted under (Overview, Company Detail, Archive) — independent of the actual dates above.</p>
@@ -8882,7 +8948,7 @@ function renderModal(){
       <div class="field"><label>SEPARATION REPORTING MONTH</label><input type="month" id="ar_tagMonth" value="${monthStr(new Date())}"></div>
     </div>
     <div class="field-row">
-      <div class="field" style="flex:1;"><label>SEPARATION REASON</label><select id="ar_sepReason"><option value="">None</option>${CONFIG.separationReasons.map(r=>`<option>${r}</option>`).join('')}</select></div>
+      <div class="field" style="flex:1;"><label>SEPARATION REASON</label><select id="ar_sepReason"><option value="">Select reason… (required if separated)</option>${CONFIG.separationReasons.map(r=>`<option>${r}</option>`).join('')}</select></div>
       <div class="field" style="flex:2;"><label>REMARKS</label><input type="text" id="ar_sepRemarks" style="width:100%;"></div>
     </div>
     <div id="arAddMsg" class="hint"></div>
@@ -9131,286 +9197,7 @@ loadAll();
 })();
 </script>
 
-<!-- ═══════════════════════════════════════════════════════════════════════════
-     OJT TRAINEES — LIVE SYNC from the PGB OJT Dashboard
-     (hrservicedeliverypgb-jpg.github.io/Primary-Group-of-Builders-OJT-Dashboard)
-     Paste this whole block just before </body> in people/index.html
-     (after the SD Records block if you added that one too).
 
-     What it does
-     • Reads the OJT Dashboard's Firestore (ojt_state/trainees) ONCE EVERY 5 HOURS
-       with a single lightweight REST call (no always-on live listener, no Firestore
-       SDK download). The last result is cached in this browser, so reopening or
-       refreshing the page within the 5-hour window does NOT re-download or re-sync.
-       The check runs in the background during idle time and only touches the
-       roster if something actually changed. Click the small "🎓 OJT" pill above
-       the sync badge (bottom-right) to force a refresh.
-     • Upserts every trainee into this app's Employee list as employmentStatus
-       "Intern/OJT", matched by Employee ID:
-         Date Started  → Date Hired
-         Affiliate     → Company (industry looked up from this app's company list)
-         Cost Center   → Cost Center     Position → Position     his/her → Gender
-     • Active in OJT Dashboard  → stays active here (Date Separated cleared).
-       Separated (archived) in OJT Dashboard → Date Separated = archive date here.
-       Restored in OJT Dashboard → re-activated here.
-     • Changes are saved through this app's own saveEmp(), so they go to the cloud
-       like any manual edit. Only Admin / HR sessions write; Executive sessions
-       just see the result.
-     • Trainees already in this app that are NOT on the OJT Dashboard are left alone.
-     ═══════════════════════════════════════════════════════════════════════════ -->
-<script>
-(function(){
-  const OJT_FB_CONFIG = {
-    apiKey: "AIzaSyCuaA8MKEE3w7ajYD5p3TvQDOBOqYLe1Is",
-    authDomain: "pgb-ojt-dashboard.firebaseapp.com",
-    projectId: "pgb-ojt-dashboard"
-  };
-  const OJT_DOC = 'ojt_state/trainees';
-  const OJT_REST = `https://firestore.googleapis.com/v1/projects/${OJT_FB_CONFIG.projectId}/databases/(default)/documents/${OJT_DOC}?key=${OJT_FB_CONFIG.apiKey}`;
-  const SYNC_EVERY_MS = 5 * 60 * 60 * 1000;          // 5 hours
-  const CACHE_KEY = (typeof LS_PREFIX!=='undefined' ? LS_PREFIX : 'pgb_') + 'ojtCache';
-
-  const S = window.OJT_SYNC = { list: null, receivedAt: null, mode: '', lastResult: null, error: '' };
-
-  // ── helpers ──
-  const up = s => String(s||'').trim().replace(/\s+/g,' ').toUpperCase();
-  function isoDate(v){
-    if(v==null || v==='') return '';
-    const s = String(v).trim();
-    if(/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0,10);
-    const d = parseDate(s);                       // handles Excel serials + MM/DD/YYYY
-    if(!d) return '';
-    return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
-  }
-  function splitName(t){
-    const [last, rest=''] = String(t.name||'').split(',');
-    const parts = rest.trim().split(/\s+/).filter(Boolean);
-    let middle = '';
-    if(parts.length > 1 && /^[A-Za-z]\.?$/.test(parts[parts.length-1])) middle = parts.pop().replace('.','');
-    return { lastName: up(t.ln || last), firstName: up(parts.join(' ')), middleName: up(middle) };
-  }
-  function industryOf(company){
-    const c = (allCompanies()||[]).find(x=>x.company===company);
-    return c ? c.industry : '';
-  }
-  // Firestore REST value → plain JS
-  function fsVal(v){
-    if(!v) return null;
-    if('stringValue' in v) return v.stringValue;
-    if('booleanValue' in v) return v.booleanValue;
-    if('integerValue' in v) return Number(v.integerValue);
-    if('doubleValue' in v) return v.doubleValue;
-    if('nullValue' in v) return null;
-    if('timestampValue' in v) return v.timestampValue;
-    if('mapValue' in v){ const o={}; for(const [k,x] of Object.entries(v.mapValue.fields||{})) o[k]=fsVal(x); return o; }
-    if('arrayValue' in v) return (v.arrayValue.values||[]).map(fsVal);
-    return null;
-  }
-
-  // What this app's record should look like for one trainee
-  function desired(t){
-    const sep = t.archived ? isoDate(t.archivedOn) : '';
-    const hired = isoDate(t.started);
-    return {
-      employeeId: up(t.id),
-      company: up(t.aff),
-      industry: industryOf(up(t.aff)),
-      costCenter: up(t.cc),
-      position: up(t.pos),
-      dateHired: hired,
-      dateSeparated: sep,
-      employmentStatus: 'Intern/OJT',
-      jobGrade: 'OJT',
-      school: t.school || '',
-      rosterSpans: hired ? [{ start: monthStr(parseDate(hired)), end: sep ? monthStr(parseDate(sep)) : '' }] : [],
-      hireTagMonth: '',
-      separationTagMonth: ''
-    };
-  }
-
-  function canWrite(){
-    return (ui.authRole==='Admin' || ui.authRole==='HR')
-      && typeof _lastKnownUpdatedAt!=='undefined' && _lastKnownUpdatedAt     // initial cloud pull done
-      && !(typeof hasUnsyncedLocalChanges==='function' && hasUnsyncedLocalChanges());
-  }
-
-  function reconcile(){
-    if(!S.list || !Array.isArray(EMP)) return null;
-    if(!canWrite()) return null;
-    const byId = {};
-    EMP.forEach(e=>{ if(STATUS_KEY(e.employmentStatus)==='intern' || e.ojtSource) byId[up(e.employeeId)] = e; });
-    const allIds = new Set(EMP.map(e=>up(e.employeeId)));
-    const res = { added:0, updated:0, separated:0, reactivated:0, skipped:[] };
-    const nowMs = monthStr(new Date());
-
-    S.list.forEach(t=>{
-      if(!t || !t.id) return;
-      const d = desired(t);
-      if(!d.dateHired){ res.skipped.push(`${t.name} (no Date Started)`); return; }
-      const ex = byId[d.employeeId];
-      if(!ex){
-        if(allIds.has(d.employeeId)){ res.skipped.push(`${t.name} (ID ${d.employeeId} already used by a non-OJT record)`); return; }
-        const n = splitName(t);
-        EMP.push({
-          ...n, ...d,
-          birthdate: '', department: '',
-          gender: t.pr==='her' ? 'Female' : (t.pr==='his' ? 'Male' : ''),
-          excludeFromHireCount: false,
-          separationReason: d.dateSeparated ? 'Separated (OJT Dashboard)' : '',
-          separationRemarks: '',
-          jobGradeHistory: [{ jobGrade:'OJT', ms: d.rosterSpans[0].start || nowMs }],
-          positionHistory: [{ position: d.position, ms: d.rosterSpans[0].start || nowMs }],
-          statusHistory:   [{ status:'Intern/OJT', ms: d.rosterSpans[0].start || nowMs }],
-          ojtSource: true
-        });
-        res.added++; if(d.dateSeparated) res.separated++;
-        return;
-      }
-      // existing trainee — patch only fields the OJT Dashboard owns
-      let changed = false;
-      const wasSep = !!ex.dateSeparated;
-      for(const k of Object.keys(d)){
-        const a = JSON.stringify(ex[k] ?? ''), b = JSON.stringify(d[k] ?? '');
-        if(a!==b){ ex[k] = d[k]; changed = true; }
-      }
-      if(!ex.gender && t.pr){ ex.gender = t.pr==='her' ? 'Female' : 'Male'; changed = true; }
-      if(d.dateSeparated && !ex.separationReason){ ex.separationReason = 'Separated (OJT Dashboard)'; changed = true; }
-      if(!d.dateSeparated && ex.separationReason==='Separated (OJT Dashboard)'){ ex.separationReason = ''; changed = true; }
-      if(!ex.ojtSource){ ex.ojtSource = true; changed = true; }
-      if(changed){
-        res.updated++;
-        if(!wasSep && d.dateSeparated) res.separated++;
-        if(wasSep && !d.dateSeparated) res.reactivated++;
-      }
-    });
-
-    S.lastResult = { ...res, at: new Date() };
-    if(res.added || res.updated){
-      saveEmp();
-      try{ render(); }catch(e){}
-      const bits = [];
-      if(res.added) bits.push(`${res.added} added`);
-      if(res.updated) bits.push(`${res.updated} updated`);
-      if(res.separated) bits.push(`${res.separated} separated`);
-      if(res.reactivated) bits.push(`${res.reactivated} re-activated`);
-      try{ toast('OJT Dashboard sync: ' + bits.join(', ')); }catch(e){}
-    }
-    if(res.skipped.length) console.warn('OJT sync skipped:', res.skipped);
-    return res;
-  }
-
-  // ── list fingerprint: skip reconcile entirely when the OJT list hasn't changed ──
-  function sig(list){ try{ return list.length + ':' + JSON.stringify(list).length + ':' + hash(JSON.stringify(list)); }catch(e){ return String(Math.random()); } }
-  function hash(str){ let h = 5381; for(let i=0;i<str.length;i++) h = ((h<<5)+h + str.charCodeAt(i))|0; return (h>>>0).toString(36); }
-  let _reconciledSig = '';   // list signature last reconciled cleanly against EMP
-  let _pending = false;      // a reconcile is owed (data arrived before login / initial cloud pull)
-
-  function runReconcile(){
-    if(!S.list) return;
-    const sg = sig(S.list);
-    if(sg===_reconciledSig){ _pending = false; return; }
-    const r = reconcile();
-    if(r){ _reconciledSig = sg; _pending = false; }   // done (with or without changes)
-    else _pending = true;                              // not allowed to write yet — retry later
-  }
-  function idle(fn){ (window.requestIdleCallback || (f=>setTimeout(f,200)))(fn, {timeout:3000}); }
-
-  function readCache(){
-    try{ const c = JSON.parse(localStorage.getItem(CACHE_KEY)||'null'); if(c && Array.isArray(c.list) && c.at) return c; }catch(e){}
-    return null;
-  }
-  function writeCache(list, at){ try{ localStorage.setItem(CACHE_KEY, JSON.stringify({ list, at })); }catch(e){} }
-
-  function updateBadge(state){
-    const el = document.getElementById('ojtBadge'); if(!el) return;
-    el.style.display = '';
-    const t = d => d.toLocaleTimeString([], {hour:'numeric', minute:'2-digit'});
-    if(state==='busy'){ el.textContent = '🎓 OJT · refreshing…'; return; }
-    if(S.error && !S.receivedAt){ el.textContent = '🎓 OJT · offline ⟳'; return; }
-    el.textContent = S.receivedAt ? `🎓 OJT · ${t(S.receivedAt)} ⟳` : '🎓 OJT ⟳';
-    const next = _dueAt ? `\nNext automatic sync: ${new Date(_dueAt).toLocaleString()}` : '';
-    el.title = `OJT list syncs automatically every 5 hours.${S.receivedAt ? `\nLast synced: ${S.receivedAt.toLocaleString()}` : ''}${next}${S.error ? `\nLast error: ${S.error}` : ''}\nClick to refresh now.`;
-  }
-  function receive(list, mode, at){
-    S.list = Array.isArray(list) ? list : [];
-    S.receivedAt = new Date(at || Date.now()); S.mode = mode; S.error = '';
-    idle(runReconcile);
-  }
-
-  // ── one-shot fetch (REST first; lazy-load Firestore SDK only as a fallback) ──
-  function loadScript(src){ return new Promise((ok,no)=>{ const s=document.createElement('script'); s.src=src; s.async=true; s.onload=ok; s.onerror=no; document.head.appendChild(s); }); }
-  async function fetchViaSdk(){
-    if(!window.firebase) throw new Error('Firebase SDK not loaded');
-    const v = (firebase.SDK_VERSION || '10.13.2');
-    if(!firebase.firestore) await loadScript(`https://www.gstatic.com/firebasejs/${v}/firebase-firestore-compat.js`);
-    const app = (firebase.apps||[]).find(a=>a.name==='ojt') || firebase.initializeApp(OJT_FB_CONFIG, 'ojt');
-    const snap = await app.firestore().doc(OJT_DOC).get();
-    return snap.exists ? (snap.data().list||[]) : [];
-  }
-  let _inFlight = null;
-  function fetchNow(){
-    if(_inFlight) return _inFlight;
-    updateBadge('busy');
-    _inFlight = (async ()=>{
-      let list, mode = 'rest';
-      try{
-        const ctrl = window.AbortController ? new AbortController() : null;
-        const to = ctrl ? setTimeout(()=>ctrl.abort(), 20000) : null;
-        const r = await fetch(OJT_REST, { cache:'no-store', signal: ctrl ? ctrl.signal : undefined });
-        if(to) clearTimeout(to);
-        if(!r.ok) throw new Error('HTTP '+r.status);
-        const j = await r.json();
-        list = fsVal(j.fields && j.fields.list) || [];
-      }catch(e){
-        console.warn('OJT REST read failed, trying Firestore SDK once:', e);
-        try{ list = await fetchViaSdk(); mode = 'sdk'; }
-        catch(e2){ S.error = String(e2.message||e2); console.warn('OJT sync failed — will retry in 30 min:', e2); schedule(30*60*1000); return null; }
-      }
-      const at = Date.now();
-      writeCache(list, at);
-      receive(list, mode, at);
-      schedule(SYNC_EVERY_MS);
-      return list;
-    })().finally(()=>{ _inFlight = null; updateBadge(); });
-    return _inFlight;
-  }
-
-  // ── 5-hour scheduler (survives refreshes via the cached timestamp) ──
-  let _timer = null, _dueAt = 0;
-  function schedule(ms){ clearTimeout(_timer); _dueAt = Date.now() + ms; _timer = setTimeout(()=> idle(fetchNow), ms); }
-  // Background tabs throttle timers; when the tab comes back, catch up if a sync is overdue.
-  document.addEventListener('visibilitychange', ()=>{ if(!document.hidden && _dueAt && Date.now() >= _dueAt) idle(fetchNow); });
-
-  // Manual refresh: ojtSyncNow() forces a fresh read right away.
-  window.ojtSyncNow = async function(){
-    _reconciledSig = '';
-    const list = await fetchNow();
-    try{ toast(list ? `OJT list refreshed (${list.length} trainees).` : 'OJT list refresh failed — check your connection.'); }catch(e){}
-    return S.lastResult;
-  };
-
-  // ── start-up: use the cached list if it's fresh, otherwise fetch (after the page has settled) ──
-  const cached = readCache();
-  if(cached){
-    S.list = cached.list; S.receivedAt = new Date(cached.at); S.mode = 'cache';
-    _pending = true;                                   // reconcile once the cloud data + login are ready
-  }
-  const age = cached ? (Date.now() - cached.at) : Infinity;
-  if(age >= SYNC_EVERY_MS) setTimeout(()=> idle(fetchNow), 8000);   // let the app finish loading first
-  else schedule(SYNC_EVERY_MS - age);
-  updateBadge();
-
-  // Retry an owed reconcile after renders (cloud pull finished, user signed in) — but ONLY while
-  // one is owed. It no longer re-runs after every single render, which was the main source of lag.
-  let _t = null;
-  const _origRender = window.render;
-  window.render = function(){
-    const out = _origRender.apply(this, arguments);
-    if(_pending && S.list){ clearTimeout(_t); _t = setTimeout(()=> idle(runReconcile), 2000); }
-    return out;
-  };
-})();
-</script>
 
 </body>
 </html>
