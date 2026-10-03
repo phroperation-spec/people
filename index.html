@@ -2554,12 +2554,48 @@ function movementBars(data, key, color){
 /* Generic breakdown chart (task G) — a colored horizontal bar per category showing count and %.
    Used for Gender/Age/Tenure on Trend & Insight so those read as graphs, not tables. */
 const BREAKDOWN_PALETTE = ['var(--blue)','var(--teal)','var(--violet)','var(--gold)','var(--green)','var(--red)','var(--gold-dim)','var(--dim2)'];
+// "Unclassified" bars are clickable — the people behind them are kept here so the modal can
+// list exactly who they are and why (usually a blank/unreadable Date Hired or Birthdate).
+let _unclassReg = [];
+// Registers a set of people behind an Unclassified/Unspecified bucket and returns the index used
+// by openUnclassifiedList. field: 'gender' | 'reason' | 'date'.
+function registerUnclassified(label, list){
+  const field = label==='Unspecified'
+    ? (list.length && list.every(e=> e.dateSeparated && !e.separationReason) ? 'reason' : 'gender')
+    : 'date';
+  if(_unclassReg.length>300) _unclassReg = [];
+  return _unclassReg.push({label, field, list}) - 1;
+}
+const UNCLASS_KEYS = ['Unclassified','Unspecified'];
+function unclassLink(k, idx){
+  return `<a href="javascript:void(0)" onclick="openUnclassifiedList(${idx})" title="Click to see who is ${k} and why">${k} — view list</a>`;
+}
+function openUnclassifiedList(i){ ui.modal = {type:'unclassifiedList', arg:i}; render(); }
+function unclassifiedIssue(e, field){
+  if(field==='gender') return e.gender ? `Gender value not recognized ("${e.gender}")` : 'Gender is blank';
+  if(field==='reason') return 'Separation Reason is blank';
+  const out = [];
+  const now = new Date();
+  const h = parseDate(e.dateHired), b = parseDate(e.birthdate);
+  if(!e.dateHired) out.push('Date Hired is blank');
+  else if(!h) out.push(`Date Hired can't be read ("${e.dateHired}")`);
+  else if(h > now) out.push('Date Hired is in the future');
+  if(!e.birthdate) out.push('Birthdate is blank');
+  else if(!b) out.push(`Birthdate can't be read ("${e.birthdate}")`);
+  else if(b > now) out.push('Birthdate is in the future');
+  if(e.dateSeparated && !parseDate(e.dateSeparated)) out.push(`Date Separated can't be read ("${e.dateSeparated}")`);
+  return out.length ? out.join('; ') : 'Value falls below the lowest configured group (check Control Panel ranges)';
+}
 function breakdownBarChart(list, keyFn, order){
   const groups = {};
+  const members = {};
   list.forEach(e=>{
     const k = keyFn(e) || 'Unassigned';
     groups[k] = (groups[k]||0) + 1;
+    if(UNCLASS_KEYS.includes(k)) (members[k] = members[k] || []).push(e);
   });
+  const unclassIdx = {};
+  Object.keys(members).forEach(k=>{ unclassIdx[k] = registerUnclassified(k, members[k]); });
   let keys = order ? order.filter(k=>groups[k]) : Object.keys(groups).sort();
   Object.keys(groups).forEach(k=>{ if(!keys.includes(k)) keys.push(k); });
   const total = list.length;
@@ -2570,7 +2606,7 @@ function breakdownBarChart(list, keyFn, order){
     const color = BREAKDOWN_PALETTE[i % BREAKDOWN_PALETTE.length];
     return `
     <div style="margin-bottom:10px;">
-      <div style="display:flex;justify-content:space-between;font-size:12.5px;margin-bottom:4px;"><span>${k}</span><span style="font-family:var(--mono);color:var(--dim);">${n} · ${pct.toFixed(0)}%</span></div>
+      <div style="display:flex;justify-content:space-between;font-size:12.5px;margin-bottom:4px;"><span>${unclassIdx[k]!==undefined ? unclassLink(k, unclassIdx[k]) : k}</span><span style="font-family:var(--mono);color:var(--dim);">${n} · ${pct.toFixed(0)}%</span></div>
       <div style="height:11px;border-radius:4px;background:var(--surface2);overflow:hidden;"><div style="height:100%;width:${pct}%;background:${color};border-radius:4px;"></div></div>
     </div>`;
   }).join('');
@@ -3608,12 +3644,16 @@ function subHeadcount(st, period){
 
 function subGroupBy(st, keyFn, label, forcedOrder, period, searchTerm, showPct){
   const groups = {};
+  const unMembers = {};
   st.active.forEach(e=>{
     const k = keyFn(e) || 'Unassigned';
     groups[k] = groups[k] || {staff:0, rankfile:0, intern:0, total:0};
     groups[k][STATUS_KEY(e.employmentStatus)]++;
     groups[k].total++;
+    if(UNCLASS_KEYS.includes(k)) (unMembers[k] = unMembers[k] || []).push(e);
   });
+  const unIdx = {};
+  Object.keys(unMembers).forEach(k=>{ unIdx[k] = registerUnclassified(k, unMembers[k]); });
   let keys = forcedOrder ? forcedOrder.filter(k=>groups[k]) : Object.keys(groups).sort();
   Object.keys(groups).forEach(k=>{ if(!keys.includes(k)) keys.push(k); });
   const q = (searchTerm||'').trim().toLowerCase();
@@ -3634,7 +3674,7 @@ function subGroupBy(st, keyFn, label, forcedOrder, period, searchTerm, showPct){
     ? cell(n, d, bold)
     : `<td style="color:var(--dim);" title="No ${statusLabel} data has been fed for ${monthLabel(ui.month)} yet.">— no data</td>`;
   const rows = keys.map(k=>`
-    <tr><td class="rowlabel">${k}</td>${statusCell('Staff', groups[k].staff, colTotals.staff)}${statusCell('Rank & File', groups[k].rankfile, colTotals.rankfile)}${cell(groups[k].total, colTotals.total, true)}</tr>
+    <tr><td class="rowlabel">${unIdx[k]!==undefined ? unclassLink(k, unIdx[k]) : k}</td>${statusCell('Staff', groups[k].staff, colTotals.staff)}${statusCell('Rank & File', groups[k].rankfile, colTotals.rankfile)}${cell(groups[k].total, colTotals.total, true)}</tr>
   `).join('');
   const totalRow = showPct ? `
     <tr class="total"><td class="rowlabel">Total</td>${statusCell('Staff', colTotals.staff, colTotals.staff, true)}${statusCell('Rank & File', colTotals.rankfile, colTotals.rankfile, true)}${cell(colTotals.total, colTotals.total, true)}</tr>` : '';
@@ -8909,6 +8949,29 @@ function renderModal(){
       <p class="hint">Clear Date Separated to move this person back onto the Active Roster. Reporting Months control which month each event is counted under (Overview, Company Detail, Archive) — independent of the actual dates above.</p>
       <div style="margin-top:16px;"><button class="btn primary" onclick="confirmEditEmployee()">Save Changes</button> <button class="btn" onclick="closeModal()">Cancel</button></div>`;
     }
+  } else if(ui.modal.type==='unclassifiedList'){
+    const reg = _unclassReg[ui.modal.arg] || {label:'Unclassified', field:'date', list:[]};
+    const list = reg.list, field = reg.field;
+    const canEdit = canQuickAdd();
+    const what = field==='gender' ? 'Gender' : (field==='reason' ? 'Separation Reason' : 'date');
+    const why = field==='gender' ? 'no Gender is recorded for them'
+      : field==='reason' ? 'no Separation Reason is recorded for them'
+      : 'a date is blank, typed in a format the system can\'t read, or set in the future';
+    body = `<h3>${reg.label} — ${list.length} employee(s)</h3>
+    <p class="hint">These records couldn't be placed in any group because ${why}. ${canEdit ? `Click <b>Edit</b> to fill in the ${what} — the chart updates as soon as you save.` : `Ask Admin/HR to fill in the ${what}.`}</p>
+    <div style="max-height:420px;overflow:auto;">
+    <table class="demo" style="font-size:12px;">
+      <thead><tr><th>ID</th><th>Name</th><th>Company</th><th>Status</th>${field==='gender'?'<th>Gender</th>':field==='reason'?'<th>Date Separated</th>':'<th>Date Hired</th><th>Birthdate</th>'}<th>Issue</th>${canEdit?'<th></th>':''}</tr></thead>
+      <tbody>${list.map(e=>`<tr>
+        <td>${e.employeeId||''}</td><td class="rowlabel">${e.lastName||''}, ${e.firstName||''}</td><td>${e.company||''}</td><td>${e.employmentStatus||''}</td>
+        ${field==='gender' ? `<td>${e.gender||'<span style="color:var(--red);">blank</span>'}</td>`
+          : field==='reason' ? `<td>${e.dateSeparated||''}</td>`
+          : `<td>${e.dateHired||'<span style="color:var(--red);">blank</span>'}</td><td>${e.birthdate||'<span style="color:var(--red);">blank</span>'}</td>`}
+        <td style="color:var(--red);">${unclassifiedIssue(e, field)}</td>
+        ${canEdit?`<td><button class="btn small" onclick="openEditEmployeeModal('${String(e.employeeId).replace(/'/g,"\\'")}')">Edit</button></td>`:''}
+      </tr>`).join('') || '<tr><td colspan="8">No records.</td></tr>'}</tbody>
+    </table></div>
+    <div style="margin-top:14px;"><button class="btn" onclick="closeModal()">Close</button></div>`;
   } else if(ui.modal.type==='addArchiveRecord'){
     const companies = allCompanies().map(c=>c.company);
     const defaultCompany = companies[0] || '';
@@ -8961,7 +9024,7 @@ function renderModal(){
     <p class="hint">This permanently deletes <b>${prf?prfRefNumber(prf):''}</b> and every slot on it${prf && prfFilledCount(prf) ? `, including ${prfFilledCount(prf)} filled slot(s)` : ''}. This can't be undone.</p>
     <div style="margin-top:16px;"><button class="btn danger" onclick="confirmDeletePrf()">Delete</button> <button class="btn" onclick="closeModal()">Cancel</button></div>`;
   }
-  const wide = (ui.modal.type==='editEmployee' || ui.modal.type==='addArchiveRecord' || ui.modal.type==='confirmMasterlistNewHires' || ui.modal.type==='confirmMasterlistPromotions' || ui.modal.type==='deleteArchiveList' || ui.modal.type==='prfForm') ? 'width:640px;' : '';
+  const wide = ui.modal.type==='unclassifiedList' ? 'width:900px;max-width:95vw;' : (ui.modal.type==='editEmployee' || ui.modal.type==='addArchiveRecord' || ui.modal.type==='confirmMasterlistNewHires' || ui.modal.type==='confirmMasterlistPromotions' || ui.modal.type==='deleteArchiveList' || ui.modal.type==='prfForm') ? 'width:640px;' : '';
   const wrap = document.createElement('div');
   wrap.innerHTML = `<div class="modal-bg" onclick="if(event.target===this) closeModal()"><div class="modal" style="${wide}">${body}</div></div>`;
   document.getElementById('app').appendChild(wrap.firstElementChild);
