@@ -430,6 +430,14 @@ function parseDate(s){
   if(isNaN(d.getTime())) return null;
   return d;
 }
+// Date inputs only accept YYYY-MM-DD — a stored "04/15/2023" or Excel serial would otherwise show
+// as blank in the Edit form. Converts whatever is on file into that format (or '' if unreadable).
+function isoDateOf(raw){ const d = parseDate(raw); return d ? fmtDate(d) : ''; }
+// Small note under a date field when the stored value can't be read, so Admin/HR can see it and fix it.
+function rawDateNote(raw){
+  if(!raw || parseDate(raw)) return '';
+  return `<div class="hint" style="color:var(--red);margin-top:4px;">On file: "${String(raw).replace(/</g,'&lt;')}" — can't be read. Pick the correct date.</div>`;
+}
 function fmtDate(d){
   if(!d) return '';
   const y = d.getFullYear();
@@ -1587,6 +1595,28 @@ function jobGradeGroupOf(company, status, raw){
   const m = bestRangeMatch(groups, n);
   return m ? m.label : 'Unclassified';
 }
+// ── Job Level (Manager / Supervisor / Staff / Rank & File) ──
+// Each Job Grade Group in the Control Panel can be tagged with a Job Level. An employee's level
+// comes from the group their Job Grade falls in (or, if the grade can't be matched, the group
+// assigned to their Position). Groups not yet tagged fall back to the employee's Employment
+// Status, so the card works right away: Staff → "Staff", Rank & File → "Rank & File".
+// Staff are split into Junior / Supervisory / Managerial (set per Job Grade Group in the Control
+// Panel; untagged groups default to Junior). Rank & File always stays its own "Rank & File" bar —
+// it is never merged into Junior.
+const STAFF_LEVELS = ['Junior','Supervisory','Managerial'];
+const JOB_LEVELS = ['Junior','Supervisory','Managerial','Rank & File'];
+const LEGACY_LEVEL = {Manager:'Managerial', Supervisor:'Supervisory', Staff:'Junior'};
+function jobLevelOf(e){
+  const company = e.company, status = e.employmentStatus;
+  if(/rank/i.test(String(status||''))) return 'Rank & File';
+  if(STATUS_KEY(status)!=='staff') return 'Unclassified';
+  const groups = (CONFIG.jobGradeGroups[company] && CONFIG.jobGradeGroups[company][status]) || [];
+  let label = jobGradeGroupOf(company, status, e.jobGrade);
+  if(label==='Unclassified') label = positionJobGradeOf(company, status, e.position) || '';
+  const g = label ? groups.find(x=> x.label===label) : null;
+  const lv = g ? (LEGACY_LEVEL[g.level] || g.level) : '';
+  return STAFF_LEVELS.includes(lv) ? lv : 'Junior';
+}
 // The Max Tenure Stay configured on a specific Job Grade Group (Staff only — see the Job Grade
 // Groups panel in the Control Panel). Returns null if unset/0, meaning that grade isn't flagged
 // at all — distinct from a stored 0, which is treated the same way since a real max-stay of zero
@@ -1713,6 +1743,7 @@ function topJobGradeNumericCeiling(company, status){
 }
 async function updateJobGradeRange(company,status,i,field,val){
   const list = jobGradeGroupsFor(company,status);
+  if(field==='level'){ if(val) list[i].level = val; else delete list[i].level; await saveConfig(); return; }
   list[i][field] = (field==='label') ? val : Number(val);
   await saveConfig();
 }
@@ -2559,8 +2590,8 @@ const BREAKDOWN_PALETTE = ['var(--blue)','var(--teal)','var(--violet)','var(--go
 let _unclassReg = [];
 // Registers a set of people behind an Unclassified/Unspecified bucket and returns the index used
 // by openUnclassifiedList. field: 'gender' | 'reason' | 'date'.
-function registerUnclassified(label, list){
-  const field = label==='Unspecified'
+function registerUnclassified(label, list, forcedField){
+  const field = forcedField ? forcedField : label==='Unspecified'
     ? (list.length && list.every(e=> e.dateSeparated && !e.separationReason) ? 'reason' : 'gender')
     : 'date';
   if(_unclassReg.length>300) _unclassReg = [];
@@ -2574,6 +2605,7 @@ function openUnclassifiedList(i){ ui.modal = {type:'unclassifiedList', arg:i}; r
 function unclassifiedIssue(e, field){
   if(field==='gender') return e.gender ? `Gender value not recognized ("${e.gender}")` : 'Gender is blank';
   if(field==='reason') return 'Separation Reason is blank';
+  if(field==='level') return `Employment Status "${e.employmentStatus||'blank'}" isn't Staff or Rank & File`;
   const out = [];
   const now = new Date();
   const h = parseDate(e.dateHired), b = parseDate(e.birthdate);
@@ -2586,7 +2618,7 @@ function unclassifiedIssue(e, field){
   if(e.dateSeparated && !parseDate(e.dateSeparated)) out.push(`Date Separated can't be read ("${e.dateSeparated}")`);
   return out.length ? out.join('; ') : 'Value falls below the lowest configured group (check Control Panel ranges)';
 }
-function breakdownBarChart(list, keyFn, order){
+function breakdownBarChart(list, keyFn, order, unclassField){
   const groups = {};
   const members = {};
   list.forEach(e=>{
@@ -2595,7 +2627,7 @@ function breakdownBarChart(list, keyFn, order){
     if(UNCLASS_KEYS.includes(k)) (members[k] = members[k] || []).push(e);
   });
   const unclassIdx = {};
-  Object.keys(members).forEach(k=>{ unclassIdx[k] = registerUnclassified(k, members[k]); });
+  Object.keys(members).forEach(k=>{ unclassIdx[k] = registerUnclassified(k, members[k], unclassField); });
   let keys = order ? order.filter(k=>groups[k]) : Object.keys(groups).sort();
   Object.keys(groups).forEach(k=>{ if(!keys.includes(k)) keys.push(k); });
   const total = list.length;
@@ -3173,7 +3205,7 @@ function renderOverview(){
     </div>
   </div>
 
-  <div class="grid ${(showIndustryPanel && !statusScope)?'cards4':'cards3'}" style="margin-top:16px;">
+  <div class="grid" style="margin-top:16px;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));">
     ${(showIndustryPanel && !statusScope) ? `
     <div class="panel">
       <div class="panel-head"><h3>Industry</h3></div>
@@ -3190,6 +3222,10 @@ function renderOverview(){
     <div class="panel">
       <div class="panel-head"><h3>Tenure</h3></div>
       ${breakdownBarChart(activeAll, e=> tenureGroupOf(tenureYears(e, end)), tenureOrder)}
+    </div>
+    <div class="panel">
+      <div class="panel-head"><h3>Job Level</h3></div>
+      ${breakdownBarChart(activeAll, jobLevelOf, JOB_LEVELS, 'level')}
     </div>
   </div>
 
@@ -3466,6 +3502,7 @@ function exportOverviewExcel(){
   addBreakdown('Gender', e=> e.gender || 'Unspecified', genderOrder);
   addBreakdown('Age Group', e=> ageGroupOf(ageYears(e, end)), ageOrder);
   addBreakdown('Tenure Group', e=> tenureGroupOf(tenureYears(e, end)), tenureOrder);
+  addBreakdown('Job Level', jobLevelOf, JOB_LEVELS);
 
   /* ---- Sheet: Headcount Trend ---- */
   const trendRows = [['Month','Reported','Total Headcount','Staff','Rank & File','New Hires','Separations']]
@@ -3495,7 +3532,7 @@ function exportOverviewExcel(){
 
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(snapshotRows), 'Workforce Snapshot');
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(breakdownRows), 'Gender-Age-Tenure');
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(breakdownRows), 'Gender-Age-Tenure-Level');
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(trendRows), 'Headcount Trend');
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(movementRows), 'Movement & Separation');
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(companyRows), 'Per-Company Breakdown');
@@ -8507,18 +8544,24 @@ async function removeRange(key,i){ CONFIG[key].splice(i,1); await saveConfig(); 
 function jobGradeRangeEditor(company, status){
   const list = jobGradeGroupsFor(company, status);
   const isStaff = status==='Staff';
-  const colCount = isStaff ? 5 : 4;
+  const colCount = isStaff ? 6 : 4;
+  const isRF = /rank/i.test(status);
+  const levelOn = isStaff && !isRF;
   return `
-  <table class="simple"><thead><tr><th>Label</th><th>Min</th><th>Max</th>${isStaff?'<th>Max Tenure Stay (yrs)</th>':''}<th></th></tr></thead>
+  <table class="simple"><thead><tr><th>Label</th><th>Min</th><th>Max</th>${levelOn?'<th title="Used by the Job Level card on Trend &amp; Insight">Job Level</th>':''}${isStaff?'<th>Max Tenure Stay (yrs)</th>':''}<th></th></tr></thead>
     <tbody>${list.map((g,i)=>`<tr>
       <td><input type="text" value="${g.label}" onchange="updateJobGradeRange('${company}','${status}',${i},'label',this.value)"></td>
       <td><input type="number" min="1" max="25" step="1" value="${g.min}" style="width:90px;" onchange="updateJobGradeRange('${company}','${status}',${i},'min',this.value)"></td>
       <td><input type="number" min="1" max="25" step="1" value="${g.max}" style="width:90px;" onchange="updateJobGradeRange('${company}','${status}',${i},'max',this.value)"></td>
+      ${levelOn ? `<td><select onchange="updateJobGradeRange('${company}','${status}',${i},'level',this.value)">
+        ${STAFF_LEVELS.map(l=>`<option ${((LEGACY_LEVEL[g.level]||g.level||'Junior')===l)?'selected':''}>${l}</option>`).join('')}
+      </select></td>` : ''}
       ${isStaff?`<td><input type="number" min="0" step="0.5" value="${g.maxTenureYears||0}" style="width:100px;" title="Years at this grade before flagging as a promotion-readiness gap. 0 = don't flag this grade." onchange="updateJobGradeRange('${company}','${status}',${i},'maxTenureYears',this.value)"></td>`:''}
       <td><button class="btn small danger" onclick="removeJobGradeRange('${company}','${status}',${i})">✕</button></td>
     </tr>`).join('') || `<tr><td colspan="${colCount}" class="hint">No ranges yet for ${company} · ${status}.</td></tr>`}</tbody>
   </table>
   <button class="btn small" style="margin-top:8px;" onclick="addJobGradeRange('${company}','${status}')">+ Add Group</button>
+  <p class="hint">${levelOn ? 'Set <b>Job Level</b> to tag each Staff group as Junior, Supervisory or Managerial — this drives the Job Level card on Trend &amp; Insight. Groups not tagged count as Junior.' : (isRF ? 'Rank &amp; File always shows as its own <b>Rank &amp; File</b> bar on the Job Level card — it is not mixed with Junior.' : '')}</p>
   `;
 }
 
@@ -8919,7 +8962,7 @@ function renderModal(){
       </div>
       <div class="field-row">
         <div class="field"><label>JOB GRADE</label><input type="text" id="em_grade" value="${emp.jobGrade||''}"></div>
-        <div class="field"><label>BIRTHDATE${emp.birthdate && ageYears(emp,new Date())!==null ? ` <span style="font-weight:400;text-transform:none;color:var(--dim2);">(age ${ageYears(emp,new Date())})</span>` : ''}</label><input type="date" id="em_birthdate" value="${emp.birthdate||''}"></div>
+        <div class="field"><label>BIRTHDATE${emp.birthdate && ageYears(emp,new Date())!==null ? ` <span style="font-weight:400;text-transform:none;color:var(--dim2);">(age ${ageYears(emp,new Date())})</span>` : ''}</label><input type="date" id="em_birthdate" value="${isoDateOf(emp.birthdate)}">${rawDateNote(emp.birthdate)}</div>
         <div class="field"><label>GENDER</label><select id="em_gender">
           <option value="" ${!emp.gender?'selected':''}>Unspecified</option>
           <option ${emp.gender==='Male'?'selected':''}>Male</option>
@@ -8929,7 +8972,7 @@ function renderModal(){
         <div class="field"><label>STATUS</label><select id="em_status">${CONFIG.statuses.map(s=>`<option ${s===emp.employmentStatus?'selected':''}>${s}</option>`).join('')}</select></div>
       </div>
       <div class="field-row">
-        <div class="field"><label>DATE HIRED</label><input type="date" id="em_hired" value="${emp.dateHired||''}"></div>
+        <div class="field"><label>DATE HIRED</label><input type="date" id="em_hired" value="${isoDateOf(emp.dateHired)}">${rawDateNote(emp.dateHired)}</div>
         <div class="field"><label>HIRE REPORTING MONTH</label><input type="month" id="em_hireTagMonth" value="${hireTagMonthOf(emp)||''}"></div>
         <div class="field" style="flex:1;display:flex;align-items:flex-end;">
           <label style="display:flex;align-items:center;gap:6px;font-weight:400;text-transform:none;">
@@ -8939,7 +8982,7 @@ function renderModal(){
       </div>
       <p class="hint" style="margin-top:-6px;">Uncheck this for someone who was actually already employed before the Date Hired above — e.g. a baseline/pre-existing employee only just added to the system, or a New Hire review answered "Yes" by mistake. This is what keeps a record out of New Hire counts (Overview, Company Detail, Recruitment Cost, trends) and — together with an accurate Date Hired — out of the wrong year's cohort in Retention/Attrition Breakdown and Trend & Insight.</p>
       <div class="field-row">
-        <div class="field"><label>DATE SEPARATED</label><input type="date" id="em_sepDate" value="${emp.dateSeparated||''}"></div>
+        <div class="field"><label>DATE SEPARATED</label><input type="date" id="em_sepDate" value="${isoDateOf(emp.dateSeparated)}">${rawDateNote(emp.dateSeparated)}</div>
         <div class="field"><label>SEPARATION REPORTING MONTH</label><input type="month" id="em_tagMonth" value="${separationTagMonthOf(emp)||''}"></div>
       </div>
       <div class="field-row">
@@ -8953,18 +8996,20 @@ function renderModal(){
     const reg = _unclassReg[ui.modal.arg] || {label:'Unclassified', field:'date', list:[]};
     const list = reg.list, field = reg.field;
     const canEdit = canQuickAdd();
-    const what = field==='gender' ? 'Gender' : (field==='reason' ? 'Separation Reason' : 'date');
-    const why = field==='gender' ? 'no Gender is recorded for them'
+    const what = field==='gender' ? 'Gender' : (field==='reason' ? 'Separation Reason' : (field==='level' ? 'Job Grade / Employment Status' : 'date'));
+    const why = field==='level' ? 'their Job Level can\'t be worked out from their Job Grade or Employment Status'
+      : field==='gender' ? 'no Gender is recorded for them'
       : field==='reason' ? 'no Separation Reason is recorded for them'
       : 'a date is blank, typed in a format the system can\'t read, or set in the future';
     body = `<h3>${reg.label} — ${list.length} employee(s)</h3>
     <p class="hint">These records couldn't be placed in any group because ${why}. ${canEdit ? `Click <b>Edit</b> to fill in the ${what} — the chart updates as soon as you save.` : `Ask Admin/HR to fill in the ${what}.`}</p>
     <div style="max-height:420px;overflow:auto;">
     <table class="demo" style="font-size:12px;">
-      <thead><tr><th>ID</th><th>Name</th><th>Company</th><th>Status</th>${field==='gender'?'<th>Gender</th>':field==='reason'?'<th>Date Separated</th>':'<th>Date Hired</th><th>Birthdate</th>'}<th>Issue</th>${canEdit?'<th></th>':''}</tr></thead>
+      <thead><tr><th>ID</th><th>Name</th><th>Company</th><th>Status</th>${field==='level'?'<th>Job Grade</th><th>Position</th>':field==='gender'?'<th>Gender</th>':field==='reason'?'<th>Date Separated</th>':'<th>Date Hired</th><th>Birthdate</th>'}<th>Issue</th>${canEdit?'<th></th>':''}</tr></thead>
       <tbody>${list.map(e=>`<tr>
         <td>${e.employeeId||''}</td><td class="rowlabel">${e.lastName||''}, ${e.firstName||''}</td><td>${e.company||''}</td><td>${e.employmentStatus||''}</td>
-        ${field==='gender' ? `<td>${e.gender||'<span style="color:var(--red);">blank</span>'}</td>`
+        ${field==='level' ? `<td>${e.jobGrade||'<span style="color:var(--red);">blank</span>'}</td><td>${e.position||''}</td>`
+          : field==='gender' ? `<td>${e.gender||'<span style="color:var(--red);">blank</span>'}</td>`
           : field==='reason' ? `<td>${e.dateSeparated||''}</td>`
           : `<td>${e.dateHired||'<span style="color:var(--red);">blank</span>'}</td><td>${e.birthdate||'<span style="color:var(--red);">blank</span>'}</td>`}
         <td style="color:var(--red);">${unclassifiedIssue(e, field)}</td>
