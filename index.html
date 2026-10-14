@@ -1203,6 +1203,11 @@ function sanitizeConfig(cfg){
   if(!cfg.prfAbbrev) cfg.prfAbbrev = {};
   if(!cfg.prfCustomPositions) cfg.prfCustomPositions = {};
   if(!cfg.prfNextControl) cfg.prfNextControl = {};
+  // Individual HR sign-in accounts (Admin-managed) and the Admin-only audit trail. Both are
+  // objects keyed by id (not arrays) so two devices adding entries at the same time merge
+  // cleanly in threeWayMergeGeneric instead of one overwriting the other.
+  if(!isPlainObj(cfg.hrAccounts)) cfg.hrAccounts = {};
+  if(!isPlainObj(cfg.auditLog)) cfg.auditLog = {};
   if(cfg.promotionBenchmarkYears==null) cfg.promotionBenchmarkYears = DEFAULT_CONFIG.promotionBenchmarkYears;
   if(!cfg.authHashes) cfg.authHashes = JSON.parse(JSON.stringify(DEFAULT_CONFIG.authHashes));
   // Same self-heal as industries above — these fields are relied on throughout the Control
@@ -1262,7 +1267,11 @@ async function loadAll(){
     const savedSession = localStorage.getItem(LS_PREFIX+'session');
     if(savedSession){
       const s = JSON.parse(savedSession);
-      if(s && ['Admin','HR','Executive'].includes(s.role)){ ui.authRole = s.role; ui.role = s.role; }
+      if(s && ['Admin','HR','Executive'].includes(s.role)){
+        ui.authRole = s.role; ui.role = s.role;
+        ui.hrAccountId = s.accountId || null;
+        ui.userName = s.username || s.role;
+      }
     }
   }catch(e){ /* ignore */ }
   // Migration: the promotion-readiness flag used to be one global "years before flagging" number
@@ -1324,15 +1333,45 @@ async function sha256Hex(str){
 }
 async function attemptLogin(){
   const role = document.getElementById('loginRole').value;
+  ui.loginRole = role;
   const pwdEl = document.getElementById('loginPassword');
   const pwd = pwdEl ? pwdEl.value : '';
+  const unameEl = document.getElementById('loginUsername');
+  const uname = unameEl ? unameEl.value.trim() : '';
+  ui.loginUsername = uname;
+  const hrNeedsUsername = role==='HR' && hrAccountsList().length > 0;
+  if(hrNeedsUsername && !uname){ ui.loginError = 'Enter your HR username.'; render(); return; }
   if(!pwd){ ui.loginError = 'Enter a password.'; render(); return; }
   let hash;
+  const noCrypto = "This browser can't verify passwords securely. Try a modern browser (Chrome, Edge, Firefox) or open this file over HTTPS.";
+  // HR: individual username + password, managed by Admin in Control Panel → HR User Accounts.
+  // (The old shared HR role password only still works while no HR account exists at all, so
+  // HR isn't locked out on the day this goes live before Admin has created anyone's account.)
+  if(hrNeedsUsername){
+    const acct = findHrAccountByUsername(uname);
+    try{ hash = await sha256Hex(hrPasswordInput(acct ? acct.id : 'none', pwd)); }
+    catch(e){ ui.loginError = noCrypto; render(); return; }
+    if(!acct || acct.passHash !== hash){
+      ui.loginError = 'Incorrect username or password.'; render(); return;
+    }
+    if(!acct.active){
+      ui.loginError = 'This HR account is disabled. Please contact your Admin.'; render(); return;
+    }
+    acct.lastLoginAt = Date.now();
+    ui.authRole = 'HR'; ui.role = 'HR'; ui.loginError = ''; ui.loginUsername = '';
+    ui.hrAccountId = acct.id; ui.userName = acct.username;
+    try{ localStorage.setItem(LS_PREFIX+'session', JSON.stringify({role:'HR', accountId:acct.id, username:acct.username, at:Date.now()})); }catch(e){}
+    queuePersist('config'); markLocalChange(); schedulePush(); // saves Last Sign-in shown in HR User Accounts (not an audit entry)
+    render();
+    maybePushInternPurge();
+    return;
+  }
   try{ hash = await sha256Hex(pwd); }
-  catch(e){ ui.loginError = "This browser can't verify passwords securely. Try a modern browser (Chrome, Edge, Firefox) or open this file over HTTPS."; render(); return; }
+  catch(e){ ui.loginError = noCrypto; render(); return; }
   if(CONFIG.authHashes && CONFIG.authHashes[role] === hash){
     ui.authRole = role; ui.role = role; ui.loginError = '';
-    try{ localStorage.setItem(LS_PREFIX+'session', JSON.stringify({role, at:Date.now()})); }catch(e){}
+    ui.hrAccountId = null; ui.userName = role;
+    try{ localStorage.setItem(LS_PREFIX+'session', JSON.stringify({role, username:role, at:Date.now()})); }catch(e){}
     render();
     maybePushInternPurge();
   }else{
@@ -1341,6 +1380,7 @@ async function attemptLogin(){
   }
 }
 function doLogout(){
+  ui.hrAccountId = null; ui.userName = null;
   ui.authRole = null; ui.loginError = '';
   try{ localStorage.removeItem(LS_PREFIX+'session'); }catch(e){}
   render();
@@ -1363,9 +1403,178 @@ async function updateRolePassword(){
 }
 // Speed: saves are coalesced (see queuePersist) — the in-memory data is already updated, the
 // browser copy is written once after a burst of edits, and the cloud push goes out as before.
-async function saveConfig(){ queuePersist('config'); markLocalChange(); schedulePush(); return true; }
-async function saveEmp(){ queuePersist('employees'); markLocalChange(); schedulePush(); return true; }
-async function saveRecruit(){ queuePersist('recruitment'); markLocalChange(); schedulePush(); return true; }
+async function saveConfig(){ queuePersist('config'); markLocalChange(); schedulePush(); auditNoteSave('settings'); return true; }
+async function saveEmp(){ queuePersist('employees'); markLocalChange(); schedulePush(); auditNoteSave('employee data'); return true; }
+async function saveRecruit(){ queuePersist('recruitment'); markLocalChange(); schedulePush(); auditNoteSave('recruitment cost data'); return true; }
+
+/* ============ AUDIT LOG (Admin-only view) ============
+   Records only two things: who made a change, and who uploaded a file. (Sign-ins, sign-outs
+   and views are deliberately NOT logged.) Every entry: when, who (HR username, or the role name
+   for Admin/Executive), role, action, details. Key actions log a specific entry (see the wrappers in the last <script> block);
+   any other save falls back to a generic "Updated …" entry so nothing goes unrecorded.
+   Stored in CONFIG.auditLog (object keyed by id), capped at AUDIT_MAX newest entries.
+   Passwords are never written to the log. */
+const AUDIT_MAX = 5000;
+let _auditLastExplicit = 0, _auditFallbackTimer = null, _auditPendingKinds = new Set();
+// Set when someone picks a file and clicks Upload; the save that follows is logged as "File uploaded".
+let _auditPendingUpload = null;
+function auditActor(){
+  if(ui.authRole==='HR' && ui.hrAccountId){
+    const a = (CONFIG.hrAccounts||{})[ui.hrAccountId];
+    return a ? a.username : (ui.userName || 'HR');
+  }
+  return ui.userName || ui.authRole || '—';
+}
+function auditActorFullName(){
+  if(ui.authRole==='HR' && ui.hrAccountId){
+    const a = (CONFIG.hrAccounts||{})[ui.hrAccountId];
+    return (a && a.fullName) || '';
+  }
+  return '';
+}
+function auditTabLabel(){
+  const n = (typeof NAV_ITEMS!=='undefined') ? NAV_ITEMS.find(x=> x[0]===ui.tab) : null;
+  return n ? String(n[1]).replace(/&amp;/g,'&') : (ui.tab||'');
+}
+function logAudit(action, details, opts){
+  opts = opts || {};
+  try{
+    if(!isPlainObj(CONFIG.auditLog)) CONFIG.auditLog = {};
+    const id = 'a' + Date.now().toString(36) + Math.random().toString(36).slice(2,8);
+    CONFIG.auditLog[id] = {
+      ts: Date.now(),
+      user: String(opts.user || auditActor()),
+      fullName: String(opts.user ? '' : auditActorFullName()),
+      role: String(opts.role || ui.authRole || ''),
+      action: String(action||''),
+      details: String(details||'').slice(0, 600),
+      page: String(ui.authRole ? auditTabLabel() : 'Sign-in screen')
+    };
+    const keys = Object.keys(CONFIG.auditLog);
+    if(keys.length > AUDIT_MAX){
+      keys.sort((a,b)=> (CONFIG.auditLog[a].ts||0) - (CONFIG.auditLog[b].ts||0))
+        .slice(0, keys.length - AUDIT_MAX).forEach(k=> delete CONFIG.auditLog[k]);
+    }
+    _auditLastExplicit = Date.now();
+    clearTimeout(_auditFallbackTimer); _auditPendingKinds.clear();
+    queuePersist('config'); markLocalChange(); schedulePush();
+  }catch(e){ console.warn('Audit log write failed:', e); }
+}
+// Generic catch-all: a save that no specific audit entry claims within ~1.5s gets one
+// "Updated <data>" entry naming the page it happened on (bursts are coalesced into one).
+function auditNoteSave(kind){
+  if(!ui.authRole) return;
+  _auditPendingKinds.add(kind);
+  clearTimeout(_auditFallbackTimer);
+  _auditFallbackTimer = setTimeout(()=>{
+    const kinds = Array.from(_auditPendingKinds); _auditPendingKinds.clear();
+    if(!kinds.length) return; // a specific entry logged since then already cleared these
+    const up = _auditPendingUpload;
+    if(up && Date.now() - up.at < 60000){
+      _auditPendingUpload = null;
+      logAudit('File uploaded', `${up.label} · ${up.file}`);
+      return;
+    }
+    logAudit('Updated ' + kinds.join(' & '), 'Change saved on ' + auditTabLabel());
+  }, 1500);
+}
+
+/* ============ HR USER ACCOUNTS (Admin adds / edits / deletes) ============ */
+function hrAccountsList(){
+  return Object.values(CONFIG.hrAccounts||{}).filter(a=> a && a.id)
+    .sort((a,b)=> String(a.username).localeCompare(String(b.username)));
+}
+function findHrAccountByUsername(u){
+  const k = String(u||'').trim().toLowerCase();
+  return hrAccountsList().find(a=> String(a.username).toLowerCase()===k) || null;
+}
+// Salted with the account's permanent id, so two HR users with the same password still get
+// different hashes, and renaming a username doesn't invalidate the password.
+function hrPasswordInput(id, pwd){ return 'hr:' + id + ':' + pwd; }
+function validHrUsername(u){ return /^[A-Za-z0-9._-]{3,30}$/.test(u); }
+async function addHrAccount(){
+  if(!isAdmin()){ toast('Only Admin can add HR accounts.'); return; }
+  const g = id => (document.getElementById(id)||{}).value || '';
+  const username = g('hra_username').trim(), fullName = g('hra_fullname').trim();
+  const pwd = g('hra_pwd'), confirm = g('hra_pwd2');
+  if(!validHrUsername(username)){ toast('Username must be 3–30 characters: letters, numbers, dot, dash or underscore.'); return; }
+  if(findHrAccountByUsername(username)){ toast('That username is already taken.'); return; }
+  if(pwd.length < 6){ toast('Password should be at least 6 characters.'); return; }
+  if(pwd !== confirm){ toast("Passwords don't match."); return; }
+  const id = 'hr_' + Math.random().toString(36).slice(2,10) + Date.now().toString(36);
+  let passHash;
+  try{ passHash = await sha256Hex(hrPasswordInput(id, pwd)); }catch(e){ toast("This browser can't hash passwords securely."); return; }
+  CONFIG.hrAccounts = CONFIG.hrAccounts || {};
+  CONFIG.hrAccounts[id] = {id, username, fullName, passHash, active:true, createdAt:Date.now(), updatedAt:Date.now(), lastLoginAt:0};
+  await saveConfig();
+  logAudit('HR account added', `${username}${fullName?` (${fullName})`:''}`);
+  toast(`HR account "${username}" created.`);
+  render();
+}
+function openEditHrAccount(id){
+  if(!isAdmin()) return;
+  ui.modal = {type:'hrAccountEdit', arg:id}; render();
+}
+function openDeleteHrAccount(id){
+  if(!isAdmin()) return;
+  ui.modal = {type:'hrAccountDelete', arg:id}; render();
+}
+async function confirmEditHrAccount(){
+  if(!isAdmin()) return;
+  const acct = (CONFIG.hrAccounts||{})[ui.modal.arg];
+  if(!acct){ closeModal(); return; }
+  const g = id => (document.getElementById(id)||{}).value || '';
+  const username = g('hre_username').trim(), fullName = g('hre_fullname').trim();
+  const active = g('hre_status') !== 'disabled';
+  const pwd = g('hre_pwd'), confirm = g('hre_pwd2');
+  if(!validHrUsername(username)){ toast('Username must be 3–30 characters: letters, numbers, dot, dash or underscore.'); return; }
+  const clash = findHrAccountByUsername(username);
+  if(clash && clash.id !== acct.id){ toast('That username is already taken.'); return; }
+  if(pwd || confirm){
+    if(pwd.length < 6){ toast('New password should be at least 6 characters.'); return; }
+    if(pwd !== confirm){ toast("Passwords don't match."); return; }
+  }
+  const changes = [];
+  if(acct.username !== username) changes.push(`username "${acct.username}" → "${username}"`);
+  if((acct.fullName||'') !== fullName) changes.push(`full name → "${fullName}"`);
+  if(!!acct.active !== active) changes.push(active ? 'enabled' : 'disabled');
+  if(pwd){
+    try{ acct.passHash = await sha256Hex(hrPasswordInput(acct.id, pwd)); }catch(e){ toast("This browser can't hash passwords securely."); return; }
+    changes.push('password reset');
+  }
+  acct.username = username; acct.fullName = fullName; acct.active = active; acct.updatedAt = Date.now();
+  await saveConfig();
+  logAudit('HR account edited', `${username}: ${changes.length ? changes.join('; ') : 'no changes'}`);
+  ui.modal = null;
+  toast(`HR account "${username}" saved.`);
+  render();
+}
+async function confirmDeleteHrAccount(){
+  if(!isAdmin()) return;
+  const acct = (CONFIG.hrAccounts||{})[ui.modal.arg];
+  if(acct){
+    delete CONFIG.hrAccounts[acct.id];
+    await saveConfig();
+    logAudit('HR account deleted', `${acct.username}${acct.fullName?` (${acct.fullName})`:''}`);
+    toast(`HR account "${acct.username}" deleted.`);
+  }
+  ui.modal = null; render();
+}
+// Signs an HR session out if Admin deleted/disabled that account (from any device), or if HR
+// is still on the old shared password after individual accounts have been set up.
+function enforceHrAccountStillValid(){
+  if(ui.authRole!=='HR') return;
+  if(!ui.hrAccountId && !hrAccountsList().length) return; // shared HR password still allowed — no accounts set up yet
+  const acct = ui.hrAccountId ? (CONFIG.hrAccounts||{})[ui.hrAccountId] : null;
+  if(acct && acct.active){ ui.userName = acct.username; return; }
+  const hadAccount = !!ui.hrAccountId;
+  ui.authRole = null; ui.hrAccountId = null; ui.userName = null;
+  ui.loginRole = 'HR';
+  ui.loginError = acct ? 'Your HR account was disabled by Admin. Please contact your Admin.'
+    : (hadAccount ? 'Your HR account was removed by Admin. Please contact your Admin.'
+    : 'HR now signs in with an individual username and password — please sign in again.');
+  try{ localStorage.removeItem(LS_PREFIX+'session'); }catch(e){}
+}
 
 const RECRUIT_FIELDS = [
   ['avgSalary','Recruitment Ave. Salary'],
@@ -2678,9 +2887,18 @@ const NAV_ITEMS = [
   ['masterlist','PGB Masterlist ↗','Open the PGB Employee Masterlist (HR Information System) in a new tab', 'https://pgb-masterlist.vercel.app/'],
   ['ats','ATS','PGB Careers Applicant Tracking System — Job Portal, PRF, and Interview Grid links'],
   ['data','Data Management','Upload the master file, add hires, mark separations'],
+  ['audit','Audit Log','Who did what, and when — visible to Admin only'],
   ['settings','Control Panel','Industries, companies, groupings and access']
 ];
 
+function toggleLoginUsername(){
+  const row = document.getElementById('loginUsernameRow');
+  const sel = document.getElementById('loginRole');
+  const show = sel && sel.value==='HR' && hrAccountsList().length > 0;
+  if(row) row.style.display = show ? 'block' : 'none';
+  const focusEl = show ? document.getElementById('loginUsername') : document.getElementById('loginPassword');
+  if(focusEl) focusEl.focus();
+}
 function renderLogin(){
   return `
   <div style="min-height:100vh;width:100%;display:flex;align-items:center;justify-content:center;">
@@ -2690,9 +2908,13 @@ function renderLogin(){
         <h1 style="font-family:var(--serif);font-weight:400;font-size:20px;margin:6px 0 0;">Employee Demographics</h1>
       </div>
       <label style="display:block;font-family:var(--mono);font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim2);margin-bottom:4px;">Sign in as</label>
-      <select id="loginRole" style="width:100%;margin-bottom:12px;">
-        ${ROLE_OPTIONS.map(r=>`<option value="${r}">${r}</option>`).join('')}
+      <select id="loginRole" style="width:100%;margin-bottom:12px;" onchange="ui.loginRole=this.value; toggleLoginUsername();">
+        ${ROLE_OPTIONS.map(r=>`<option value="${r}" ${(ui.loginRole||ROLE_OPTIONS[0])===r?'selected':''}>${r}</option>`).join('')}
       </select>
+      <div id="loginUsernameRow" style="display:${(ui.loginRole==='HR' && hrAccountsList().length)?'block':'none'};">
+        <label style="display:block;font-family:var(--mono);font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim2);margin-bottom:4px;">Username</label>
+        <input type="text" id="loginUsername" placeholder="HR username" autocomplete="username" value="${escapeHtml(ui.loginUsername||'')}" style="width:100%;margin-bottom:12px;" onkeydown="if(event.key==='Enter'){ document.getElementById('loginPassword').focus(); }">
+      </div>
       <label style="display:block;font-family:var(--mono);font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim2);margin-bottom:4px;">Password</label>
       <input type="password" id="loginPassword" placeholder="Password" style="width:100%;margin-bottom:14px;" onkeydown="if(event.key==='Enter'){ attemptLogin(); }" autofocus>
       ${ui.loginError ? `<div style="color:var(--red);font-size:12.5px;margin-bottom:12px;">${ui.loginError}</div>` : ''}
@@ -2717,10 +2939,12 @@ function renderFatalError(err, where){
 function render(){
   const app = document.getElementById('app');
   if(!ready){ app.innerHTML = '<div class="empty" style="padding:60px;">⏳ Loading saved data from the cloud…</div>'; return; }
+  enforceHrAccountStillValid();
   if(!ui.authRole){
     try{ app.innerHTML = renderLogin(); }
     catch(err){ console.error(err); app.innerHTML = renderFatalError(err, 'the login screen'); }
-    (document.getElementById('loginPassword') || document.getElementById('recCode'))?.focus();
+    const _u = document.getElementById('loginUsername');
+    ((_u && _u.offsetParent && !_u.value) ? _u : (document.getElementById('loginPassword') || document.getElementById('recCode')))?.focus();
     return;
   }
   try{
@@ -2742,7 +2966,10 @@ function render(){
   // branch and renderCompany's Export sub-tab, both gated on canViewCompanyExport()).
   const EXEC_ALLOWED_TABS = ['overview','company','forecastreport']; // ATS + PGB Masterlist link removed for Executives
   try{
-    if(ui.tab==='settings' && !isAdmin()){
+    if(ui.tab==='audit' && !isAdmin()){
+      body.innerHTML = '<div class="empty">The Audit Log is restricted to Admin users.</div>';
+    }
+    else if(ui.tab==='settings' && !isAdmin()){
       body.innerHTML = '<div class="empty">The Control Panel is restricted to Admin users. Switch your role to Admin (bottom-left) if that\'s you, or ask your Admin for this change.</div>';
     }
     else if(ui.role==='Executive' && !EXEC_ALLOWED_TABS.includes(ui.tab)){
@@ -2759,6 +2986,7 @@ function render(){
     else if(ui.tab==='coe') body.innerHTML = renderCOE();
     else if(ui.tab==='prf') body.innerHTML = renderPRF();
     else if(ui.tab==='ats') body.innerHTML = renderATS();
+    else if(ui.tab==='audit') body.innerHTML = renderAudit();
     else if(ui.tab==='settings') body.innerHTML = renderSettings();
   }catch(err){
     console.error(err);
@@ -2772,7 +3000,7 @@ function sidebar(){
   const dueAppraisals = pendingAppraisals().length;
   const EXEC_ALLOWED_TABS = ['overview','company','forecastreport']; // ATS + PGB Masterlist link removed for Executives
   const navItems = NAV_ITEMS.filter(([k,,,href])=>{
-    if(k==='settings') return isAdmin();
+    if(k==='settings' || k==='audit') return isAdmin();
     // Executives only see their allowed tabs — this also hides external links such as PGB Masterlist ↗
     if(ui.role==='Executive') return EXEC_ALLOWED_TABS.includes(k);
     if(href) return true; // external links are visible to Admin / HR
@@ -2797,7 +3025,7 @@ function sidebar(){
       <div style="margin-bottom:8px;">
         <label style="display:block;font-family:var(--mono);font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim2);margin-bottom:4px;">Signed in as</label>
         <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
-          <span style="font-size:13px;font-weight:600;">${ui.role}</span>
+          <span style="font-size:13px;font-weight:600;">${ui.role}${(ui.role==='HR' && ui.hrAccountId && ui.userName) ? ` <span style="font-weight:400;color:var(--dim2);">· ${escapeHtml(ui.userName)}</span>` : ''}</span>
           <button class="btn small" onclick="doLogout()">Log Out</button>
         </div>
       </div>
@@ -2809,8 +3037,8 @@ function sidebar(){
 function topbar(){
   const current = NAV_ITEMS.find(n=>n[0]===ui.tab);
   const [curYear, curMonthNum] = ui.month.split('-').map(Number);
-  const monthIrrelevant = ui.tab==='overview' || (ui.tab==='company' && ui.companyPeriod!=='monthly') || ui.tab==='archive' || ui.tab==='appraisal' || ui.tab==='coe' || ui.tab==='ats' || (ui.tab==='forecastreport' && ui.reportPeriod!=='monthly');
-  const monthOffTitle = ui.tab==='overview'
+  const monthIrrelevant = ui.tab==='overview' || (ui.tab==='company' && ui.companyPeriod!=='monthly') || ui.tab==='archive' || ui.tab==='appraisal' || ui.tab==='coe' || ui.tab==='ats' || ui.tab==='audit' || (ui.tab==='forecastreport' && ui.reportPeriod!=='monthly');
+  const monthOffTitle = ui.tab==='audit' ? "Month isn't used here — the Audit Log has its own date filter." : ui.tab==='overview'
     ? "Month isn't used here — Trend & Insight shows accumulated/annual data for the Year selected above."
     : (ui.tab==='appraisal'
     ? "Month isn't used here — evaluation due dates are tracked against today's date."
@@ -5457,7 +5685,7 @@ function prfWeekdaysBetween(approvedStr, onboardStr){
   }
   return count;
 }
-function prfEmptySlot(){ return {employeeId:'', employeeName:'', onboardingDate:''}; }
+function prfEmptySlot(){ return {employeeId:'', employeeName:'', jobOfferDate:'', onboardingDate:''}; }
 // Grows or shrinks a PRF's slot list to match Headcount Requested. Shrinking is blocked if it
 // would discard a slot that's already been filled (linked to a hire, or given a manual name/
 // date) — Headcount Requested should be corrected some other way, or that slot cleared first,
@@ -5466,7 +5694,7 @@ function prfResizeSlots(prf, newCount){
   newCount = Math.max(1, Number(newCount)||1);
   const slots = Array.isArray(prf.slots) ? prf.slots.slice() : [];
   if(newCount < slots.length){
-    const wouldDrop = slots.slice(newCount).some(s=> s.employeeName || s.onboardingDate);
+    const wouldDrop = slots.slice(newCount).some(s=> s.employeeName || s.jobOfferDate || s.onboardingDate);
     if(wouldDrop){ toast("Can't reduce Headcount Requested below the number of slots already filled — clear a filled slot first."); return false; }
   }
   while(slots.length < newCount) slots.push(prfEmptySlot());
@@ -5552,7 +5780,10 @@ function renderPRF(){
         <div class="card" style="padding:10px 14px;"><div class="label">Closed</div><div class="value green" style="font-size:20px;">${closedHeads}</div></div>
       </div>
     </div>
-    ${canQuickAdd() ? `<button class="btn primary" onclick="openAddPrfModal()">+ Add PRF</button>` : ''}
+    <div style="display:flex;gap:8px;flex-wrap:wrap;">
+      <button class="btn" onclick="openPrfExportModal()">⬇ Export to Excel</button>
+      ${canQuickAdd() ? `<button class="btn primary" onclick="openAddPrfModal()">+ Add PRF</button>` : ''}
+    </div>
   </div>
   <div class="field-row" style="margin-top:16px;align-items:center;gap:0;border-bottom:1px solid var(--border,rgba(255,255,255,.1));">
     <div onclick="ui.prfView='active'; render();" style="cursor:pointer;padding:8px 16px;font-family:var(--mono);font-size:11.5px;letter-spacing:.05em;text-transform:uppercase;${view==='active'?'color:var(--gold);border-bottom:2px solid var(--gold);':'color:var(--dim2);border-bottom:2px solid transparent;'}">Active (${open+onHold})</div>
@@ -5627,10 +5858,11 @@ function prfListHTML(list){
       // that hasn't reached that point yet (that's the normal way HR logs a new hire here).
       const locked = !!s.onboardingDate;
       const slotEditable = canEdit && (admin || !locked);
-      const canClearSlot = (s.employeeName || s.onboardingDate) && (admin || !locked);
+      const canClearSlot = (s.employeeName || s.jobOfferDate || s.onboardingDate) && (admin || !locked);
       return `<tr>
         <td>Slot ${i+1}</td>
         <td>${slotEditable ? `<input type="text" value="${(s.employeeName||'').replace(/"/g,'&quot;')}" placeholder="— Unfilled —" style="width:100%;" onchange="updatePrfSlotName('${prf.id}',${i},this.value)">` : (s.employeeName || '— Unfilled —')}</td>
+        <td>${slotEditable ? `<input type="date" value="${s.jobOfferDate||''}" onchange="updatePrfSlotOfferDate('${prf.id}',${i},this.value)">` : (s.jobOfferDate ? fmtDateMDY(s.jobOfferDate) : '—')}</td>
         <td>${slotEditable ? `<input type="date" value="${s.onboardingDate||''}" onchange="updatePrfSlotDate('${prf.id}',${i},this.value)">` : (s.onboardingDate ? fmtDateMDY(s.onboardingDate) : '—')}</td>
         <td>${days===null ? '—' : days+'d'}</td>
         <td class="row-actions">${canClearSlot ? `<button class="btn small danger" onclick="clearPrfSlot('${prf.id}',${i})">Clear</button>` : (canEdit && locked && !admin ? '<span class="hint" style="margin:0;">Admin only</span>' : '')}</td>
@@ -5658,7 +5890,7 @@ function prfListHTML(list){
       ${prf.qualifications ? `<p class="hint"><b>Qualifications:</b> ${escapeHtml(prf.qualifications)}</p>` : ''}
       ${status==='On Hold' && prf.remarks ? `<p class="hint" style="color:var(--red);"><b>On Hold — Remarks:</b> ${escapeHtml(prf.remarks)}</p>` : ''}
       <table class="simple">
-        <thead><tr><th>Slot</th><th>Employee</th><th>Onboarding / Hired Date</th><th>Days Filled</th><th></th></tr></thead>
+        <thead><tr><th>Slot</th><th>Employee</th><th>Job Offer Date</th><th>Onboarding / Hired Date</th><th>Days Filled</th><th></th></tr></thead>
         <tbody>${slotsHTML}</tbody>
       </table>
     </div>`;
@@ -5681,9 +5913,25 @@ async function updatePrfSlotDate(id, idx, value){
   const prf = (CONFIG.prfList||[]).find(p=> p.id===id);
   if(!prf || !prf.slots[idx]) return;
   if(prf.slots[idx].onboardingDate && !isAdmin()){ toast('Only Admin can edit a PRF slot that already has an onboarding date on file.'); render(); return; }
+  // Job Offer Date is required before a slot can be marked hired/deployed — it's the start of
+  // the offer-to-onboard stretch reported in the PRF Excel export.
+  if(value && !prf.slots[idx].jobOfferDate){ toast('Enter the Job Offer Date for this slot first, then the Onboarding / Hired Date.'); render(); return; }
+  if(value && prf.slots[idx].jobOfferDate && parseDate(value) < parseDate(prf.slots[idx].jobOfferDate)){ toast('Onboarding / Hired Date can\'t be earlier than the Job Offer Date.'); render(); return; }
   prf.slots[idx].onboardingDate = value;
   await saveConfig();
   render(); // status/pill and Days Filled both depend on this, not just the row
+}
+async function updatePrfSlotOfferDate(id, idx, value){
+  if(!canQuickAdd()) return;
+  const prf = (CONFIG.prfList||[]).find(p=> p.id===id);
+  if(!prf || !prf.slots[idx]) return;
+  const slot = prf.slots[idx];
+  if(slot.onboardingDate && !isAdmin()){ toast('Only Admin can edit a PRF slot that already has an onboarding date on file.'); renderPRFList(); return; }
+  if(!value && slot.onboardingDate){ toast('Job Offer Date is required once a slot has an Onboarding / Hired Date.'); renderPRFList(); return; }
+  if(value && slot.onboardingDate && parseDate(slot.onboardingDate) && parseDate(value) > parseDate(slot.onboardingDate)){ toast('Job Offer Date can\'t be later than the Onboarding / Hired Date.'); renderPRFList(); return; }
+  slot.jobOfferDate = value;
+  await saveConfig();
+  renderPRFList();
 }
 async function clearPrfSlot(id, idx){
   if(!canQuickAdd()) return;
@@ -5707,6 +5955,96 @@ async function confirmDeletePrf(){
   closeModal();
   toast('PRF deleted.');
   render();
+}
+
+/* ---- PRF Excel export ----
+   Two sheets, filtered by PRF Status, Business Affiliate and Date Requested (= Date Received):
+   1) PRF Summary — one row per PRF with status, dates and fill counts.
+   2) Hires per PRF — one row per requested head (slot): who was hired, Job Offer Date and
+      Date Hired / Deployed, so HR can trace each PRF to the people who filled it. */
+function openPrfExportModal(){
+  ui.modal = {type:'prfExport', arg:null};
+  render();
+}
+function prfExportModalHTML(){
+  const companies = allCompanies().map(c=>c.company);
+  return `
+  <h3>Export PRFs to Excel</h3>
+  <p class="hint" style="margin-top:-4px;">Exports a PRF Summary sheet plus a Hires per PRF sheet (employee, Job Offer Date, Date Hired / Deployed). Leave a filter blank to include everything.</p>
+  <div class="field-row">
+    <div class="field" style="flex:1;"><label>PRF STATUS</label>
+      <select id="prfx_status">
+        <option value="">All statuses</option>
+        <option value="Open">Open</option>
+        <option value="On Hold">On Hold</option>
+        <option value="Closed">Closed (Served)</option>
+      </select>
+    </div>
+    <div class="field" style="flex:2;"><label>BUSINESS AFFILIATE</label>
+      <select id="prfx_company">
+        <option value="">All Affiliates</option>
+        ${companies.map(c=>`<option value="${c}">${c}</option>`).join('')}
+      </select>
+    </div>
+  </div>
+  <div class="field-row">
+    <div class="field"><label>DATE REQUESTED — FROM</label><input type="date" id="prfx_from"></div>
+    <div class="field"><label>DATE REQUESTED — TO</label><input type="date" id="prfx_to"></div>
+  </div>
+  <p class="hint">Date Requested is the PRF's Date Received. PRFs with no Date Received are left out only when a date range is set.</p>
+  <div style="margin-top:16px;"><button class="btn primary" onclick="exportPrfExcel()">Download .xlsx</button> <button class="btn" onclick="closeModal()">Cancel</button></div>`;
+}
+function exportPrfExcel(){
+  if(typeof XLSX === 'undefined'){ toast('Excel export isn\'t available right now — try refreshing the page.'); return; }
+  const g = id => (document.getElementById(id)||{}).value || '';
+  const status = g('prfx_status'), company = g('prfx_company'), from = g('prfx_from'), to = g('prfx_to');
+  if(from && to && from > to){ toast('"From" date is after the "To" date.'); return; }
+  const list = (CONFIG.prfList||[]).filter(p=>{
+    if(status && prfOverallStatus(p)!==status) return false;
+    if(company && p.company!==company) return false;
+    if(from || to){
+      if(!p.dateReceived) return false;
+      if(from && p.dateReceived < from) return false;
+      if(to && p.dateReceived > to) return false;
+    }
+    return true;
+  }).slice().sort((a,b)=> (a.company||'').localeCompare(b.company||'') || (a.controlNum||0)-(b.controlNum||0));
+  if(!list.length){ toast('No PRFs match those filters.'); return; }
+
+  const calDays = (a,b)=>{ const x=parseDate(a), y=parseDate(b); return (x&&y&&y>=x) ? Math.round((y-x)/86400000) : ''; };
+
+  const summary = [['PRF Reference #','Business Affiliate','Position','Cost Center','PRF Status','Date Requested','Date Approved','Headcount Requested','Filled','Unfilled','Hired / Deployed (Names)','Qualifications','Remarks']]
+    .concat(list.map(p=>{
+      const slots = p.slots||[], filled = prfFilledCount(p);
+      const names = slots.filter(s=> s.onboardingDate).map(s=> s.employeeName||s.employeeId||'').filter(Boolean).join('; ');
+      return [prfRefNumber(p), p.company||'', p.position||'', p.costCenter||'', prfOverallStatus(p),
+        fmtDateMDY(p.dateReceived), fmtDateMDY(p.dateApproved), slots.length, filled, slots.length-filled,
+        names, p.qualifications||'', p.remarks||''];
+    }));
+
+  const hires = [['PRF Reference #','Business Affiliate','Position','PRF Status','Date Requested','Date Approved','Slot','Employee ID','Employee Name','Job Offer Date','Date Hired / Deployed','Slot Status','Days: Offer → Hired (calendar)','Days Filled from Approval (weekdays)']];
+  list.forEach(p=>{
+    (p.slots||[]).forEach((s,i)=>{
+      const wd = prfWeekdaysBetween(p.dateApproved, s.onboardingDate);
+      hires.push([prfRefNumber(p), p.company||'', p.position||'', prfOverallStatus(p),
+        fmtDateMDY(p.dateReceived), fmtDateMDY(p.dateApproved), i+1,
+        s.employeeId||'', s.employeeName||'', fmtDateMDY(s.jobOfferDate), fmtDateMDY(s.onboardingDate),
+        s.onboardingDate ? 'Hired / Deployed' : (s.jobOfferDate ? 'Offer Made' : 'Unfilled'),
+        calDays(s.jobOfferDate, s.onboardingDate), wd===null ? '' : wd]);
+    });
+  });
+
+  const ws1 = XLSX.utils.aoa_to_sheet(summary);
+  ws1['!cols'] = [24,26,26,14,12,14,14,10,8,9,40,40,30].map(w=>({wch:w}));
+  const ws2 = XLSX.utils.aoa_to_sheet(hires);
+  ws2['!cols'] = [24,26,26,12,14,14,6,12,28,14,18,16,14,16].map(w=>({wch:w}));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws1, 'PRF Summary');
+  XLSX.utils.book_append_sheet(wb, ws2, 'Hires per PRF');
+  const scope = [status||'All-Statuses', company||'All-Affiliates', from||'', to||''].filter(Boolean).join('_').replace(/\s+/g,'-');
+  XLSX.writeFile(wb, `prf_monitoring_${scope}.xlsx`);
+  closeModal();
+  toast(`Exported ${list.length} PRF(s).`);
 }
 
 /* ---- Add / Edit PRF modal ---- */
@@ -6942,6 +7280,12 @@ function openMasterlistNewHireConfirm(rows, thenPromotionRows, thenCandidateIds)
 // because the Date Hired is a typo (e.g. wrong year) or because they were actually already
 // employed before this date and should be marked "No" instead. This flags that mismatch live, at
 // the point of review, instead of leaving it to surface later as a number that doesn't add up.
+// Reveals the required Job Offer Date field once a PRF is picked for this new hire.
+function toggleMlPrfOfferDate(employeeId){
+  const sel = document.querySelector(`.mlPrfSelect[data-id="${employeeId}"]`);
+  const row = document.querySelector(`.mlPrfOfferRow[data-for="${employeeId}"]`);
+  if(row) row.style.display = (sel && sel.value) ? 'flex' : 'none';
+}
 function checkNewHireDateWarning(employeeId){
   const sel = document.querySelector(`.mlNewHireChoice[data-id="${employeeId}"]`);
   const dateEl = document.querySelector(`.mlNewHireDate[data-id="${employeeId}"]`);
@@ -6963,6 +7307,20 @@ async function confirmMasterlistNewHires(){
   const {company, status, asOfMonth} = P;
   let newHires=0, addedNotCounted=0, promotedFromRf=0;
   const pendingPrfLinks = [];
+  // Job Offer Date is required for every new hire tagged to a PRF — checked up front, before
+  // anything is staged into P.working, so HR can fix it and click Save again.
+  for(const row of rows){
+    const sel = document.querySelector(`.mlNewHireChoice[data-id="${row.employeeId}"]`);
+    const prfSel = document.querySelector(`.mlPrfSelect[data-id="${row.employeeId}"]`);
+    if(!prfSel || !prfSel.value || (sel && sel.value!=='yes')) continue;
+    const offerEl = document.querySelector(`.mlPrfOfferDate[data-id="${row.employeeId}"]`);
+    const dateEl = document.querySelector(`.mlNewHireDate[data-id="${row.employeeId}"]`);
+    const offer = offerEl ? offerEl.value : '';
+    const hired = (dateEl && dateEl.value) ? dateEl.value : row.dateHired;
+    const who = `${row.lastName||''}, ${row.firstName||''}`;
+    if(!offer){ toast(`Enter the Job Offer Date for ${who} — required when assigning a new hire to a PRF.`); if(offerEl) offerEl.focus(); return; }
+    if(hired && parseDate(hired) && parseDate(offer) > parseDate(hired)){ toast(`Job Offer Date for ${who} can't be later than their Date Hired.`); if(offerEl) offerEl.focus(); return; }
+  }
   rows.forEach(row=>{
     const sel = document.querySelector(`.mlNewHireChoice[data-id="${row.employeeId}"]`);
     const dateEl = document.querySelector(`.mlNewHireDate[data-id="${row.employeeId}"]`);
@@ -7023,7 +7381,8 @@ async function confirmMasterlistNewHires(){
     // finalizeMasterlistUpload, so a cancelled upload can't leave a PRF slot filled with nobody
     // actually on the roster. Onboarding Date defaults to this row's Date Hired, per Task h.
     if(isNewHire && prfSel && prfSel.value){
-      pendingPrfLinks.push({prfId:prfSel.value, employeeId:row.employeeId, employeeName:`${row.lastName||''}, ${row.firstName||''}`, onboardingDate:dateHired});
+      const offerEl = document.querySelector(`.mlPrfOfferDate[data-id="${row.employeeId}"]`);
+      pendingPrfLinks.push({prfId:prfSel.value, employeeId:row.employeeId, employeeName:`${row.lastName||''}, ${row.firstName||''}`, jobOfferDate:offerEl?offerEl.value:'', onboardingDate:dateHired});
     }
   });
   P.meta.newHires = newHires;
@@ -7218,6 +7577,7 @@ async function finalizeMasterlistUpload(){
       if(!slot) return;
       slot.employeeId = link.employeeId;
       slot.employeeName = link.employeeName;
+      slot.jobOfferDate = link.jobOfferDate || '';
       slot.onboardingDate = link.onboardingDate;
       prfChanged = true;
     });
@@ -8263,6 +8623,153 @@ function downloadCSV(rows, filename){
 }
 
 /* ============ SETTINGS / CONTROL PANEL ============ */
+function fmtDateTime(ts){
+  if(!ts) return '—';
+  const d = new Date(ts);
+  return isNaN(d) ? '—' : d.toLocaleString('en-PH', {year:'numeric', month:'short', day:'2-digit', hour:'2-digit', minute:'2-digit', second:'2-digit'});
+}
+function renderHrAccountsPanel(){
+  const list = hrAccountsList();
+  return `
+  <div class="panel" id="hrAccountsPanel">
+    <div class="panel-head"><h3>HR User Accounts <span class="n" style="color:var(--dim);font-family:var(--mono);font-size:12px;">${list.length}</span></h3></div>
+    <p class="hint">When someone picks <b>HR</b> on the sign-in screen, they must enter their own username and password from this list. Only Admin can add, edit, disable or delete HR accounts. Passwords are stored only as salted SHA-256 hashes. Every sign-in and change is recorded in the Audit Log.</p>
+    <div class="field-row" style="flex-wrap:wrap;">
+      <input type="text" id="hra_username" placeholder="Username (e.g. jdelacruz)" autocomplete="off" style="width:170px;">
+      <input type="text" id="hra_fullname" placeholder="Full name" autocomplete="off" style="width:190px;">
+      <input type="password" id="hra_pwd" placeholder="Password (min. 6)" autocomplete="new-password" style="width:150px;">
+      <input type="password" id="hra_pwd2" placeholder="Confirm password" autocomplete="new-password" style="width:150px;">
+      <button class="btn primary" onclick="addHrAccount()">+ Add HR Account</button>
+    </div>
+    ${list.length ? `
+    <table class="simple" style="margin-top:10px;">
+      <thead><tr><th>Username</th><th>Full Name</th><th>Status</th><th>Created</th><th>Last Sign-in</th><th></th></tr></thead>
+      <tbody>${list.map(a=>`<tr>
+        <td style="font-family:var(--mono);">${escapeHtml(a.username)}</td>
+        <td>${escapeHtml(a.fullName||'—')}</td>
+        <td>${a.active ? '<span class="pill" style="background:rgba(58,142,91,.14);color:var(--green);">Active</span>' : '<span class="pill" style="background:rgba(178,58,58,.14);color:var(--red);">Disabled</span>'}</td>
+        <td>${fmtDateTime(a.createdAt)}</td>
+        <td>${a.lastLoginAt ? fmtDateTime(a.lastLoginAt) : '—'}</td>
+        <td class="row-actions"><button class="btn small" onclick="openEditHrAccount('${a.id}')">Edit</button> <button class="btn small danger" onclick="openDeleteHrAccount('${a.id}')">Delete</button></td>
+      </tr>`).join('')}</tbody>
+    </table>` : '<div class="empty" style="margin-top:10px;">No HR accounts yet.</div>'}
+  </div>`;
+}
+function hrAccountModalHTML(type, id){
+  const a = (CONFIG.hrAccounts||{})[id];
+  if(!a) return '<h3>HR account not found</h3><div style="margin-top:16px;"><button class="btn" onclick="closeModal()">Close</button></div>';
+  if(type==='hrAccountDelete') return `
+    <h3>Delete HR account?</h3>
+    <p class="hint">This permanently removes <b>${escapeHtml(a.username)}</b>${a.fullName?` (${escapeHtml(a.fullName)})`:''}. They'll be signed out on every device and won't be able to sign in again. Their past actions stay in the Audit Log. To block access temporarily instead, use Edit → Disabled.</p>
+    <div style="margin-top:16px;"><button class="btn danger" onclick="confirmDeleteHrAccount()">Delete</button> <button class="btn" onclick="closeModal()">Cancel</button></div>`;
+  return `
+    <h3>Edit HR Account</h3>
+    <div class="field-row">
+      <div class="field" style="flex:1;"><label>USERNAME</label><input type="text" id="hre_username" value="${escapeHtml(a.username)}" autocomplete="off"></div>
+      <div class="field" style="flex:2;"><label>FULL NAME</label><input type="text" id="hre_fullname" value="${escapeHtml(a.fullName||'')}" autocomplete="off" style="width:100%;"></div>
+    </div>
+    <div class="field" style="margin-bottom:10px;"><label>STATUS</label>
+      <select id="hre_status"><option value="active" ${a.active?'selected':''}>Active — can sign in</option><option value="disabled" ${a.active?'':'selected'}>Disabled — can't sign in</option></select>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>NEW PASSWORD <span style="font-weight:400;text-transform:none;color:var(--dim2);">(leave blank to keep)</span></label><input type="password" id="hre_pwd" autocomplete="new-password"></div>
+      <div class="field"><label>CONFIRM NEW PASSWORD</label><input type="password" id="hre_pwd2" autocomplete="new-password"></div>
+    </div>
+    <div style="margin-top:16px;"><button class="btn primary" onclick="confirmEditHrAccount()">Save Changes</button> <button class="btn" onclick="closeModal()">Cancel</button></div>`;
+}
+
+/* ---- Audit Log page (Admin only) ---- */
+// Only changes and file uploads are shown — entries from the earlier version that recorded
+// sign-ins/sign-outs/exports are hidden.
+function auditVisibleEntries(){
+  return Object.values(CONFIG.auditLog||{}).filter(e=> e && e.ts && !/^(Signed in|Signed out|Sign-in |Audit log exported)/.test(e.action||''));
+}
+function auditEntriesFiltered(){
+  const all = auditVisibleEntries();
+  const q = (ui.auditSearch||'').trim().toLowerCase();
+  const from = ui.auditFrom ? new Date(ui.auditFrom+'T00:00:00').getTime() : null;
+  const to = ui.auditTo ? new Date(ui.auditTo+'T23:59:59').getTime() : null;
+  return all.filter(e=>{
+    if(ui.auditUser && e.user!==ui.auditUser) return false;
+    if(ui.auditRole && e.role!==ui.auditRole) return false;
+    if(from!=null && e.ts < from) return false;
+    if(to!=null && e.ts > to) return false;
+    if(q && ![e.user, e.fullName, e.role, e.action, e.details, e.page].join(' ').toLowerCase().includes(q)) return false;
+    return true;
+  }).sort((a,b)=> b.ts - a.ts);
+}
+function renderAudit(){
+  const all = auditVisibleEntries();
+  const users = Array.from(new Set(all.map(e=> e.user).filter(Boolean))).sort((a,b)=> a.localeCompare(b));
+  const dayAgo = Date.now() - 86400000;
+  const today = all.filter(e=> e.ts >= dayAgo).length;
+  const uploads = all.filter(e=> e.ts >= dayAgo && /^File uploaded/.test(e.action)).length;
+  return `
+  <div class="field-row" style="justify-content:space-between;flex-wrap:wrap;gap:12px;align-items:flex-start;">
+    <div class="grid cards3" style="grid-template-columns:repeat(3,150px);gap:12px;">
+      <div class="card" style="padding:10px 14px;"><div class="label">Total Entries</div><div class="value" style="font-size:20px;">${all.length}</div></div>
+      <div class="card" style="padding:10px 14px;"><div class="label">Last 24 Hours</div><div class="value" style="font-size:20px;color:var(--gold);">${today}</div></div>
+      <div class="card" style="padding:10px 14px;"><div class="label">File Uploads (24h)</div><div class="value" style="font-size:20px;color:var(--teal);">${uploads}</div></div>
+    </div>
+    <button class="btn" onclick="exportAuditExcel()">⬇ Export to Excel</button>
+  </div>
+  <p class="hint">Records who made changes and who uploaded files. Only Admin can see this page. Entries can't be edited or deleted; the newest ${AUDIT_MAX.toLocaleString()} are kept.</p>
+  <div class="field-row" style="flex-wrap:wrap;">
+    <input type="text" id="auditSearchBox" placeholder="Search action, details, page…" value="${escapeHtml(ui.auditSearch||'')}" oninput="ui.auditSearch=this.value; renderAuditList();" style="width:240px;">
+    <div class="field"><label>USER</label>
+      <select onchange="ui.auditUser=this.value; renderAuditList();">
+        <option value="">All users</option>
+        ${users.map(u=>`<option value="${escapeHtml(u)}" ${ui.auditUser===u?'selected':''}>${escapeHtml(u)}</option>`).join('')}
+      </select>
+    </div>
+    <div class="field"><label>ROLE</label>
+      <select onchange="ui.auditRole=this.value; renderAuditList();">
+        <option value="">All roles</option>
+        ${ROLE_OPTIONS.map(r=>`<option value="${r}" ${ui.auditRole===r?'selected':''}>${r}</option>`).join('')}
+      </select>
+    </div>
+    <div class="field"><label>FROM</label><input type="date" value="${ui.auditFrom||''}" onchange="ui.auditFrom=this.value; renderAuditList();"></div>
+    <div class="field"><label>TO</label><input type="date" value="${ui.auditTo||''}" onchange="ui.auditTo=this.value; renderAuditList();"></div>
+  </div>
+  <div id="auditList" style="margin-top:12px;">${auditListHTML()}</div>`;
+}
+function auditListHTML(){
+  const list = auditEntriesFiltered();
+  if(!list.length) return '<div class="empty">No audit entries match these filters.</div>';
+  const shown = list.slice(0, 500);
+  return `
+  ${list.length > shown.length ? `<p class="hint">Showing the newest ${shown.length} of ${list.length} matching entries — narrow the filters or export to Excel for the rest.</p>` : ''}
+  <table class="simple">
+    <thead><tr><th style="white-space:nowrap;">Date / Time</th><th>User</th><th>Role</th><th>Action</th><th>Details</th><th>Page</th></tr></thead>
+    <tbody>${shown.map(e=>`<tr>
+      <td style="white-space:nowrap;font-family:var(--mono);font-size:11.5px;">${fmtDateTime(e.ts)}</td>
+      <td>${escapeHtml(e.user||'')}${e.fullName?`<div class="hint" style="margin:0;">${escapeHtml(e.fullName)}</div>`:''}</td>
+      <td>${escapeHtml(e.role||'')}</td>
+      <td style="${/deleted|Bulk/i.test(e.action)?'color:var(--red);':(/^File uploaded/.test(e.action)?'color:var(--teal);':'')}">${escapeHtml(e.action||'')}</td>
+      <td style="font-size:12.5px;">${escapeHtml(e.details||'')}</td>
+      <td class="hint" style="margin:0;">${escapeHtml(e.page||'')}</td>
+    </tr>`).join('')}</tbody>
+  </table>`;
+}
+function renderAuditList(){
+  const el = document.getElementById('auditList');
+  if(el) el.innerHTML = auditListHTML();
+}
+function exportAuditExcel(){
+  if(!isAdmin()) return;
+  if(typeof XLSX === 'undefined'){ toast('Excel export isn\'t available right now — try refreshing the page.'); return; }
+  const list = auditEntriesFiltered();
+  if(!list.length){ toast('No audit entries match these filters.'); return; }
+  const rows = [['Date / Time','User','Full Name','Role','Action','Details','Page']]
+    .concat(list.map(e=> [fmtDateTime(e.ts), e.user||'', e.fullName||'', e.role||'', e.action||'', e.details||'', e.page||'']));
+  const ws = XLSX.utils.aoa_to_sheet(rows);
+  ws['!cols'] = [24,18,24,10,26,70,24].map(w=>({wch:w}));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Audit Log');
+  const d = new Date();
+  XLSX.writeFile(wb, `audit_log_${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}.xlsx`);
+}
+
 function renderSettings(){
   const settingsCompanies = allCompanies().map(c=>c.company);
   if(!ui.ccDeptCompany || !settingsCompanies.includes(ui.ccDeptCompany)) ui.ccDeptCompany = settingsCompanies[0] || null;
@@ -8477,8 +8984,11 @@ function renderSettings(){
     </table>
   </div>
 
+  ${renderHrAccountsPanel()}
+
   <div class="panel">
     <div class="panel-head"><h3>Role Passwords</h3></div>
+    ${hrAccountsList().length ? '<p class="hint" style="color:var(--teal);">HR now signs in with individual accounts (see HR User Accounts above) — the shared HR password below is no longer accepted.</p>' : '<p class="hint" style="color:var(--gold);">No HR accounts yet — HR can still use the shared HR password below until you add the first one in HR User Accounts.</p>'}
     <p class="hint">Admin, HR, and Executive each sign in with one shared password. Passwords are never stored as readable text — only a one-way SHA-256 hash is saved — so this stays safe even with the file published on GitHub. Changing a password here takes effect immediately and doesn't require touching the file at all.</p>
     <div class="field-row">
       <select id="pwRole"><option>Admin</option><option>HR</option><option>Executive</option></select>
@@ -8771,10 +9281,14 @@ function renderModal(){
           </div>
           ${openPrfs.length ? `
           <div style="margin-top:6px;">
-            <select class="mlPrfSelect" data-id="${r.employeeId}" style="width:100%;">
+            <select class="mlPrfSelect" data-id="${r.employeeId}" style="width:100%;" onchange="toggleMlPrfOfferDate('${r.employeeId}')">
               <option value="">— No PRF (skip PRF Monitoring for this hire) —</option>
               ${openPrfs.map(p=>`<option value="${p.id}">Fills PRF ${prfRefNumber(p)} — ${prfFilledCount(p)}/${(p.slots||[]).length} filled</option>`).join('')}
             </select>
+            <div class="mlPrfOfferRow" data-for="${r.employeeId}" style="display:none;margin-top:6px;align-items:center;gap:8px;flex-wrap:wrap;">
+              <label style="font-size:11.5px;letter-spacing:.04em;text-transform:uppercase;color:var(--dim2);">Job Offer Date <span style="color:var(--red);">*</span></label>
+              <input type="date" class="mlPrfOfferDate" data-id="${r.employeeId}" style="flex:1;min-width:130px;">
+            </div>
           </div>` : ''}
           <div id="mlNewHireWarn-${r.employeeId}" style="display:none;font-size:11.5px;color:var(--red);margin-top:6px;line-height:1.4;"></div>
         </div>
@@ -9063,13 +9577,17 @@ function renderModal(){
     <div style="margin-top:16px;"><button class="btn primary" onclick="confirmAddArchiveRecord()">Add Record</button> <button class="btn" onclick="closeModal()">Cancel</button></div>`;
   } else if(ui.modal.type==='prfForm'){
     body = prfFormModalHTML(ui.modal.arg);
+  } else if(ui.modal.type==='prfExport'){
+    body = prfExportModalHTML();
+  } else if(ui.modal.type==='hrAccountEdit' || ui.modal.type==='hrAccountDelete'){
+    body = isAdmin() ? hrAccountModalHTML(ui.modal.type, ui.modal.arg) : '<h3>Admin only</h3>';
   } else if(ui.modal.type==='deletePrf'){
     const prf = (CONFIG.prfList||[]).find(p=> p.id===ui.modal.arg);
     body = `<h3>Delete PRF?</h3>
     <p class="hint">This permanently deletes <b>${prf?prfRefNumber(prf):''}</b> and every slot on it${prf && prfFilledCount(prf) ? `, including ${prfFilledCount(prf)} filled slot(s)` : ''}. This can't be undone.</p>
     <div style="margin-top:16px;"><button class="btn danger" onclick="confirmDeletePrf()">Delete</button> <button class="btn" onclick="closeModal()">Cancel</button></div>`;
   }
-  const wide = ui.modal.type==='unclassifiedList' ? 'width:900px;max-width:95vw;' : (ui.modal.type==='editEmployee' || ui.modal.type==='addArchiveRecord' || ui.modal.type==='confirmMasterlistNewHires' || ui.modal.type==='confirmMasterlistPromotions' || ui.modal.type==='deleteArchiveList' || ui.modal.type==='prfForm') ? 'width:640px;' : '';
+  const wide = ui.modal.type==='unclassifiedList' ? 'width:900px;max-width:95vw;' : (ui.modal.type==='editEmployee' || ui.modal.type==='addArchiveRecord' || ui.modal.type==='confirmMasterlistNewHires' || ui.modal.type==='confirmMasterlistPromotions' || ui.modal.type==='deleteArchiveList' || ui.modal.type==='prfForm' || ui.modal.type==='prfExport' || ui.modal.type==='hrAccountEdit') ? 'width:640px;' : '';
   const wrap = document.createElement('div');
   wrap.innerHTML = `<div class="modal-bg" onclick="if(event.target===this) closeModal()"><div class="modal" style="${wide}">${body}</div></div>`;
   document.getElementById('app').appendChild(wrap.firstElementChild);
@@ -9304,6 +9822,93 @@ loadAll();
   };
 })();
 </script>
+<script>
+/* ============ AUDIT LOG — specific entries for key actions ============
+   Wraps the existing action functions (same pattern as the window.render wrapper above): the
+   original runs unchanged, and an entry is logged only if it actually saved something (detected
+   via _localChangeSeq), so a cancelled/invalid attempt isn't recorded as done. Context such as an
+   employee's name is captured BEFORE the action, since a delete removes it. */
+(function(){
+  const empLabel = id => {
+    const e = EMP.find(x=> String(x.employeeId)===String(id));
+    return e ? `${e.lastName||''}, ${e.firstName||''} (ID ${e.employeeId}${e.company?` · ${e.company}`:''})` : `ID ${id}`;
+  };
+  const prfRef = id => { const p = (CONFIG.prfList||[]).find(x=> x.id===id); return p ? prfRefNumber(p) : id; };
+  const val = id => { const el = document.getElementById(id); return el ? String(el.value||'').trim() : ''; };
+  const modalArg = () => (ui.modal ? ui.modal.arg : null);
+  function wrap(name, pre, log){
+    const orig = window[name];
+    if(typeof orig !== 'function') return;
+    window[name] = async function(...args){
+      let ctx = null;
+      try{ ctx = pre ? pre(args) : null; }catch(e){}
+      const before = _localChangeSeq;
+      const r = await orig.apply(this, args);
+      if(_localChangeSeq !== before){
+        try{ const out = log(args, ctx); if(out) logAudit(out[0], out[1]); }catch(e){ console.warn('audit', name, e); }
+      }
+      return r;
+    };
+  }
+  // PRF Monitoring
+  wrap('confirmSavePrf', ()=>({editingId: modalArg()}), (a,c)=>{
+    const p = c.editingId ? (CONFIG.prfList||[]).find(x=> x.id===c.editingId) : (CONFIG.prfList||[]).slice(-1)[0];
+    return [c.editingId ? 'PRF edited' : 'PRF added', p ? `${prfRefNumber(p)} · ${p.company} · headcount ${(p.slots||[]).length} · ${prfOverallStatus(p)}` : ''];
+  });
+  wrap('confirmDeletePrf', ()=>({ref: prfRef(modalArg())}), (a,c)=> ['PRF deleted', c.ref]);
+  wrap('updatePrfSlotName', null, a=> ['PRF slot updated', `${prfRef(a[0])} · slot ${a[1]+1} · employee → "${a[2]}"`]);
+  wrap('updatePrfSlotOfferDate', null, a=> ['PRF slot updated', `${prfRef(a[0])} · slot ${a[1]+1} · job offer date → ${a[2] ? fmtDateMDY(a[2]) : '(cleared)'}`]);
+  wrap('updatePrfSlotDate', null, a=> ['PRF slot updated', `${prfRef(a[0])} · slot ${a[1]+1} · onboarding / hired date → ${a[2] ? fmtDateMDY(a[2]) : '(cleared)'}`]);
+  wrap('clearPrfSlot', a=>{ const p=(CONFIG.prfList||[]).find(x=> x.id===a[0]); const sl=p&&p.slots[a[1]]; return {name: sl ? (sl.employeeName||'') : ''}; },
+    (a,c)=> ['PRF slot cleared', `${prfRef(a[0])} · slot ${a[1]+1}${c.name?` (was ${c.name})`:''}`]);
+  // Employees / roster
+  wrap('deleteEmp', a=>({who: empLabel(a[0])}), (a,c)=> ['Employee record deleted', c.who]);
+  wrap('deleteEmpForMonth', a=>({who: empLabel(a[0])}), (a,c)=> ['Employee removed from month', `${c.who} · ${monthLabel(a[1])}`]);
+  wrap('confirmDeleteAllActive', ()=>({company: val('delAllCompany'), status: val('delAllStatus')}), (a,c)=> ['Bulk delete — active employees', `${c.company} · ${c.status}`]);
+  wrap('confirmSeparate', ()=>({who: empLabel(modalArg()), date: val('m_sepDate'), reason: val('m_sepReason')}),
+    (a,c)=> ['Employee marked separated', `${c.who} · ${c.date ? fmtDateMDY(c.date) : ''}${c.reason?` · ${c.reason}`:''}`]);
+  wrap('confirmTransfer', ()=>({who: empLabel(modalArg())}), (a,c)=> ['Employee transferred', c.who]);
+  wrap('confirmEditEmployee', ()=>({who: empLabel(modalArg())}), (a,c)=> ['Employee record edited', c.who]);
+  wrap('confirmArchiveDeleteOne', ()=>({who: empLabel(modalArg())}), (a,c)=> ['Archive record deleted', c.who]);
+  wrap('confirmDeleteArchiveList', ()=>({...(modalArg()||{})}), (a,c)=> ['Archive list deleted', `${c.kind||''} · ${c.month!=null?c.month+'/':''}${c.year||''}`]);
+  wrap('confirmAddArchiveRecord', ()=>({id: val('ar_id'), last: val('ar_last'), first: val('ar_first')}), (a,c)=> ['Archive record added', `ID ${c.id}${c.last||c.first?` · ${c.last}, ${c.first}`:''}`]);
+  wrap('finalizeMasterlistUpload', ()=>{ const P = MASTERLIST_PENDING||{}; const up = _auditPendingUpload; return {company:P.company, status:P.status, ms:P.asOfMonth, rows:P.rowCount, meta:P.meta||{}, file: up ? up.file : ''}; },
+    (a,c)=>{ _auditPendingUpload = null; return ['File uploaded', `Master List${c.file?` "${c.file}"`:''} · ${c.company||''} · ${c.status||''} · ${c.ms?monthLabel(c.ms):''}${c.rows!=null?` · ${c.rows} rows`:''}${c.meta.newHires!=null?` · ${c.meta.newHires} new hire(s)`:''}`]; });
+  // File uploads: remember who picked which file; the resulting save is logged as "File uploaded".
+  function noteUpload(inputId, label){
+    const el = document.getElementById(inputId);
+    const f = el && el.files && el.files[0];
+    if(f) _auditPendingUpload = {label, file: `"${f.name}"`, at: Date.now()};
+  }
+  ['handleCompanyUpload','handleUpload','handleRecruitUpload'].forEach(name=>{
+    const orig = window[name];
+    if(typeof orig !== 'function') return;
+    const meta = {handleCompanyUpload:['cu_file','Master List'], handleUpload:['csvFile','Employee import file'], handleRecruitUpload:['recruitFile','Recruitment cost file']}[name];
+    window[name] = function(...args){ try{ noteUpload(meta[0], meta[1]); }catch(e){} return orig.apply(this, args); };
+  });
+  // A cancelled Master List upload saved nothing — forget the file so a later edit isn't logged as an upload.
+  if(typeof window.cancelMasterlistUpload === 'function'){
+    const origCancel = window.cancelMasterlistUpload;
+    window.cancelMasterlistUpload = function(...args){ _auditPendingUpload = null; return origCancel.apply(this, args); };
+  }
+  wrap('confirmDismissPromotion', ()=>({who: empLabel((modalArg()||{}).employeeId)}), (a,c)=> ['Promotion entry deleted', c.who]);
+  wrap('markAppraisalDone', a=>({who: empLabel(a[0])}), (a,c)=> ['Appraisal marked done', `${c.who} · ${a[1]}-month`]);
+  wrap('undoAppraisalDone', a=>({who: empLabel(a[0])}), (a,c)=> ['Appraisal undone', `${c.who} · ${a[1]}-month`]);
+  wrap('confirmRecruitDetail', ()=>({company: modalArg()}), (a,c)=> ['Recruitment cost updated', `${c.company} · ${monthLabel(ui.month)}`]);
+  // Control Panel
+  wrap('updateRolePassword', ()=>({role: val('pwRole')}), (a,c)=> ['Role password changed', c.role]);
+  wrap('addUser', ()=>({name: val('userName'), role: val('userRole')}), (a,c)=> ['User with access added', `${c.name} · ${c.role}`]);
+  wrap('removeUser', a=>({u: (CONFIG.users||[])[a[0]]}), (a,c)=> ['User with access removed', c.u ? `${c.u.name} · ${c.u.role}` : '']);
+  wrap('confirmAddIndustry', ()=>({name: val('m_name')}), (a,c)=> ['Industry added', c.name]);
+  wrap('removeIndustry', a=>({n: ((CONFIG.industries||[])[a[0]]||{}).name}), (a,c)=> ['Industry removed', c.n||'']);
+  wrap('confirmAddCompany', a=>({ind: ((CONFIG.industries||[])[a[0]]||{}).name, name: val('m_name')}), (a,c)=> ['Company added', `${c.name}${c.ind?` · ${c.ind}`:''}`]);
+  wrap('removeCompany', a=>({n: (((CONFIG.industries||[])[a[0]]||{}).companies||[])[a[1]]}), (a,c)=> ['Company removed', String(c.n||'')]);
+  wrap('addManualCostCenter', null, a=> ['Cost center added', `${a[0]} · ${a[1]}`]);
+  wrap('deleteCostCenter', null, a=> ['Cost center deleted', `${a[0]} · ${a[1]}`]);
+  wrap('saveCOECompanyDefaults', null, ()=> ['COE defaults saved', '']);
+})();
+</script>
+
 
 
 
