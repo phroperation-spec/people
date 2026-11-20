@@ -5862,8 +5862,8 @@ function prfListHTML(list){
       return `<tr>
         <td>Slot ${i+1}</td>
         <td>${slotEditable ? `<input type="text" value="${(s.employeeName||'').replace(/"/g,'&quot;')}" placeholder="— Unfilled —" style="width:100%;" onchange="updatePrfSlotName('${prf.id}',${i},this.value)">` : (s.employeeName || '— Unfilled —')}</td>
-        <td>${slotEditable ? `<input type="date" value="${s.jobOfferDate||''}" onchange="updatePrfSlotOfferDate('${prf.id}',${i},this.value)">` : (s.jobOfferDate ? fmtDateMDY(s.jobOfferDate) : '—')}</td>
-        <td>${slotEditable ? `<input type="date" value="${s.onboardingDate||''}" onchange="updatePrfSlotDate('${prf.id}',${i},this.value)">` : (s.onboardingDate ? fmtDateMDY(s.onboardingDate) : '—')}</td>
+        <td>${slotEditable ? `<input type="date" value="${s.jobOfferDate||''}" data-orig="${s.jobOfferDate||''}" onchange="prfSlotDateCommit(this,'offer','${prf.id}',${i})" onblur="prfSlotDateCommit(this,'offer','${prf.id}',${i},true)" onkeydown="if(event.key==='Enter'){this.blur();}">` : (s.jobOfferDate ? fmtDateMDY(s.jobOfferDate) : '—')}</td>
+        <td>${slotEditable ? `<input type="date" value="${s.onboardingDate||''}" data-orig="${s.onboardingDate||''}" onchange="prfSlotDateCommit(this,'hired','${prf.id}',${i})" onblur="prfSlotDateCommit(this,'hired','${prf.id}',${i},true)" onkeydown="if(event.key==='Enter'){this.blur();}">` : (s.onboardingDate ? fmtDateMDY(s.onboardingDate) : '—')}</td>
         <td>${days===null ? '—' : days+'d'}</td>
         <td class="row-actions">${canClearSlot ? `<button class="btn small danger" onclick="clearPrfSlot('${prf.id}',${i})">Clear</button>` : (canEdit && locked && !admin ? '<span class="hint" style="margin:0;">Admin only</span>' : '')}</td>
       </tr>`;
@@ -5907,6 +5907,25 @@ async function updatePrfSlotName(id, idx, value){
   prf.slots[idx].employeeName = value;
   await saveConfig();
   renderPRFList();
+}
+// Typed dates: the browser fires "change" after every keystroke once a full date exists, so
+// typing the year "2026" would commit 0002 → 0020 → 0202 and re-render (losing focus) after the
+// first digit — leaving years like 0001. Only commit once the year is a real 4-digit year
+// (1900–2100), or on blur/Enter; a half-typed/invalid date on blur reverts to the saved value.
+function prfSlotDateCommit(el, kind, id, idx, isBlur){
+  const v = el.value || '';
+  const orig = el.dataset.orig || '';
+  if(v === orig) return;
+  const y = v ? parseInt(v.slice(0,4),10) : 0;
+  const valid = !v || (y >= 1900 && y <= 2100);
+  if(!valid){
+    if(isBlur){ toast('Please enter a complete date (mm/dd/yyyy) with a 4-digit year.'); el.value = orig; }
+    return; // still typing the year — wait
+  }
+  if(!isBlur && v && document.activeElement === el && y < 1000) return;
+  el.dataset.orig = v; // prevent the blur that follows a re-render from double-committing
+  if(kind === 'offer') updatePrfSlotOfferDate(id, idx, v);
+  else updatePrfSlotDate(id, idx, v);
 }
 async function updatePrfSlotDate(id, idx, value){
   if(!canQuickAdd()) return;
