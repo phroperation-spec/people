@@ -2754,7 +2754,7 @@ function trendLineChart(data){
 function headcountTrendChartByStatus(data){
   const pts = data.filter(d=> d.reported!==false && d.headcount!==null);
   if(!pts.length) return '<div class="empty">No reported months yet for this year — upload a Master List to start the trend.</div>';
-  const w=620, h=190, padL=34, padR=16, padT=22, padB=26;
+  const w=620, h=230, padL=34, padR=30, padT=24, padB=40;
   const plotW=w-padL-padR, plotH=h-padT-padB;
   const series = [
     {key:'headcount', color:'var(--gold)', label:'Total'},
@@ -2770,13 +2770,34 @@ function headcountTrendChartByStatus(data){
   const yFor = v => padT + plotH - ((v-minV)/range)*plotH;
   const lines = series.map(s=>{
     const linePts = idx.map(o=>`${xFor(o.i)},${yFor(o.d[s.key]||0)}`).join(' ');
-    const dots = idx.map(o=>`<circle cx="${xFor(o.i)}" cy="${yFor(o.d[s.key]||0)}" r="3" style="fill:${s.color};"/>`).join('');
+    const dots = idx.map(o=>`<circle cx="${xFor(o.i)}" cy="${yFor(o.d[s.key]||0)}" r="3" style="fill:${s.color};"><title>${o.d.label} · ${s.label}: ${(o.d[s.key]||0).toLocaleString()}</title></circle>`).join('');
     return `<polyline points="${linePts}" style="fill:none;stroke:${s.color};stroke-width:2.2;stroke-linejoin:round;stroke-linecap:round;"/>${dots}`;
+  }).join('');
+  // Value labels — placed per month so they never overlap: the top line's number goes above its
+  // dot, the bottom line's below, the middle one wherever there's room; then any labels still
+  // too close are pushed apart and kept inside the chart area.
+  const LBL_GAP = 13, topBound = 11, botBound = padT + plotH + 14;
+  const values = idx.map(o=>{
+    const items = series.map(s=>{ const v=o.d[s.key]||0; return {s, v, y:yFor(v)}; }).sort((a,b)=> a.y-b.y);
+    items.forEach((it,k)=>{
+      const above = it.y - 8, below = it.y + 16;
+      if(k===0) it.ly = above;
+      else if(k===items.length-1) it.ly = below;
+      else {
+        const gapUp = it.y - items[k-1].y, gapDown = items[k+1].y - it.y;
+        it.ly = gapUp >= gapDown ? above : below;
+      }
+    });
+    items.sort((a,b)=> a.ly-b.ly);
+    for(let k=1;k<items.length;k++) if(items[k].ly < items[k-1].ly + LBL_GAP) items[k].ly = items[k-1].ly + LBL_GAP;
+    if(items[items.length-1].ly > botBound){ items[items.length-1].ly = botBound; for(let k=items.length-2;k>=0;k--) if(items[k].ly > items[k+1].ly - LBL_GAP) items[k].ly = items[k+1].ly - LBL_GAP; }
+    if(items[0].ly < topBound){ items[0].ly = topBound; for(let k=1;k<items.length;k++) if(items[k].ly < items[k-1].ly + LBL_GAP) items[k].ly = items[k-1].ly + LBL_GAP; }
+    return items.map(it=> `<text x="${xFor(o.i)}" y="${it.ly}" text-anchor="middle" style="font-size:10.5px;font-weight:600;fill:${it.s.color};font-family:var(--mono);paint-order:stroke;stroke:var(--surface);stroke-width:3px;stroke-linejoin:round;">${it.v.toLocaleString()}</text>`).join('');
   }).join('');
   const labels = data.map((d,i)=>`<text x="${xFor(i)}" y="${h-8}" text-anchor="middle" style="font-size:10px;fill:var(--${d.reported===false?'dim2':'dim'});font-family:var(--mono);">${d.label}</text>`).join('');
   return `<svg viewBox="0 0 ${w} ${h}" style="width:100%;height:${h}px;display:block;">
     <line x1="${padL}" y1="${padT+plotH}" x2="${w-padR}" y2="${padT+plotH}" style="stroke:var(--border);stroke-width:1;"/>
-    ${lines}${labels}
+    ${lines}${values}${labels}
   </svg>
   <div style="display:flex;gap:18px;margin-top:10px;flex-wrap:wrap;">
     ${series.map(s=>`<div style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--dim);"><span style="width:9px;height:9px;border-radius:50%;background:${s.color};display:inline-block;"></span>${s.label}</div>`).join('')}
