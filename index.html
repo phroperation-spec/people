@@ -3886,7 +3886,7 @@ function companySubview(sub, st, period){
   if(sub==='tenure'){
     const keyFn = e=> tenureGroupOf(tenureYears(e, period.end));
     const order = CONFIG.tenureGroups.map(g=>g.label);
-    return subGroupBy(st, keyFn, 'Tenure Group', order, period, '', true) + deptCrossTab(st, keyFn, 'Tenure Group', order, period);
+    return subGroupBy(st, keyFn, 'Tenure Group', order, period, '', true) + deptCrossTab(st, keyFn, 'Tenure Group', order, period) + tenureExceededSection(st, period);
   }
   if(sub==='gender'){
     const keyFn = e=> e.gender || 'Unspecified';
@@ -3902,6 +3902,48 @@ function companySubview(sub, st, period){
   return '';
 }
 
+// Company Detail → Tenure: active Staff at this company whose tenure has reached or passed their
+// CURRENT Job Grade Group's Max Tenure Stay (Control Panel → Job Grade Groups, Staff only).
+// Unlike execTenureGradeGaps this lists everyone over the limit, including those already at the
+// top grade, and says which ones still have a grade to move up into.
+function tenureExceededSection(st, period){
+  const rows = [];
+  st.active.filter(e=> STATUS_KEY(e.employmentStatus)==='staff').forEach(e=>{
+    const group = jobGradeGroupOf(e.company, e.employmentStatus, e.jobGrade);
+    if(group==='Unclassified') return;
+    const maxTenure = jobGradeGroupMaxTenure(e.company, e.employmentStatus, group);
+    if(!maxTenure) return;
+    const t = tenureYears(e, period.end);
+    if(t===null || t<maxTenure) return;
+    const ceiling = topJobGradeNumericCeiling(e.company, e.employmentStatus);
+    const curNum = jobGradeNumeric(e.jobGrade);
+    const atTop = ceiling!==null && curNum!==null && curNum>=ceiling;
+    const promos = Array.isArray(e.promotionHistory) ? e.promotionHistory.filter(h=> h.type==='promotion').map(h=>h.ms).sort() : [];
+    rows.push({emp:e, tenure:t, group, maxTenure, over:t-maxTenure, atTop, lastPromo: promos.length ? promos[promos.length-1] : null});
+  });
+  rows.sort((a,b)=> b.over-a.over);
+  return `
+  <h2 class="section" style="margin-top:28px;">Exceeded Max Tenure Stay <span class="n">${ui.company} · Staff · as of ${period.label} · ${rows.length} employee(s)</span></h2>
+  <p class="hint" style="margin-top:-4px;">Staff whose tenure has reached or passed the Max Tenure Stay set for their current Job Grade Group in <b>Control Panel → Job Grade Groups</b>.</p>
+  ${rows.length ? `<div class="archive-table-wrap"><table class="simple">
+    <thead><tr><th>ID</th><th>Name</th><th>Position</th><th>Department</th><th>Date Hired</th><th>Tenure</th><th>Job Grade</th><th>Grade Group</th><th>Max Tenure Stay</th><th>Over By</th><th>Last Promotion</th><th>Next Step</th></tr></thead>
+    <tbody>${rows.map(r=>`<tr>
+      <td>${escapeHtml(String(r.emp.employeeId||''))}</td>
+      <td>${escapeHtml(r.emp.lastName||'')}, ${escapeHtml(r.emp.firstName||'')}</td>
+      <td>${escapeHtml(r.emp.position||'—')}</td>
+      <td>${deptOfEmployee(r.emp, true)}</td>
+      <td>${fmtDateMDY(r.emp.dateHired)}</td>
+      <td>${r.tenure.toFixed(1)} yrs</td>
+      <td>${escapeHtml(String(r.emp.jobGrade||'—'))}</td>
+      <td>${escapeHtml(r.group)}</td>
+      <td>${r.maxTenure} yr(s)</td>
+      <td style="color:var(--red);font-weight:600;">+${r.over.toFixed(1)} yrs</td>
+      <td>${r.lastPromo ? monthLabel(r.lastPromo) : '<span style="color:var(--dim2);">None on record</span>'}</td>
+      <td>${r.atTop ? '<span style="color:var(--dim2);">At top grade</span>' : '<span style="color:var(--blue);">Review for promotion</span>'}</td>
+    </tr>`).join('')}</tbody>
+  </table></div>` : `<div class="empty">No Staff at ${ui.company} have exceeded their Job Grade Group's Max Tenure Stay. Set a Max Tenure Stay per Staff Job Grade Group in Control Panel → Job Grade Groups to start flagging.</div>`}
+  `;
+}
 function subHeadcount(st, period){
   // nhYear anchors both month-by-month tables below to a calendar year (independent of the
   // Monthly/Annual period selector, which only drives the Overall block above).
@@ -4752,8 +4794,8 @@ function promotionsTableByStatus(rows, cols, emptyNoun){
     <p class="hint" style="margin:12px 0 4px;"><b>${label}</b> — ${list.length} ${emptyNoun}</p>
     ${list.length ? `
     <table class="demo compact">
-      <thead><tr><th class="rowlabel">Employee</th><th>Position</th><th>${cols.startLabel}</th><th>${cols.curLabel}</th>${admin?'<th></th>':''}</tr></thead>
-      <tbody>${list.map(r=>`<tr><td class="rowlabel">${r.emp.lastName||''}, ${r.emp.firstName||''} <span style="color:var(--dim2);font-size:11px;">(${r.emp.employeeId})</span>${r.statusPromoted?` <span class="pill staff" style="font-size:10px;" title="Tagged as a promotion because they moved from Rank & File to Staff, regardless of Job Grade numbers.">Rank &amp; File → Staff</span>`:''}</td><td>${r.emp.position||'—'}</td><td>${r.startGrade} <span style="color:var(--dim2);font-size:11px;">(${r.startGroup})</span></td><td style="color:var(--green);">${r.curGrade} <span style="font-size:11px;">(${r.curGroup})</span></td>${admin?`<td><button class="btn small danger" onclick="openDismissPromotionModal('${r.emp.employeeId}','${r.fromMs}','${r.toMs}')">Delete</button></td>`:''}</tr>`).join('')}</tbody>
+      <thead><tr><th class="rowlabel">Employee</th><th>Position</th><th>Date Hired</th><th>${cols.startLabel}</th><th>${cols.curLabel}</th><th>Date Promoted</th>${admin?'<th></th>':''}</tr></thead>
+      <tbody>${list.map(r=>`<tr><td class="rowlabel">${r.emp.lastName||''}, ${r.emp.firstName||''} <span style="color:var(--dim2);font-size:11px;">(${r.emp.employeeId})</span>${r.statusPromoted?` <span class="pill staff" style="font-size:10px;" title="Tagged as a promotion because they moved from Rank & File to Staff, regardless of Job Grade numbers.">Rank &amp; File → Staff</span>`:''}</td><td>${r.emp.position||'—'}</td><td>${fmtDateMDY(r.emp.dateHired)||'—'}</td><td>${r.startGrade} <span style="color:var(--dim2);font-size:11px;">(${r.startGroup})</span></td><td style="color:var(--green);">${r.curGrade} <span style="font-size:11px;">(${r.curGroup})</span></td><td style="white-space:nowrap;">${r.promotedMs ? monthLabel(r.promotedMs) : '—'}</td>${admin?`<td><button class="btn small danger" onclick="openDismissPromotionModal('${r.emp.employeeId}','${r.fromMs}','${r.toMs}')">Delete</button></td>`:''}</tr>`).join('')}</tbody>
     </table>` : `<div class="empty">No ${label} ${emptyNoun} in this view.</div>`}
   `;
   return renderGroup('Staff', staffRows) + renderGroup('Rank & File', rfRows);
@@ -4789,6 +4831,49 @@ function companyMonthOverMonthPromotions(company){
   });
   return { rows: rows.sort((a,b)=> (b.curNum-b.startNum)-(a.curNum-a.startNum)), curLabel: monthLabel(curMs), prevLabel: monthLabel(prevMs) };
 }
+// Annual-view summary for Company Detail → Promotions: every promotion detected for the year,
+// grouped by the month it took effect (promotedMs — see promotionEffectiveMonth). "Date Promoted"
+// is month-level because promotions are detected from monthly Master List snapshots, not a
+// day-specific field.
+function promotionsMonthlySummary(rows, year){
+  const months = [];
+  for(let m=1;m<=12;m++){
+    const ms = `${year}-${String(m).padStart(2,'0')}`;
+    const list = rows.filter(r=> r.promotedMs===ms);
+    months.push({ms, list,
+      staff: list.filter(r=> STATUS_KEY(r.emp.employmentStatus)==='staff').length,
+      rf: list.filter(r=> STATUS_KEY(r.emp.employmentStatus)==='rankfile').length});
+  }
+  const other = rows.filter(r=> !r.promotedMs || !months.some(x=> x.ms===r.promotedMs));
+  const max = Math.max(1, ...months.map(x=> x.list.length));
+  const nameLine = r=> `<div style="padding:3px 0;border-bottom:1px dashed var(--border);">
+      <b>${escapeHtml(r.emp.lastName||'')}, ${escapeHtml(r.emp.firstName||'')}</b> <span style="color:var(--dim2);font-size:11px;">(${escapeHtml(String(r.emp.employeeId))})</span>
+      <span class="pill ${STATUS_KEY(r.emp.employmentStatus)}" style="font-size:10px;">${statusLabel(r.emp.employmentStatus)}</span>
+      <span style="color:var(--dim);font-size:12px;"> · ${escapeHtml(r.startPosition||r.emp.position||'—')} → ${escapeHtml(r.curPosition||r.emp.position||'—')} · Grade ${escapeHtml(String(r.startGrade||'—'))} → <span style="color:var(--green);">${escapeHtml(String(r.curGrade||'—'))}</span></span>
+      <span style="font-size:11px;color:var(--dim2);"> · Promoted ${monthLabel(r.promotedMs)}</span>
+    </div>`;
+  return `
+  <h2 class="section" style="margin-top:28px;">Promotions per Month <span class="n">${year} · Jan–Dec · ${rows.length} total</span></h2>
+  <div class="bar-mini">
+    ${months.map(x=>`<div class="b" style="height:60px;"><div class="fill" style="height:${x.list.length/max*100}%;"></div></div>`).join('')}
+  </div>
+  <div class="bar-mini" style="height:auto;">${months.map(x=>`<div class="lbl">${MONTH_NAMES[Number(x.ms.slice(5))-1].slice(0,3)}<br>${x.list.length}</div>`).join('')}</div>
+  <table class="demo compact" style="margin-top:14px;">
+    <thead><tr><th class="rowlabel">Month</th><th>Staff</th><th>Rank &amp; File</th><th>Total</th><th class="rowlabel">Who Was Promoted (date promoted)</th></tr></thead>
+    <tbody>
+      ${months.map(x=>`<tr>
+        <td class="rowlabel" style="white-space:nowrap;vertical-align:top;">${monthLabel(x.ms)}</td>
+        <td style="vertical-align:top;">${x.staff||'—'}</td>
+        <td style="vertical-align:top;">${x.rf||'—'}</td>
+        <td style="vertical-align:top;font-weight:600;">${x.list.length||'—'}</td>
+        <td class="rowlabel" style="font-weight:400;text-align:left;">${x.list.length ? x.list.map(nameLine).join('') : '<span style="color:var(--dim2);">No promotions</span>'}</td>
+      </tr>`).join('')}
+      <tr class="total"><td class="rowlabel">Total</td><td>${months.reduce((a,x)=>a+x.staff,0)}</td><td>${months.reduce((a,x)=>a+x.rf,0)}</td><td>${rows.length-other.length}</td><td></td></tr>
+    </tbody>
+  </table>
+  ${other.length ? `<p class="hint">${other.length} promotion(s) couldn't be pinned to a specific month in ${year}.</p>` : ''}
+  <p class="hint">Date Promoted is the month the higher Job Grade (or the Rank &amp; File → Staff move) first appeared on an uploaded Master List.</p>`;
+}
 function subPromotions(st, period){
   const year = Number(ui.month.split('-')[0]) || new Date().getFullYear();
   const rows = companyAnnualPromotions(ui.company, year, period.end);
@@ -4798,9 +4883,7 @@ function subPromotions(st, period){
   const staffPct = staffTotal ? (staffRows.length/staffTotal*100) : 0;
   const rfPct = rfTotal ? (rfRows.length/rfTotal*100) : 0;
   const pct = total ? (rows.length/total*100) : 0;
-  const monthly = companyMonthOverMonthPromotions(ui.company);
-  const monthlyStaffRows = monthly.rows.filter(r=> STATUS_KEY(r.emp.employmentStatus)==='staff');
-  const monthlyRfRows = monthly.rows.filter(r=> STATUS_KEY(r.emp.employmentStatus)==='rankfile');
+  const isAnnual = ui.companyPeriod==='annual';
   return `
   <h2 class="section">Promotions <span class="n">${year} · ${ui.company}</span></h2>
   <div class="grid cards3" style="grid-template-columns:repeat(3,1fr);">
@@ -4810,13 +4893,7 @@ function subPromotions(st, period){
   </div>
   ${rows.length ? promotionsTableByStatus(rows, {startLabel:`Grade at Start of ${year}`, curLabel:'Current Grade'}, 'promotion(s)') : `<div class="empty">No promotions detected for ${ui.company} in ${year} yet — either no one's Job Grade has increased, or there aren't enough dated Master List snapshots on file yet to compare (this tracks movement going forward from when Job Grade history started being recorded).</div>`}
 
-  <h2 class="section" style="margin-top:28px;">Monthly <span class="n">${monthly.curLabel}</span></h2>
-  <div class="grid cards3" style="grid-template-columns:repeat(3,1fr);margin-bottom:12px;">
-    <div class="card"><div class="label">Staff Promoted</div><div class="value" style="color:var(--blue);font-size:20px;">${isMonthUploaded(ui.company,'Staff',ui.month) ? monthlyStaffRows.length : noDataCell('Staff')}</div><div class="foot">${monthly.curLabel}</div></div>
-    <div class="card"><div class="label">Rank &amp; File Promoted</div><div class="value" style="color:var(--teal);font-size:20px;">${isMonthUploaded(ui.company,'Rank & File',ui.month) ? monthlyRfRows.length : noDataCell('Rank & File')}</div><div class="foot">${monthly.curLabel}</div></div>
-    <div class="card"><div class="label">Overall Promoted</div><div class="value green" style="font-size:20px;">${monthly.rows.length}</div><div class="foot">${monthly.curLabel}</div></div>
-  </div>
-  ${monthly.rows.length ? promotionsTableByStatus(monthly.rows, {startLabel:`Grade Before (${monthly.prevLabel})`, curLabel:`Grade Now (${monthly.curLabel})`}, 'promotion(s)') : `<div class="empty">No Job Grade increases detected for ${ui.company} in ${monthly.curLabel}.</div>`}
+  ${isAnnual ? promotionsMonthlySummary(rows, year) : `<p class="hint" style="margin-top:14px;">Switch to <b>Annual</b> above to see a month-by-month summary of who was promoted in ${year}.</p>`}
   `;
 }
 
@@ -5370,9 +5447,10 @@ function renderTransfers(){
   <div class="field-row" style="margin-bottom:14px;">
     <button class="btn ${(ui.movementsView||'transfers')==='transfers' ? 'primary' : ''}" onclick="ui.movementsView='transfers'; render();">Cross-Affiliate Transfers</button>
     <button class="btn ${ui.movementsView==='promotions' ? 'primary' : ''}" onclick="ui.movementsView='promotions'; render();">Rank &amp; File → Staff Promotions</button>
+    <button class="btn ${ui.movementsView==='allpromos' ? 'primary' : ''}" onclick="ui.movementsView='allpromos'; render();">All Promoted</button>
     <button class="btn" style="margin-left:auto;" onclick="exportAllMovementsExcel()" title="One Excel file covering every year on file, not just the year selected above.">⬇ Export to Excel (all years)</button>
   </div>`;
-  return switcher + (ui.movementsView==='promotions' ? renderStaffPromotionsCategory() : renderTransfersCategory());
+  return switcher + (ui.movementsView==='promotions' ? renderStaffPromotionsCategory() : ui.movementsView==='allpromos' ? renderAllPromotedCategory() : renderTransfersCategory());
 }
 // Exports the complete Movements picture — every Rank & File -> Staff Promotion and every
 // Cross-Affiliate Transfer on file, across ALL years (not just whatever year happens to be
@@ -5464,6 +5542,156 @@ function renderStaffPromotionsCategory(){
   <h2 class="section">Rank &amp; File → Staff Promotions <span class="n">${year} · ${rows.length} found</span></h2>
   ${body}
   <p class="hint">Change the Year at the top of the page to view a different year.</p>
+  `;
+}
+// ===== Movements → All Promoted =====
+// One HR-friendly list of EVERY detected promotion, every company: Job Grade increases (same
+// detection as Company Detail → Promotions, companyAnnualPromotions) plus Rank & File → Staff
+// moves (detectStaffPromotions — including cross-affiliate and regularized-under-new-ID cases).
+// Rows are de-duplicated per employee + company + month promoted.
+function collectAllPromotions(year){
+  const map = new Map();
+  const add = (r)=>{ const k = [r.emp.employeeId, r.emp.company, r.promotedMs||''].join('|'); if(!map.has(k)) map.set(k, r); else { const x = map.get(k); if(r.statusPromoted) x.statusPromoted = true; if(!x.fromCompany && r.fromCompany) x.fromCompany = r.fromCompany; } };
+  const pick = ph=> Array.isArray(ph) ? ph : [];
+  const years = year==='all' ? workforceMovementYearOptions() : [year];
+  years.forEach(y=>{
+    const asOfEnd = new Date(y,11,31,23,59,59);
+    allCompanies().map(c=>c.company).forEach(co=>{
+      companyAnnualPromotions(co, y, asOfEnd).forEach(r=>{
+        if(!r.promotedMs || r.promotedMs.slice(0,4)!==String(y)) return;
+        add({emp:r.emp, fromCompany:r.emp.company, toCompany:r.emp.company, startPosition:r.startPosition, curPosition:r.curPosition,
+          startGrade:r.startGrade, curGrade:r.curGrade, startGroup:r.startGroup, curGroup:r.curGroup,
+          statusPromoted:r.statusPromoted, promotedMs:r.promotedMs, tag:null, fromMs:r.fromMs, toMs:r.toMs,
+          fromStatus: r.statusPromoted ? 'Rank & File' : r.emp.employmentStatus});
+      });
+    });
+    detectStaffPromotions(y, asOfEnd).forEach(r=>{
+      if(r.tag==='unclosed' && r.promotedMs && r.promotedMs.slice(0,4)!==String(y)) return; // shown once, in its own year
+      const ph = pick(r.emp.promotionHistory).find(h=> h.statusChange && h.ms===r.promotedMs) || pick(r.emp.promotionHistory).find(h=> h.statusChange);
+      add({emp:r.emp, fromCompany:r.fromCompany, toCompany:r.toCompany, startPosition:r.startPosition, curPosition:r.curPosition,
+        startGrade:(ph&&ph.fromJobGrade)||'', curGrade:(ph&&ph.toJobGrade)||r.emp.jobGrade||'', startGroup:'', curGroup:'',
+        statusPromoted:true, promotedMs:r.promotedMs, tag:r.tag, fromMs:r.fromMs, toMs:r.toMs, fromStatus:'Rank & File'});
+    });
+  });
+  return Array.from(map.values()).sort((a,b)=> (b.promotedMs||'').localeCompare(a.promotedMs||'') || String(a.emp.lastName||'').localeCompare(String(b.emp.lastName||'')));
+}
+function allPromoTypeLabel(r){
+  if(r.statusPromoted){
+    if(r.fromCompany && r.toCompany && r.fromCompany!==r.toCompany) return 'Rank & File → Staff (Cross-Affiliate)';
+    if(r.tag==='regularized' || r.tag==='matched') return 'Rank & File → Staff (Regularized)';
+    if(r.tag==='unclosed') return 'Rank & File → Staff (old R&F record still active)';
+    return 'Rank & File → Staff';
+  }
+  return 'Job Grade Increase';
+}
+function allPromoYearsInService(r){
+  const h = parseDate(r.emp.dateHired); if(!h || !r.promotedMs) return null;
+  const [y,m] = r.promotedMs.split('-').map(Number);
+  const yrs = (new Date(y,m-1,1) - h)/(365.25*24*3600*1000);
+  return yrs<0 ? 0 : yrs;
+}
+function allPromoFiltered(){
+  const year = ui.allPromoYear || (Number(ui.month.split('-')[0]) || new Date().getFullYear());
+  const q = (ui.allPromoSearch||'').trim().toLowerCase();
+  return collectAllPromotions(year==='all' ? 'all' : Number(year)).filter(r=>{
+    if(ui.allPromoCompany && r.toCompany!==ui.allPromoCompany && r.fromCompany!==ui.allPromoCompany) return false;
+    if(ui.allPromoType==='grade' && r.statusPromoted) return false;
+    if(ui.allPromoType==='status' && !r.statusPromoted) return false;
+    if(ui.allPromoStatus && STATUS_KEY(r.emp.employmentStatus)!==ui.allPromoStatus) return false;
+    if(!q) return true;
+    return `${r.emp.lastName||''} ${r.emp.firstName||''} ${r.emp.middleName||''} ${r.emp.employeeId||''} ${r.curPosition||''} ${r.startPosition||''}`.toLowerCase().includes(q);
+  });
+}
+function allPromotedTableHTML(list){
+  if(!list.length) return '<div class="empty">No promotions found for this year/filter.</div>';
+  return `<div class="archive-table-wrap"><table class="simple">
+    <thead><tr><th>ID</th><th>Name</th><th>Company</th><th>Department</th><th>Status Now</th><th>Date Hired</th><th>Date Promoted</th><th>Yrs in Service at Promotion</th><th>From Position</th><th>To Position</th><th>From Grade</th><th>To Grade</th><th>Type</th></tr></thead>
+    <tbody>${list.map(r=>{ const yis = allPromoYearsInService(r); return `<tr>
+      <td>${escapeHtml(String(r.emp.employeeId||''))}</td>
+      <td style="white-space:nowrap;"><b>${escapeHtml(r.emp.lastName||'')}</b>, ${escapeHtml(r.emp.firstName||'')}${r.emp.middleName?' '+escapeHtml(r.emp.middleName[0])+'.':''}</td>
+      <td>${r.fromCompany && r.fromCompany!==r.toCompany ? `${escapeHtml(r.fromCompany)} <span style="color:var(--dim2);">→</span> ${escapeHtml(r.toCompany)}` : escapeHtml(r.toCompany||r.emp.company||'')}</td>
+      <td>${deptOfEmployee(r.emp, true)}</td>
+      <td><span class="pill ${STATUS_KEY(r.emp.employmentStatus)}">${statusLabel(r.emp.employmentStatus)}</span></td>
+      <td style="white-space:nowrap;">${fmtDateMDY(r.emp.dateHired)||'—'}</td>
+      <td style="white-space:nowrap;color:var(--green);font-weight:600;">${r.promotedMs ? monthLabel(r.promotedMs) : '—'}</td>
+      <td>${yis===null ? '—' : yis.toFixed(1)+' yrs'}</td>
+      <td>${escapeHtml(r.startPosition||'—')}</td>
+      <td>${escapeHtml(r.curPosition||'—')}</td>
+      <td>${escapeHtml(String(r.startGrade||'—'))}</td>
+      <td>${escapeHtml(String(r.curGrade||'—'))}</td>
+      <td style="font-size:12px;">${escapeHtml(allPromoTypeLabel(r))}</td>
+    </tr>`;}).join('')}</tbody>
+  </table></div>`;
+}
+function renderAllPromotedTable(){
+  const list = allPromoFiltered();
+  const wrap = document.getElementById('allPromoTableWrap'); if(wrap) wrap.innerHTML = allPromotedTableHTML(list);
+  const cnt = document.getElementById('allPromoCount'); if(cnt) cnt.textContent = `${list.length} promotion(s)`;
+}
+function exportAllPromotedExcel(){
+  if(typeof XLSX === 'undefined'){ toast('Excel export isn\'t available right now — try refreshing the page.'); return; }
+  const list = allPromoFiltered();
+  if(!list.length){ toast('No promotions to export for this filter.'); return; }
+  const aoa = [['Employee ID','Last Name','First Name','Middle Name','From Company','To Company','Department','Status Now','Date Hired','Date Promoted','Yrs in Service at Promotion','From Position','To Position','From Grade','To Grade','Type']]
+    .concat(list.map(r=>{ const yis = allPromoYearsInService(r); return [
+      r.emp.employeeId||'', r.emp.lastName||'', r.emp.firstName||'', r.emp.middleName||'',
+      r.fromCompany||r.emp.company||'', r.toCompany||r.emp.company||'', deptOfEmployee(r.emp, true), statusLabel(r.emp.employmentStatus),
+      fmtDateMDY(r.emp.dateHired)||'', r.promotedMs ? monthLabel(r.promotedMs) : '', yis===null?'':Number(yis.toFixed(1)),
+      r.startPosition||'', r.curPosition||'', r.startGrade||'', r.curGrade||'', allPromoTypeLabel(r)
+    ]; }));
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(aoa), 'All Promoted');
+  XLSX.writeFile(wb, `all_promoted_${ui.allPromoYear||ui.month.split('-')[0]}_${new Date().toISOString().slice(0,10)}.xlsx`);
+}
+function renderAllPromotedCategory(){
+  const curYear = Number(ui.month.split('-')[0]) || new Date().getFullYear();
+  if(!ui.allPromoYear) ui.allPromoYear = curYear;
+  const years = Array.from(new Set([curYear, ...workforceMovementYearOptions()])).sort((a,b)=> b-a);
+  const companies = allCompanies().map(c=>c.company);
+  const list = allPromoFiltered();
+  const staffN = list.filter(r=> STATUS_KEY(r.emp.employmentStatus)==='staff').length;
+  const gradeN = list.filter(r=> !r.statusPromoted).length;
+  const statusN = list.filter(r=> r.statusPromoted).length;
+  return `
+  <p class="hint" style="margin:0 0 10px;max-width:720px;">Every promoted employee across <b>all companies</b> in one list — Job Grade increases and Rank &amp; File → Staff moves — with Date Hired, Date Promoted and the before/after Position and Grade. Date Promoted is the month the promotion first showed up on an uploaded Master List.</p>
+  <div class="grid cards3" style="grid-template-columns:repeat(4,1fr);margin-bottom:12px;">
+    <div class="card"><div class="label">Total Promoted</div><div class="value green" style="font-size:22px;">${list.length}</div><div class="foot">${ui.allPromoYear==='all'?'All years':ui.allPromoYear}</div></div>
+    <div class="card"><div class="label">Job Grade Increase</div><div class="value" style="color:var(--blue);font-size:22px;">${gradeN}</div><div class="foot">within the same status</div></div>
+    <div class="card"><div class="label">Rank &amp; File → Staff</div><div class="value" style="color:var(--teal);font-size:22px;">${statusN}</div><div class="foot">status promotions</div></div>
+    <div class="card"><div class="label">Now Staff</div><div class="value" style="font-size:22px;">${staffN}</div><div class="foot">${list.length-staffN} now Rank &amp; File</div></div>
+  </div>
+  <div class="field-row" style="align-items:flex-end;">
+    <input type="text" placeholder="Search name, ID or position…" value="${escapeHtml(ui.allPromoSearch||'')}" oninput="ui.allPromoSearch=this.value; renderAllPromotedTable();" style="width:240px;">
+    <div class="field"><label>YEAR</label>
+      <select onchange="ui.allPromoYear=this.value==='all'?'all':Number(this.value); render();">
+        <option value="all" ${ui.allPromoYear==='all'?'selected':''}>All years</option>
+        ${years.map(y=>`<option value="${y}" ${String(ui.allPromoYear)===String(y)?'selected':''}>${y}</option>`).join('')}
+      </select>
+    </div>
+    <div class="field"><label>COMPANY</label>
+      <select onchange="ui.allPromoCompany=this.value; render();">
+        <option value="">All companies</option>
+        ${companies.map(c=>`<option value="${c}" ${ui.allPromoCompany===c?'selected':''}>${c}</option>`).join('')}
+      </select>
+    </div>
+    <div class="field"><label>TYPE</label>
+      <select onchange="ui.allPromoType=this.value; render();">
+        <option value="">All types</option>
+        <option value="grade" ${ui.allPromoType==='grade'?'selected':''}>Job Grade Increase</option>
+        <option value="status" ${ui.allPromoType==='status'?'selected':''}>Rank &amp; File → Staff</option>
+      </select>
+    </div>
+    <div class="field"><label>STATUS NOW</label>
+      <select onchange="ui.allPromoStatus=this.value; render();">
+        <option value="">Any</option>
+        <option value="staff" ${ui.allPromoStatus==='staff'?'selected':''}>Staff</option>
+        <option value="rankfile" ${ui.allPromoStatus==='rankfile'?'selected':''}>Rank &amp; File</option>
+      </select>
+    </div>
+    <button class="btn" style="margin-left:auto;" onclick="exportAllPromotedExcel()">⬇ Export this list</button>
+  </div>
+  <h2 class="section">All Promoted <span class="n" id="allPromoCount">${list.length} promotion(s)</span></h2>
+  <div id="allPromoTableWrap">${allPromotedTableHTML(list)}</div>
   `;
 }
 function renderTransfersCategory(){
@@ -8902,27 +9130,6 @@ function renderSettings(){
   <div class="panel">
     <div class="panel-head"><h3>Job Positions <span style="font-weight:400;color:var(--dim);font-size:12px;">categorize each Job Position by Job Grade Group — uses the company &amp; employment status selected above</span></h3></div>
     ${ui.jobGradeCompany && ui.jobGradeStatus ? positionJobGradeEditor(ui.jobGradeCompany, ui.jobGradeStatus) : '<div class="empty">Add a company and an employment status category first.</div>'}
-  </div>
-
-  <div class="panel">
-    <div class="panel-head"><h3>Promotion Benchmark <span style="font-weight:400;color:var(--dim);font-size:12px;">used by the Executive Report's Tenure vs. Job Grade correlation — Staff only</span></h3></div>
-    ${(()=>{
-      const gaps = controlPanelTenureGradeGaps();
-      const companies = allCompanies().map(c=>c.company).filter(c=> gaps.some(r=> r.emp.company===c));
-      return `
-      ${companies.length ? companies.map(company=>{
-        const rows = gaps.filter(r=> r.emp.company===company);
-        return `
-        <p class="hint" style="margin:12px 0 4px;"><b>${company}</b> — ${rows.length} flagged</p>
-        <table class="demo compact">
-          <thead><tr><th class="rowlabel">Employee</th><th>Position</th><th>Tenure</th><th>Current Grade Group</th><th>Max Tenure Stay</th><th>Top Grade Group</th></tr></thead>
-          <tbody>${rows.slice(0,15).map(r=>`<tr><td class="rowlabel">${r.emp.lastName||''}, ${r.emp.firstName||''} <span style="color:var(--dim2);font-size:11px;">(${r.emp.employeeId})</span></td><td>${r.emp.position||'—'}</td><td>${r.tenure.toFixed(1)} yrs</td><td>${r.group}</td><td>${r.maxTenure} yr(s)</td><td>${r.top}</td></tr>`).join('')}</tbody>
-        </table>
-        ${rows.length>15 ? `<p class="hint">Showing the 15 longest-tenured for ${company}; ${rows.length-15} more flagged. See the Executive Report for the full list per scope/period.</p>` : ''}
-        `;
-      }).join('') : `<div class="empty">No Staff currently exceed their Job Grade Group's Max Tenure Stay while still having room to move up at least one Job Grade. Set a Max Tenure Stay on a Staff Job Grade Group above to start flagging.</div>`}
-      `;
-    })()}
   </div>
 
   <div class="panel" id="deptPanel">
