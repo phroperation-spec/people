@@ -6847,6 +6847,350 @@ function execExecutiveSummary(st, prevSt, period){
   return `<ul style="margin:0;padding-left:20px;line-height:1.9;font-size:13.5px;">${bullets.map(b=>`<li>${b}</li>`).join('')}</ul>`;
 }
 
+/* ============ BOARD-LEVEL WORKFORCE NARRATIVE ============
+   A CHRO-style narrative written live from the same data as the rest of the Executive Report.
+   Every sentence is built from figures computed below (no hard-coded numbers), and the judgement
+   words ("balanced", "concentrated", "elevated"…) come from the explicit thresholds in BN_T, so the
+   story changes as soon as the data does. Sections follow the board format: Executive Summary,
+   Key Findings (Trends · Implications · Risks · Opportunities · Actions per category), Business
+   Risks, Opportunities, Recommended Actions (with priority) and the Executive Takeaway. */
+const BN_T = {
+  genderBalanced:[40,60],   // % female considered balanced
+  concentration:50,         // one affiliate/industry/department holding more than this % of headcount
+  newHireHeavy:30,          // % of workforce with < 1 year tenure
+  knowledgeHeavy:25,        // % with 10+ years tenure
+  retireNear:15,            // % aged 55+ (within ~5 years of the optional retirement age of 60)
+  leaderRetire:25,          // % of leaders aged 55+
+  youngPipeline:30,         // % under 35 considered a healthy pipeline
+  attrAnnualHigh:20,        // annualized overall attrition flagged as high
+  volAnnualHigh:15,         // annualized voluntary (resignation) turnover flagged as high
+  earlyExit:40,             // % of separations happening in the first year
+  riskIdx:1.3,              // group over-represented among leavers (risk index)
+  leaderGenderGap:10        // pts gap between female share overall and in leadership
+};
+const bnPct = (n,d)=> d ? n/d*100 : 0;
+const bnF = (x,dp)=> (x===null||x===undefined||isNaN(x)) ? '—' : Number(x).toFixed(dp==null?0:dp);
+const bnMed = a=>{ const s=a.filter(x=>x!==null&&!isNaN(x)).sort((x,y)=>x-y); if(!s.length) return null; const m=Math.floor(s.length/2); return s.length%2?s[m]:(s[m-1]+s[m])/2; };
+const bnE = s=> escapeHtml(String(s==null?'':s));
+const bnIsF = e=> /^f/i.test((e.gender||'').trim());
+const bnIsM = e=> /^m/i.test((e.gender||'').trim());
+function bnGeneration(e){ const b=parseDate(e.birthdate); if(!b) return null; const y=b.getFullYear();
+  return y>=2013?'Gen Alpha':y>=1997?'Gen Z':y>=1981?'Millennials':y>=1965?'Gen X':y>=1946?'Baby Boomers':'Silent Generation'; }
+const BN_GEN_ORDER=['Gen Z','Millennials','Gen X','Baby Boomers','Silent Generation','Gen Alpha'];
+// "Leadership" = Staff in the most senior configured Job Grade Group of their company, or whose
+// position title names a leadership role. Stated in the report so the Board knows how it's defined.
+const BN_LEAD_RE = /\b(manager|head|director|chief|supervisor|vice[- ]president|vp|president|officer|superintendent|team lead|lead)\b/i;
+function bnIsLeader(e){
+  if(STATUS_KEY(e.employmentStatus)!=='staff') return false;
+  const top = topJobGradeGroupLabel(e.company, e.employmentStatus);
+  return (top && jobGradeGroupOf(e.company, e.employmentStatus, e.jobGrade)===top) || BN_LEAD_RE.test(e.position||'');
+}
+const bnTop = m=>{ const k=Object.keys(m).sort((a,b)=> m[b]-m[a]); return k.length?{k:k[0], n:m[k[0]]}:null; };
+const bnList = (m, total, n)=> Object.keys(m).sort((a,b)=> m[b]-m[a]).slice(0,n||3).map(k=>`${bnE(k)} ${bnF(bnPct(m[k],total))}%`).join(', ');
+
+// Attrition over-representation by any grouping: share of leavers ÷ share of the starting base.
+function bnRiskBy(period, keyBase, keySep, minSep){
+  const {baseSet, separated} = execAttritionCohorts(period);
+  const b=groupCount(baseSet, keyBase), s=groupCount(separated, keySep||keyBase);
+  const tb=baseSet.length||1, ts=separated.length||1;
+  return Object.keys(Object.assign({}, b, s)).filter(k=> k!=='Unassigned' && k!=='Unclassified' && k!=='Unknown').map(k=>({
+    k, base:b[k]||0, sep:s[k]||0, rate: b[k]? (s[k]||0)/b[k]*100 : null, idx: b[k] ? ((s[k]||0)/ts)/(b[k]/tb) : null
+  })).filter(r=> r.sep>=(minSep||2) && r.idx!==null).sort((a,b)=> b.idx-a.idx);
+}
+
+function bnData(st, prevSt, period){
+  const A=st.active, N=A.length, end=period.end, base=period.opts.baselineDate, SK=e=>STATUS_KEY(e.employmentStatus);
+  const ann = ui.reportPeriod==='monthly' ? 12 : 1;
+  const D = {N, ann, period};
+  // ---- composition
+  D.prevN = prevSt ? prevSt.active.length : null;
+  D.growth = D.prevN ? (N-D.prevN)/D.prevN*100 : null;
+  D.hires = st.hired.length; D.seps = st.separated.length; D.net = D.hires-D.seps;
+  D.F = A.filter(bnIsF).length; D.M = A.filter(bnIsM).length; D.U = N-D.F-D.M;
+  D.fPct = bnPct(D.F, D.F+D.M);
+  D.gen = groupCount(A, e=> bnGeneration(e)||'Unknown');
+  D.genKnown = N-(D.gen.Unknown||0);
+  D.status = {staff:A.filter(e=>SK(e)==='staff').length, rankfile:A.filter(e=>SK(e)==='rankfile').length, intern:A.filter(e=>SK(e)==='intern').length};
+  D.byInd = groupCount(A, e=> industryOf(e.company)||'Unassigned');
+  D.byCo = groupCount(A, e=> e.company||'Unassigned');
+  D.byDept = groupCount(A, e=> deptOfEmployee(e,true));
+  D.topCo = bnTop(D.byCo); D.topInd = bnTop(D.byInd); D.topDept = bnTop(D.byDept);
+  // ---- tenure
+  const ten = A.map(e=> tenureYears(e,end)).filter(t=> t!==null && t>=0);
+  D.tenKnown = ten.length; D.medTen = bnMed(ten);
+  D.t1 = ten.filter(t=>t<1).length; D.t13 = ten.filter(t=>t>=1&&t<3).length; D.t10 = ten.filter(t=>t>=10).length;
+  D.t1Pct = bnPct(D.t1, ten.length); D.t10Pct = bnPct(D.t10, ten.length); D.t3Pct = bnPct(D.t1+D.t13, ten.length);
+  D.longAndOld = A.filter(e=>{ const t=tenureYears(e,end), a=ageYears(e,end); return t!==null && t>=10 && a!==null && a>=55; }).length;
+  // ---- age
+  const ages = A.map(e=> ageYears(e,end)).filter(a=> a!==null);
+  D.ageKnown = ages.length; D.medAge = bnMed(ages);
+  D.a60 = ages.filter(a=>a>=60).length; D.a5559 = ages.filter(a=>a>=55&&a<60).length; D.a55Pct = bnPct(D.a60+D.a5559, ages.length);
+  D.u35 = ages.filter(a=>a<35).length; D.u35Pct = bnPct(D.u35, ages.length); D.a50 = ages.filter(a=>a>=50).length;
+  D.pipelineRatio = D.a50 ? D.u35/D.a50 : null;
+  // ---- leadership
+  const L = A.filter(bnIsLeader); D.L = L.length;
+  D.LF = L.filter(bnIsF).length; D.LM = L.filter(bnIsM).length; D.LfPct = bnPct(D.LF, D.LF+D.LM);
+  D.L55 = L.filter(e=> (ageYears(e,end)||0)>=55).length; D.L55Pct = bnPct(D.L55, L.length);
+  D.Lunder40 = L.filter(e=>{ const a=ageYears(e,end); return a!==null && a<40; }).length;
+  D.LbyDept = groupCount(L, e=> deptOfEmployee(e,true));
+  // gender skew by department (≥5 heads)
+  D.deptSkew = Object.keys(D.byDept).filter(d=> D.byDept[d]>=5 && d!=='Unassigned').map(d=>{
+    const g=A.filter(e=> deptOfEmployee(e,true)===d), f=g.filter(bnIsF).length, m=g.filter(bnIsM).length;
+    return {d, n:g.length, fPct: bnPct(f, f+m)}; }).filter(x=> x.fPct>=80 || x.fPct<=20).sort((a,b)=> b.n-a.n);
+  // ---- attrition
+  const {baseSet, separated} = execAttritionCohorts(period);
+  D.base = baseSet.length; D.sepR = separated.length;
+  D.attr = st.attritionRate; D.attrAnn = st.attritionRate*ann; D.prevAttr = prevSt ? prevSt.attritionRate : null;
+  const rs = (re)=> separated.filter(e=> re.test(e.separationReason||'')).length;
+  D.vol = rs(/resign/i); D.eoc = rs(/end of contract|contract/i); D.invol = rs(/terminat|redundan|retrench|dismiss/i); D.ret = rs(/retire/i);
+  D.volRate = bnPct(D.vol, D.base); D.volAnn = D.volRate*ann; D.volShare = bnPct(D.vol, D.sepR);
+  D.early = separated.filter(e=>{ const t=tenureAtSeparation(e); return t!==null && t<1; }).length; D.earlyPct = bnPct(D.early, D.sepR);
+  D.riskTenure = tenureAttritionRows(period).filter(r=> r.band!=='Unclassified' && r.sepCount>=2 && r.idx!==null).sort((a,b)=> b.idx-a.idx);
+  D.riskAge = bnRiskBy(period, e=> ageGroupOf(ageYears(e, base)), e=>{ const s=parseDate(e.dateSeparated); return ageGroupOf(ageYears(e, s||end)); });
+  D.riskGender = bnRiskBy(period, e=> bnIsF(e)?'Female':bnIsM(e)?'Male':'Unknown');
+  D.riskStatus = bnRiskBy(period, e=> SK(e)==='staff'?'Staff':'Rank & File');
+  D.riskDept = bnRiskBy(period, e=> deptOfEmployee(e,true)).filter(r=> r.base>=5);
+  D.ccRisk = costCenterRiskRows(period).filter(r=> r.sep>0);
+  // ---- mobility
+  const msS = monthStr(period.start), msE = monthStr(period.end);
+  const scopeEmp = execScopeEmp();
+  const promoKeys = new Set(), promoF = [], promoRF = new Set();
+  scopeEmp.forEach(e=> (Array.isArray(e.promotionHistory)?e.promotionHistory:[]).forEach(h=>{
+    if(h && h.type==='promotion' && h.ms>=msS && h.ms<=msE){ const k=e.company+'|'+e.employeeId; if(!promoKeys.has(k)){ promoKeys.add(k); promoF.push(e); } if(h.statusChange) promoRF.add(k); } }));
+  if(ui.reportCompare){ const mv=execJobGradeMovement(period); mv.promoted.forEach(r=>{ const k=r.emp.company+'|'+r.emp.employeeId; if(!promoKeys.has(k)){ promoKeys.add(k); promoF.push(r.emp); } if(r.statusPromoted) promoRF.add(k); }); }
+  D.promos = promoKeys.size; D.promoRF = promoRF.size;
+  D.promoFem = promoF.filter(bnIsF).length; D.promoFemPct = bnPct(D.promoFem, promoF.filter(e=>bnIsF(e)||bnIsM(e)).length);
+  const coreN = D.status.staff + D.status.rankfile;
+  D.promoRate = bnPct(D.promos, coreN); D.promoRateAnn = D.promoRate*ann;
+  D.hireToPromo = D.promos ? D.hires/D.promos : null;
+  D.xfer = 0; scopeEmp.forEach(e=> (e.transferHistory||[]).forEach(t=>{ const d=parseDate(t.date); if(d && d>=period.start && d<=period.end) D.xfer++; }));
+  D.xAff = 0; try{ const yrs=new Set([period.start.getFullYear(), period.end.getFullYear()]);
+    yrs.forEach(y=> detectTransfers(y).forEach(t=>{ const h=parseDate(t.dateHired); if(h && h>=period.start && h<=period.end && (!ui.reportScope || t.fromCompany===ui.reportScope || t.toCompany===ui.reportScope)) D.xAff++; })); }catch(err){}
+  D.stalled = execTenureGradeGaps(st, period).length;
+  // ---- strategic
+  D.single = execCriticalPositionGaps(st);
+  const singleSet = new Set(D.single);
+  const incumbents = A.filter(e=> singleSet.has((e.position||'').trim()));
+  D.singleLeaders = incumbents.filter(bnIsLeader).map(e=> e.position);
+  D.singleAtRisk = incumbents.filter(e=>{ const a=ageYears(e,end), t=tenureYears(e,end); return (a!==null&&a>=55) || (t!==null&&t>=10); }).map(e=> e.position);
+  const posCore = groupCount(A.filter(e=> ['staff','rankfile'].includes(SK(e))), e=> (e.position||'').trim()||'Unassigned');
+  D.topPos = bnTop(posCore); D.topPosPct = D.topPos ? bnPct(D.topPos.n, coreN) : 0;
+  D.top3PosPct = bnPct(Object.values(posCore).sort((a,b)=>b-a).slice(0,3).reduce((s,x)=>s+x,0), coreN);
+  D.leaderConc = bnTop(D.LbyDept); D.leaderConcPct = D.leaderConc ? bnPct(D.leaderConc.n, D.L) : 0;
+  // ---- data quality
+  D.miss = {birth: N-D.ageKnown, gender: D.U, hire: N-D.tenKnown};
+  return D;
+}
+
+function bnBuild(D, scopeLabel){
+  const T=BN_T, p=D.period, per = ui.reportPeriod==='monthly' ? 'this month' : 'this year';
+  const annNote = D.ann>1 ? ' (annualized)' : '';
+  const risks=[], opps=[], acts=[], insights=[];
+  const R=(sev,cat,text)=> risks.push({sev,cat,text});
+  const O=(cat,text)=> opps.push({cat,text});
+  const AC=(pri,cat,text,owner,when)=> acts.push({pri,cat,text,owner,when});
+  const I=(score,text)=> insights.push({score,text});
+  const sections=[];
+  const S=(title, o)=> sections.push(Object.assign({title}, o));
+
+  /* 1. WORKFORCE COMPOSITION */
+  { const t=[], im=[], rk=[], op=[], ac=[];
+    if(D.growth!==null){
+      t.push(`Headcount ${D.growth>=0?'grew':'declined'} <b>${bnF(Math.abs(D.growth),1)}%</b> to <b>${D.N}</b> (from ${D.prevN} in ${bnE(p.prevLabel)}), with ${D.hires} hire(s) against ${D.seps} separation(s).`);
+    } else t.push(`Headcount stands at <b>${D.N}</b> as of ${bnE(p.label)}; ${per} brought ${D.hires} hire(s) and ${D.seps} separation(s), a net change of <b>${D.net>=0?'+':''}${D.net}</b>.`);
+    const replace = D.seps ? D.hires/D.seps : null;
+    if(replace!==null){
+      if(replace>=1.2){ im.push(`Hiring is running ahead of exits (${bnF(replace,1)} hires per separation) — the organization is in a growth posture, which raises the importance of onboarding quality and first-year retention.`); }
+      else if(replace<0.8){ im.push(`Exits are outpacing hires (${bnF(replace,1)} hires per separation). Unless this is a deliberate right-sizing, remaining employees are absorbing more workload, which tends to accelerate further turnover.`); rk.push('Net workforce contraction with exits outpacing replacement hiring.'); R(2,'Composition',`Workforce is contracting — ${D.hires} hire(s) vs ${D.seps} separation(s) ${per}; capacity gaps may be forming in operating units.`); ac.push(['Medium','Confirm whether the contraction is planned; if not, fast-track requisitions for the units losing the most people.','HR Business Partners + Unit Heads','30 days']); }
+      else im.push(`Hires and exits are roughly in balance (${bnF(replace,1)} hires per separation) — headcount is stable, so the story is about mix and quality rather than volume.`);
+    }
+    if(D.F+D.M){
+      const bal = D.fPct>=T.genderBalanced[0] && D.fPct<=T.genderBalanced[1];
+      t.push(`Gender mix is <b>${bnF(D.fPct)}% female / ${bnF(100-D.fPct)}% male</b>${D.U?` (${D.U} record(s) without gender)`:''} — ${bal?'within a balanced range':'skewed toward '+(D.fPct>50?'women':'men')}.`);
+      if(!bal) im.push(`The gender skew largely mirrors the type of work in the portfolio (e.g. construction, maritime and site roles vs. office, hospitality and health roles), but it narrows the talent pool the organization draws from.`);
+    }
+    if(D.genKnown){
+      const gs=BN_GEN_ORDER.filter(g=>D.gen[g]).map(g=>`${g} ${bnF(bnPct(D.gen[g],D.genKnown))}%`).join(' · ');
+      const top=bnTop(Object.fromEntries(BN_GEN_ORDER.filter(g=>D.gen[g]).map(g=>[g,D.gen[g]])));
+      t.push(`Generational mix: ${gs}. ${top?`<b>${top.k}</b> form the core of the workforce.`:''}`);
+      const gz=bnPct(D.gen['Gen Z']||0,D.genKnown);
+      if(gz>=25){ im.push(`Gen Z is already ${bnF(gz)}% of the workforce — expectations around career speed, feedback and flexibility will increasingly shape retention.`); op.push('A large early-career cohort that can be developed into the future talent bench.'); }
+    }
+    t.push(`Employment status: <b>${D.status.staff}</b> Staff (${bnF(bnPct(D.status.staff,D.N))}%), <b>${D.status.rankfile}</b> Rank &amp; File (${bnF(bnPct(D.status.rankfile,D.N))}%)${D.status.intern?`, ${D.status.intern} Intern/OJT`:''}.`);
+    if(D.topInd && Object.keys(D.byInd).length>1){
+      t.push(`Operational footprint: ${bnList(D.byInd, D.N, 5)} by industry; largest affiliate is <b>${bnE(D.topCo.k)}</b> (${bnF(bnPct(D.topCo.n,D.N))}%).`);
+      if(bnPct(D.topCo.n,D.N)>T.concentration){ rk.push(`More than half the workforce sits in one affiliate (${bnE(D.topCo.k)}).`); R(2,'Composition',`Headcount concentration — ${bnE(D.topCo.k)} holds ${bnF(bnPct(D.topCo.n,D.N))}% of employees, so a disruption there affects the majority of the workforce.`); }
+    } else if(D.topDept) t.push(`Largest department is <b>${bnE(D.topDept.k)}</b> (${bnF(bnPct(D.topDept.n,D.N))}% of headcount).`);
+    t.push(`<span class="hint">Geographic note: the masterlist does not yet capture work location, so distribution is shown by industry and affiliate as the operating footprint.</span>`);
+    op.push('Shared HR data across affiliates enables group-wide redeployment instead of separate external hiring.');
+    ac.push(['Low','Add a Work Location / Site field to the Master List so geographic exposure (e.g. Cebu vs. Bohol vs. Manila sites) can be reported to the Board.','HRIS / People Analytics','Next quarter']);
+    S('Workforce Composition',{t,im,rk,op,ac});
+    if(D.growth!==null && Math.abs(D.growth)>=3) I(Math.abs(D.growth)>=8?3:2, `Headcount ${D.growth>0?'grew':'fell'} ${bnF(Math.abs(D.growth),1)}% vs ${bnE(p.prevLabel)} to ${D.N} employees.`);
+  }
+
+  /* 2. TENURE DISTRIBUTION */
+  { const t=[], im=[], rk=[], op=[], ac=[];
+    if(D.tenKnown){
+      t.push(`Median tenure is <b>${bnF(D.medTen,1)} years</b>. <b>${bnF(D.t1Pct)}%</b> of employees have under 1 year of service, <b>${bnF(D.t3Pct)}%</b> under 3 years, and <b>${bnF(D.t10Pct)}%</b> have 10+ years.`);
+      if(D.t1Pct>=T.newHireHeavy){ im.push(`${bnF(D.t1Pct)}% of the workforce is still in its first year. This group is still ramping up to full productivity and is the most likely to leave, so onboarding and the quality of first-line supervision now directly affect operating results.`); rk.push(`High new-employee concentration (${bnF(D.t1Pct)}% under 1 year).`); R(2,'Tenure',`New-employee concentration — ${bnF(D.t1Pct)}% of the workforce has less than one year of service, so productivity ramp-up and early attrition risk are concentrated here.`); ac.push(['High','Strengthen the first-90-days program (structured onboarding, buddy system, 30/60/90 check-ins) and track first-year retention as a KPI per affiliate.','L&D + HR Business Partners','Next 60 days']); }
+      else im.push(`New-employee concentration is moderate, so the organization is not overly dependent on people still learning their roles.`);
+      if(D.t10Pct>=T.knowledgeHeavy){ im.push(`A large long-service group (${bnF(D.t10Pct)}%) holds much of the organization's institutional knowledge, client relationships and informal process know-how.`); op.push(`Deep institutional knowledge in the ${D.t10} long-service employees — a ready pool of mentors and trainers.`); }
+      if(D.longAndOld){ rk.push(`${D.longAndOld} employee(s) combine 10+ years of service with age 55+ — knowledge that can walk out through retirement.`); R(D.longAndOld>=5?3:2,'Tenure',`Institutional knowledge risk — ${D.longAndOld} long-serving employee(s) (10+ years) are aged 55 or older; their know-how is largely undocumented.`); ac.push(['High','Run knowledge-capture for long-serving employees nearing retirement: documented SOPs, shadowing of successors and recorded walkthroughs of critical tasks.','Unit Heads + Knowledge Management','Start within 90 days']); I(D.longAndOld>=5?3:2, `${D.longAndOld} long-serving employee(s) aged 55+ hold knowledge at risk of retirement exit.`); }
+      const tr=D.riskTenure[0];
+      if(tr && tr.idx>=T.riskIdx){ t.push(`Retention pattern: the <b>${bnE(tr.band)}</b> band accounts for ${bnF(tr.sepPct)}% of exits but only ${bnF(tr.basePct)}% of the workforce (${bnF(tr.idx,1)}× its expected share).`);
+        rk.push(`Employees in the ${bnE(tr.band)} band are leaving disproportionately.`); }
+      else if(D.sepR) t.push(`Exits are spread across tenure bands roughly in line with their size — no single tenure group is leaving disproportionately.`);
+    } else t.push('Date Hired is missing on the records in scope, so tenure cannot be analyzed.');
+    S('Tenure Distribution',{t,im,rk,op,ac});
+    if(D.t1Pct>=T.newHireHeavy) I(2, `${bnF(D.t1Pct)}% of employees are in their first year — onboarding quality is now a business driver.`);
+  }
+
+  /* 3. AGE DEMOGRAPHICS */
+  { const t=[], im=[], rk=[], op=[], ac=[];
+    if(D.ageKnown){
+      t.push(`Median age is <b>${bnF(D.medAge)}</b>. <b>${D.a60}</b> employee(s) are 60+ (eligible for optional retirement now) and <b>${D.a5559}</b> are 55–59 (eligible within five years) — <b>${bnF(D.a55Pct)}%</b> of the workforce combined. <b>${bnF(D.u35Pct)}%</b> are under 35.`);
+      if(D.a55Pct>=T.retireNear){ im.push(`Retirement is a planning issue, not a distant one: roughly one in ${Math.max(2,Math.round(100/D.a55Pct))} employees could exit for retirement within five years, along with retirement-pay obligations.`); rk.push(`Retirement exposure of ${bnF(D.a55Pct)}% within five years.`); R(3,'Age',`Retirement wave — ${D.a60+D.a5559} employee(s) (${bnF(D.a55Pct)}%) are 55+, eligible for retirement now or within five years.`); ac.push(['High','Build a 5-year retirement calendar by affiliate and position, and fund the retirement liability accordingly.','HR + Finance','Next quarter']); I(3, `${bnF(D.a55Pct)}% of the workforce is within five years of retirement eligibility.`); }
+      else im.push(`Retirement exposure is manageable at ${bnF(D.a55Pct)}% — the priority is keeping the pipeline of younger talent growing.`);
+      if(D.L){
+        t.push(`Leadership continuity: <b>${D.L55}</b> of ${D.L} leader(s) (${bnF(D.L55Pct)}%) are 55+, while <b>${D.Lunder40}</b> are under 40.`);
+        if(D.L55Pct>=T.leaderRetire){ rk.push(`${bnF(D.L55Pct)}% of leaders are 55+ — a leadership retirement cliff.`); R(3,'Age',`Leadership continuity — ${D.L55} of ${D.L} leaders (${bnF(D.L55Pct)}%) are 55 or older; several senior seats could open at the same time.`); ac.push(['High','Name ready-now and ready-in-2-years successors for every leader aged 55+, with individual development plans.','CHRO + Executive Committee','Within 6 months']); I(3, `${bnF(D.L55Pct)}% of leaders are 55+, creating a near-term succession need.`); }
+        if(D.L && D.Lunder40===0){ rk.push('No leaders under 40 — the next generation of leadership is not yet visible.'); }
+      }
+      if(D.u35Pct>=T.youngPipeline){ op.push(`${bnF(D.u35Pct)}% of employees are under 35 — a sizeable base to grow future supervisors and managers from.`); }
+      else { rk.push(`Thin young-talent base (${bnF(D.u35Pct)}% under 35).`); R(2,'Age',`Future workforce sustainability — only ${bnF(D.u35Pct)}% of employees are under 35${D.pipelineRatio!==null?` (${bnF(D.pipelineRatio,1)} under-35s for every employee aged 50+)`:''}.`); ac.push(['Medium','Expand the School and Industry Partnership, TESDA EBET and OJT programs into a structured early-career hiring channel.','Talent Acquisition + L&D','Next 6 months']); }
+      if(D.pipelineRatio!==null) im.push(`There are ${bnF(D.pipelineRatio,1)} employees under 35 for every employee aged 50+ — ${D.pipelineRatio>=1.5?'the age pyramid can replace its senior cohort':'the incoming generation is not large enough to replace the senior cohort on its own'}.`);
+    } else t.push('Date of Birth is missing on the records in scope, so age cannot be analyzed.');
+    S('Age Demographics',{t,im,rk,op,ac});
+  }
+
+  /* 4. DIVERSITY & INCLUSION */
+  { const t=[], im=[], rk=[], op=[], ac=[];
+    if(D.F+D.M){
+      t.push(`Women are <b>${bnF(D.fPct)}%</b> of the workforce${D.L?` and <b>${bnF(D.LfPct)}%</b> of leadership (${D.LF} of ${D.LF+D.LM})`:''}.`);
+      if(D.L && D.LF+D.LM>=3){ const gap=D.fPct-D.LfPct;
+        if(gap>=T.leaderGenderGap){ im.push(`Women are under-represented in leadership by ${bnF(gap)} points relative to their share of the workforce — the pipeline narrows at the senior grades.`); rk.push(`Leadership gender gap of ${bnF(gap)} pts.`); R(2,'Diversity',`Leadership diversity — women hold ${bnF(D.LfPct)}% of leadership roles vs ${bnF(D.fPct)}% of the workforce.`); ac.push(['Medium','Set a leadership-pipeline representation goal and ensure every leadership shortlist includes qualified women.','CHRO + Talent Management','Next review cycle']); I(2, `Women are ${bnF(D.fPct)}% of employees but ${bnF(D.LfPct)}% of leaders.`); }
+        else if(gap<=-T.leaderGenderGap) im.push(`Women are better represented in leadership (${bnF(D.LfPct)}%) than in the overall workforce (${bnF(D.fPct)}%) — the gap to watch is men's progression in the units where they dominate the base.`);
+        else { im.push(`Leadership gender representation broadly mirrors the workforce — a sign that promotion paths are open to both.`); op.push('Leadership gender representation is in line with the workforce — a credible employer-brand message.'); }
+      }
+      if(D.deptSkew.length){ t.push(`Strongly single-gender units (80%+ one gender): ${D.deptSkew.slice(0,5).map(x=>`${bnE(x.d)} (${bnF(x.fPct)}% female)`).join(', ')}.`); im.push('Single-gender units usually reflect the nature of the work, but they limit perspective in decision-making and can signal barriers in recruitment.'); }
+      if(D.promos>=3){ t.push(`Equity check: women received <b>${bnF(D.promoFemPct)}%</b> of promotions ${per}, against ${bnF(D.fPct)}% of the workforce.`);
+        if(Math.abs(D.promoFemPct-D.fPct)>=15){ rk.push('Promotion outcomes differ noticeably from workforce gender mix.'); ac.push(['Medium','Review promotion decisions for consistency of criteria across genders and affiliates.','HR + Unit Heads','Next promotion cycle']); } }
+      const rg=D.riskGender[0]; if(rg && rg.idx>=T.riskIdx){ t.push(`${bnE(rg.k)} employees are leaving at ${bnF(rg.idx,1)}× their share of the workforce.`); rk.push(`${bnE(rg.k)} attrition is disproportionate.`); }
+    } else t.push('Gender is not recorded on the records in scope.');
+    t.push(`<span class="hint">Pay data is not held in this system, so pay equity cannot be assessed here.</span>`);
+    S('Diversity and Inclusion',{t,im,rk,op,ac});
+  }
+
+  /* 5. TALENT MOBILITY */
+  { const t=[], im=[], rk=[], op=[], ac=[];
+    t.push(`<b>${D.promos}</b> promotion(s) were recorded ${per} (${bnF(D.promoRate,1)}% of Staff and Rank &amp; File${annNote&&D.promos?`, ≈${bnF(D.promoRateAnn,1)}% annualized`:''})${D.promoRF?`, including <b>${D.promoRF}</b> Rank &amp; File → Staff move(s)`:''}.`);
+    t.push(D.xfer||D.xAff ? `Internal movement: <b>${D.xfer}</b> cost center / department transfer(s) and <b>${D.xAff}</b> likely cross-affiliate transfer(s).` : `No internal (cost center / department) or cross-affiliate transfers were recorded ${per}.`);
+    if(D.hireToPromo!==null) im.push(`For every internal promotion the organization made ${bnF(D.hireToPromo,1)} external hire(s) — ${D.hireToPromo>4?'it relies heavily on the external market to fill roles, which is slower and costlier than growing talent internally':'a healthy balance between building and buying talent'}.`);
+    else if(D.hires) { im.push(`No promotions were recorded while ${D.hires} external hire(s) were made — employees may not see a visible career path.`); rk.push('Visible career progression is low relative to external hiring.'); }
+    if(D.stalled){ t.push(`<b>${D.stalled}</b> Staff employee(s) have stayed in their Job Grade Group beyond its Max Tenure Stay without moving up.`); rk.push(`${D.stalled} employee(s) appear stalled in grade — a disengagement and flight risk.`); R(D.stalled>=10?2:1,'Mobility',`Career stagnation — ${D.stalled} Staff employee(s) have exceeded their grade's Max Tenure Stay with room to move up.`); ac.push(['Medium','Hold calibration on the employees past their grade\'s Max Tenure Stay: promote, re-scope the role, or agree a development plan.','HR + Unit Heads','Next 90 days']); }
+    if(D.promoRF) op.push(`${D.promoRF} Rank & File → Staff move(s) show a working internal ladder that can be promoted in recruitment.`);
+    if(D.xAff || D.xfer) op.push('Cross-affiliate and internal transfers demonstrate the group can redeploy talent rather than lose it.');
+    else ac.push(['Low','Post open roles internally across affiliates first (internal job board) before going to the external market.','Talent Acquisition','Next quarter']);
+    S('Talent Mobility',{t,im,rk,op,ac});
+    if(D.stalled>=5) I(2, `${D.stalled} Staff employees appear stalled in grade beyond the expected time.`);
+  }
+
+  /* 6. ATTRITION AND RETENTION */
+  { const t=[], im=[], rk=[], op=[], ac=[];
+    t.push(`Attrition was <b>${bnF(D.attr,1)}%</b> ${per}${D.ann>1?` (≈<b>${bnF(D.attrAnn,1)}%</b> annualized)`:''}${D.prevAttr!==null?`, vs ${bnF(D.prevAttr,1)}% in ${bnE(p.prevLabel)}`:''}. Of ${D.sepR} Staff/Rank &amp; File exit(s): ${D.vol} resignation(s), ${D.eoc} end of contract, ${D.invol} termination/redundancy, ${D.ret} retirement.`);
+    if(D.sepR){
+      t.push(`Voluntary turnover (resignations) is <b>${bnF(D.volRate,1)}%</b>${D.ann>1?` (≈${bnF(D.volAnn,1)}% annualized)`:''}, or ${bnF(D.volShare)}% of all exits.`);
+      if(D.volAnn>=T.volAnnualHigh){ im.push('Voluntary exits are the controllable part of turnover — each resignation carries recruitment, training and lost-productivity cost, typically a significant share of annual pay per role.'); rk.push(`Voluntary turnover is elevated at ≈${bnF(D.volAnn,1)}% a year.`); R(3,'Attrition',`Elevated voluntary turnover — resignations are running at ≈${bnF(D.volAnn,1)}% a year, above this report's ${T.volAnnualHigh}% alert level.`); ac.push(['High','Introduce stay interviews for high performers and exit interviews for every resignation; report the top three exit drivers to the Executive Committee monthly.','HR Business Partners','Start next month']); I(3, `Voluntary turnover is ≈${bnF(D.volAnn,1)}% a year — the main controllable workforce cost.`); }
+      else { im.push('Voluntary turnover is within a manageable range — retention fundamentals are working.'); op.push('Stable voluntary turnover gives room to invest in development rather than backfilling.'); }
+      if(D.earlyPct>=T.earlyExit){ t.push(`<b>${bnF(D.earlyPct)}%</b> of exits happened within the first year of employment.`); rk.push('Early-tenure exits signal hiring-fit or onboarding gaps.'); R(2,'Attrition',`First-year attrition — ${bnF(D.earlyPct)}% of separations left within their first year, pointing to selection or onboarding gaps.`); ac.push(['High','Review hiring criteria and realistic job previews for the roles with the most first-year exits.','Talent Acquisition','Next 60 days']); I(2, `${bnF(D.earlyPct)}% of exits leave within their first year.`); }
+      const hot=[]; [['tenure',D.riskTenure.map(r=>({k:r.band, idx:r.idx}))],['age',D.riskAge],['status',D.riskStatus],['department',D.riskDept]].forEach(([lbl,L])=>{ const r=L[0]; if(r && r.idx>=T.riskIdx) hot.push(`${bnE(r.k)} (${lbl}, ${bnF(r.idx,1)}×)`); });
+      if(hot.length){ t.push(`High-risk groups (leaving faster than their share of the workforce): ${hot.join(', ')}.`); rk.push(`Attrition is concentrated in: ${hot.join(', ')}.`); R(2,'Attrition',`High-risk populations — exits are concentrated in ${hot.join(', ')} relative to their share of the workforce.`); ac.push(['Medium',`Run targeted retention conversations and engagement pulse checks with the high-risk groups (${hot.map(h=>h.split(' (')[0]).join(', ')}).`,'HR Business Partners','Next 90 days']); }
+      const cc=D.ccRisk[0]; if(cc && cc.rate>0){ t.push(`Highest cost-center attrition: <b>${bnE(cc.cc)}</b> at ${bnF(cc.rate,1)}% (${cc.sep} of ${cc.base}).`); if(cc.rate*D.ann>=T.attrAnnualHigh){ R(2,'Attrition',`Turnover hotspot — cost center ${bnE(cc.cc)} lost ${cc.sep} of ${cc.base} people ${per}.`); ac.push(['High',`Diagnose the ${bnE(cc.cc)} hotspot with its unit head (workload, supervision, pay competitiveness) and agree a 90-day retention plan.`,'HR Business Partner + Unit Head','Next 30 days']); } }
+      if(D.attrAnn>=T.attrAnnualHigh && D.volAnn<T.volAnnualHigh) im.push('Overall attrition is high mainly because of contract ends or involuntary exits rather than resignations — a workforce-planning question more than a retention one.');
+    } else { t.push(`No Staff or Rank &amp; File separations were recorded ${per}.`); op.push('No regretted exits this period — a strong retention signal.'); }
+    S('Attrition and Retention',{t,im,rk,op,ac});
+  }
+
+  /* 7. STRATEGIC WORKFORCE RISKS */
+  { const t=[], im=[], rk=[], op=[], ac=[];
+    t.push(`<b>${D.single.length}</b> position(s) have a single incumbent${D.singleLeaders.length?`, of which <b>${D.singleLeaders.length}</b> are leadership roles`:''}${D.singleAtRisk.length?` and <b>${D.singleAtRisk.length}</b> are held by someone aged 55+ or with 10+ years' service`:''}.`);
+    if(D.single.length){ im.push('A single-incumbent role is a single point of failure: one resignation, illness or retirement stops that capability until a replacement is hired and trained.'); }
+    if(D.singleAtRisk.length){ rk.push(`Critical talent dependency on: ${D.singleAtRisk.slice(0,6).map(bnE).join(', ')}${D.singleAtRisk.length>6?', …':''}.`); R(3,'Strategic',`Critical talent dependency — ${D.singleAtRisk.length} single-incumbent role(s) are held by people near retirement or with deep tenure (${D.singleAtRisk.slice(0,4).map(bnE).join(', ')}${D.singleAtRisk.length>4?', …':''}).`); ac.push(['High','Designate and train a back-up for every single-incumbent role held by someone aged 55+ or with 10+ years of service.','Unit Heads + L&D','Within 6 months']); I(3, `${D.singleAtRisk.length} critical single-person role(s) have no back-up and are held by near-retirement or long-tenure staff.`); }
+    if(D.singleLeaders.length){ rk.push(`${D.singleLeaders.length} leadership role(s) have no peer or deputy.`); if(!D.singleAtRisk.length) R(2,'Strategic',`Succession vulnerability — ${D.singleLeaders.length} leadership role(s) have only one incumbent and no visible deputy.`); }
+    if(D.L && D.leaderConcPct>=T.concentration && Object.keys(D.LbyDept).length>1) t.push(`${bnF(D.leaderConcPct)}% of leaders sit in <b>${bnE(D.leaderConc.k)}</b> — leadership capacity is concentrated in one function.`);
+    if(D.topPos) { t.push(`Skills concentration: the largest role, <b>${bnE(D.topPos.k)}</b>, is ${bnF(D.topPosPct)}% of Staff and Rank &amp; File; the top three roles make up ${bnF(D.top3PosPct)}%.`);
+      if(D.top3PosPct>=T.concentration){ im.push('A workforce concentrated in a few role types is efficient to manage but exposed to market competition for those skills and to changes in client demand.'); rk.push('Skills are concentrated in a small number of role types.'); R(1,'Strategic',`Skills concentration — the top three roles account for ${bnF(D.top3PosPct)}% of the core workforce.`); ac.push(['Low','Cross-train employees in the largest role groups on adjacent skills to create flexible capacity.','L&D','Next 6 months']); } }
+    op.push('A multi-industry group can build shared talent pools and succession benches across affiliates — something single-business competitors cannot.');
+    S('Strategic Workforce Risks',{t,im,rk,op,ac});
+  }
+
+  // consolidated lists
+  sections.forEach(s=>{ s.ac.forEach(a=> AC(a[0], s.title, a[1], a[2], a[3])); s.op.forEach(o=> O(s.title, o)); });
+  risks.sort((a,b)=> b.sev-a.sev);
+  const pr={High:0,Medium:1,Low:2}; acts.sort((a,b)=> pr[a.pri]-pr[b.pri]);
+  insights.sort((a,b)=> b.score-a.score);
+  if(insights.length<5){
+    if(D.sepR) I(1, `Attrition stands at ${bnF(D.attr,1)}%${D.ann>1?` (≈${bnF(D.attrAnn,1)}% annualized)`:''}, with ${bnF(D.volShare)}% of exits being resignations.`);
+    if(D.ageKnown) I(1, `The median employee is ${bnF(D.medAge)} years old with ${bnF(D.medTen,1)} years of service.`);
+    if(D.F+D.M) I(1, `Women make up ${bnF(D.fPct)}% of the workforce${D.L?` and ${bnF(D.LfPct)}% of leaders`:''}.`);
+  }
+  // takeaway
+  const top2 = risks.slice(0,2).map(r=> r.text.split(' — ')[0].replace(/<[^>]+>/g,'').toLowerCase());
+  const posture = D.growth!==null ? (D.growth>=3?'growing':D.growth<=-3?'contracting':'stable') : (D.net>0?'growing':D.net<0?'contracting':'stable');
+  const takeaway = `${ui.reportScope?bnE(scopeLabel):'The organization'} has a ${posture} workforce of ${D.N}${D.ageKnown?` with a median age of ${bnF(D.medAge)}`:''}${D.tenKnown?` and median tenure of ${bnF(D.medTen,1)} years`:''}. `
+    + (top2.length ? `The issues that most need Board attention are ${top2.join(' and ')}: left unmanaged, they translate into lost capability, higher replacement cost and gaps in leadership at the moment the business needs continuity. ` : `No critical workforce risks are flagged ${per}; the priority is to protect current stability while building the next generation of talent. `)
+    + (opps.length ? `The organization's advantage is ${opps[0].text.replace(/\.$/,'').replace(/^./,c=>c.toLowerCase())}. ` : '')
+    + `Leadership's next step is to act on the ${acts.filter(a=>a.pri==='High').length} high-priority action(s) below${acts[0]?`, starting with: “${acts[0].text.replace(/\.$/,'')}”,`:''} and to review progress at the next Executive Committee meeting.`;
+  return {sections, risks, opps, acts, insights, takeaway};
+}
+
+function renderBoardNarrative(st, prevSt, period){
+  if(!st.active.length) return `<div class="empty">No active employees in this scope and period — nothing to narrate yet.</div>`;
+  const D = bnData(st, prevSt, period), B = bnBuild(D, execReportScopeLabel());
+  const sev = s=> s>=3?'<span class="pill" style="background:var(--red);color:#fff;">High</span>':s===2?'<span class="pill" style="background:var(--gold);color:#fff;">Medium</span>':'<span class="pill" style="background:var(--dim2);color:#fff;">Low</span>';
+  const pri = p=> sev(p==='High'?3:p==='Medium'?2:1);
+  const li = a=> a.length ? `<ul style="margin:4px 0 0;padding-left:20px;line-height:1.75;">${a.map(x=>`<li>${x}</li>`).join('')}</ul>` : '<div class="hint" style="margin:2px 0 0;">None flagged.</div>';
+  const lbl = (k,c)=> `<div style="font-size:11px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:${c};margin-top:10px;">${k}</div>`;
+  const dq = D.miss, dqTxt = [dq.birth?`${dq.birth} without Date of Birth`:'', dq.gender?`${dq.gender} without gender`:'', dq.hire?`${dq.hire} without Date Hired`:''].filter(Boolean).join(', ');
+  const h2 = (n,t)=> `<h2 class="section">${t}</h2>`;
+  return `<div id="boardNarrative">
+  <p class="hint" style="margin-top:-4px;">Written live from the data on file for <b>${bnE(execReportScopeLabel())}</b>, ${bnE(period.label)}. "Leadership" means Staff in their company's most senior Job Grade Group or in a manager/head/supervisor/officer title. Retirement exposure uses age 60 (optional retirement) as the reference point. ${ui.reportPeriod==='monthly'?'Monthly rates are also shown annualized (× 12) for comparison. ':''}${ui.reportCompare?'':'Turn on "Compare vs. prior period" to add growth and change figures. '}${dqTxt?`Data gaps: ${dqTxt}.`:''}</p>
+
+  <div class="exec-block">${h2('','Executive Summary')}
+    <ol style="margin:0;padding-left:22px;line-height:1.85;font-size:14px;">${B.insights.slice(0,5).map(i=>`<li>${i.text}</li>`).join('')}</ol></div>
+
+  <div>${h2('','Key Findings')}
+    ${B.sections.map((s,i)=>`<div class="card exec-block" style="margin-bottom:14px;padding:16px 18px;">
+      <h3 style="font-size:15.5px;margin:0 0 4px;">${i+1}. ${s.title}</h3>
+      ${lbl('Key trends','var(--blue)')}${li(s.t)}
+      ${lbl('Business implications','var(--teal)')}${li(s.im)}
+      ${lbl('Potential risks','var(--red)')}${li(s.rk)}
+      ${lbl('Opportunities','var(--green)')}${li(s.op)}
+      ${lbl('Recommended actions','var(--gold)')}${li(s.ac.map(a=>`<b>[${a[0]}]</b> ${a[1]}`))}
+    </div>`).join('')}</div>
+
+  <div class="exec-block">${h2('','Business Risks')}
+    ${B.risks.length ? `<table class="demo compact"><thead><tr><th class="rowlabel">Risk (supported by data)</th><th>Area</th><th>Severity</th></tr></thead><tbody>
+      ${B.risks.map(r=>`<tr><td class="rowlabel" style="white-space:normal;">${r.text}</td><td>${r.cat}</td><td>${sev(r.sev)}</td></tr>`).join('')}</tbody></table>` : '<p class="hint">No material workforce risks flagged for this scope and period.</p>'}</div>
+
+  <div class="exec-block">${h2('','Opportunities')}
+    ${B.opps.map(o=>`<div class="exec-flag opp"><b>${o.cat}:</b> ${o.text}</div>`).join('')}</div>
+
+  <div class="exec-block">${h2('','Recommended Actions')}
+    <table class="demo compact"><thead><tr><th>Priority</th><th class="rowlabel">Action</th><th>Owner</th><th>Timing</th><th>Area</th></tr></thead><tbody>
+      ${B.acts.map(a=>`<tr><td>${pri(a.pri)}</td><td class="rowlabel" style="white-space:normal;">${a.text}</td><td>${a.owner}</td><td>${a.when}</td><td>${a.cat}</td></tr>`).join('')}</tbody></table></div>
+
+  <div class="exec-block">${h2('','Executive Takeaway')}
+    <div class="card" style="padding:16px 18px;font-size:14.5px;line-height:1.75;border-left:4px solid var(--blue);">${B.takeaway}</div></div>
+  </div>`;
+}
+function copyBoardNarrative(){
+  const el=document.getElementById('boardNarrative'); if(!el) return;
+  const txt=el.innerText.replace(/\n{3,}/g,'\n\n');
+  (navigator.clipboard ? navigator.clipboard.writeText(txt) : Promise.reject()).then(()=> toast('Board narrative copied — paste it into your deck or memo.')).catch(()=>{
+    const r=document.createRange(); r.selectNodeContents(el); const s=getSelection(); s.removeAllRanges(); s.addRange(r); document.execCommand('copy'); s.removeAllRanges(); toast('Board narrative copied.'); });
+}
+
 function renderExecReport(){
   const companies = allCompanies().map(c=>c.company);
   const period = execReportPeriodBounds();
@@ -6925,8 +7269,17 @@ function renderExecReport(){
   ${topControls}
   <p class="hint exec-noprint" style="margin-top:-4px;">Showing <b>${period.label}</b>${ui.reportCompare?` compared ${period.compareWord} against <b>${period.prevLabel}</b>`:''} for <b>${scopeLabel}</b>. Use the Year/Month picker above for Monthly; Annual always uses the Year picker only.</p>
 
-  <div class="exec-block">
-    <h2 class="section">Executive Summary</h2>
+  <div style="margin-bottom:8px;">
+    <div class="field-row" style="justify-content:space-between;align-items:center;gap:10px;margin-bottom:4px;">
+      <h1 style="font-family:var(--serif);font-size:22px;margin:0;">Board-Level Employee Demographics Report</h1>
+      <button class="btn exec-noprint" onclick="copyBoardNarrative()">📋 Copy narrative</button>
+    </div>
+    ${renderBoardNarrative(st, prevSt, period)}
+  </div>
+
+  <div class="exec-block exec-section-break">
+    <h1 style="font-family:var(--serif);font-size:20px;margin:0 0 6px;">Supporting Data</h1>
+    <h2 class="section">Data Highlights</h2>
     ${execExecutiveSummary(st, prevSt, period)}
   </div>
 
